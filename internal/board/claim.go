@@ -182,6 +182,36 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 		}
 	}()
 
+	// The spend ceiling is evaluated HERE, inside the claim transaction and
+	// before any row is written, and its verdict is final for this call. Two
+	// properties follow, and they are the reason it is not evaluated in the
+	// handler:
+	//
+	//   - The ledger read and the claim's writes cannot be interleaved by
+	//     another writer. BEGIN IMMEDIATE already serialises writers, and the
+	//     read going through `conn` (not `db`, which would deadlock on the
+	//     one-connection pool) keeps it inside that transaction.
+	//   - The pause it records is written in the same transaction as whatever
+	//     this claim does, so the event log and the config row agree.
+	//
+	// A ceiling the board cannot read is an error, not unlimited: a typo must
+	// not silently disable the safety mechanism.
+	paused, _, err := reconcileCeiling(ctx, conn, clock)
+	if err != nil {
+		return nil, err
+	}
+	if paused {
+		// A paused board still answers the claim — with nothing. An error would
+		// tell the node the board is broken; this tells it, truthfully, that
+		// there is no work for it. The reason travels on /admin/spend/today and
+		// in the event log.
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return nil, err
+		}
+		committed = true
+		return nil, nil
+	}
+
 	// Eligible candidates for this node only.
 	var mine []Candidate
 	for _, c := range cands {

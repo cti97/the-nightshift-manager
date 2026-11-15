@@ -344,7 +344,26 @@ claims anything.
 **Reserved spend.** `runs.input_tokens`/`output_tokens` are provider-reported actuals.
 `runs.reserved_tokens` is the separate budget charge for attempts that failed and reported no
 usage (a retried `Complete` can be billed twice); the spend ledger counts both rather than
-pretending the failed attempt produced output.
+pretending the failed attempt produced output. A reservation carries no in/out split, so it is
+priced at the model's **input** rate: the prompt is the part a failed attempt certainly sent,
+and charging an unobserved `max_tokens` at the output rate would let a reservation artifact
+dominate the day's number. The bound is deliberate and known — a failed attempt that did
+generate output before failing is under-counted.
+
+**Spend is derived from `runs`.** `runs.cost_estimate` is `usage × the model's prices`, written
+once by the report that settles the run and then frozen: a later price edit or disable must not
+rewrite a day that has already been spent, or the number an operator saw yesterday would move
+underneath them and a typo'd price would retroactively trip the ceiling. The daily ledger is
+`SUM(cost_estimate)` over the runs issued today — never a counter, because a counter drifts from
+the rows an operator can read and the disagreement surfaces during an incident. "Today" is the
+**UTC calendar day** containing the board's injected clock, decided by `runs.started_at` (the
+day the work was issued; `ended_at` is nullable). The ceiling is checked inside the claim
+transaction: at or above it, `Claim` issues nothing and the board records itself `paused` with a
+reason naming the ceiling, in the same transaction as the event. A ceiling of `0` is unlimited
+and is the default. Because the pause is a projection of the ledger, raising the ceiling above
+today's spend (or a new UTC day) resumes the board with no separate "clear" action; a
+`board_paused` value the ceiling did not write is an operator's pause and is never touched. A
+paused board keeps heartbeating, reaping and reporting — only issuance stops.
 
 **Capabilities are dynamic.** A laptop that has driven to the office can no longer reach
 `lan:home-nas`, and its `provides_live` says so on the next heartbeat (15s). Placement uses
@@ -578,7 +597,8 @@ Second guard: `turn_owner`. An agent may not post twice consecutively — altern
 reliable brake than any cap, because two agents that can always reply to each other will loop.
 
 Third: `max_turns`. Fourth: a **global daily spend ceiling**. When it trips, the manager stops
-issuing work, freezes all threads, and marks itself `paused` until a human clears it.
+issuing work and marks itself `paused` (§8). Thread freezing is M3's to implement alongside the
+thread tables; M2's ceiling stops issuance, which is what bounds a runaway loop's cost.
 
 ## 14. Dashboard
 
@@ -759,6 +779,16 @@ worth adding.
     needs real kernel confinement or not holding keys in the same process as the shell — both
     larger than M2. The Linux node is therefore *not* a place to run untrusted model output with
     production keys.
+
+19. **The spend ceiling gates issuance, not cost in flight.** It is evaluated against settled
+    runs inside the claim transaction, and claiming itself spends nothing, so work issued below
+    the ceiling can report a cost that crosses it. The overshoot is bounded by what is already
+    in flight and is visible on `/admin/spend/today` (which reports `over_ceiling` separately
+    from `paused`), and the next claim stops. A hard per-run budget is M3's thread/reservation
+    machinery; the ceiling is the coarse daily backstop. A related bound: `reserved_tokens` is
+    priced at the input rate, so a failed attempt that really generated output before failing is
+    under-counted, and a run the reaper settles as `lost` is priced at 0 because its usage is
+    unknowable — the ledger under-counts what it could not observe rather than inventing it.
 
 ## 20. Distribution and release
 

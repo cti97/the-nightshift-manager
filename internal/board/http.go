@@ -68,6 +68,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.Handle("GET /admin/board", s.adminAuth(http.HandlerFunc(s.handleBoard)))
+	mux.Handle("GET /admin/spend/today", s.adminAuth(http.HandlerFunc(s.handleSpendToday)))
+	mux.Handle("PUT /admin/spend/ceiling", s.adminAuth(http.HandlerFunc(s.handleSetSpendCeiling)))
 	mux.Handle("POST /admin/items", s.adminAuth(http.HandlerFunc(s.handleCreateItem)))
 	mux.Handle("POST /admin/endpoints", s.adminAuth(http.HandlerFunc(s.handleCreateEndpoint)))
 	mux.Handle("GET /admin/endpoints", s.adminAuth(http.HandlerFunc(s.handleListEndpoints)))
@@ -373,6 +375,47 @@ func writeAdminWriteError(w http.ResponseWriter, code string, err error) {
 	default:
 		WriteError(w, http.StatusBadRequest, code, err.Error())
 	}
+}
+
+// handleSpendToday is the operator's spend ledger: what today's runs cost, the
+// ceiling it is measured against, and whether the board is refusing work. It is
+// a read of `runs` on every call — there is no running total to go stale, so the
+// number here is the same number the claim gate acts on.
+func (s *Server) handleSpendToday(w http.ResponseWriter, r *http.Request) {
+	st, err := TodaySpend(r.Context(), s.db, s.clock)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "spend", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, st)
+}
+
+// setCeilingRequest requires the field: 0 is a meaningful value (unlimited), so
+// an absent ceiling must be distinguishable from an explicit zero. A plain
+// float64 would let a body that forgot the field quietly disable the ceiling.
+type setCeilingRequest struct {
+	Ceiling *float64 `json:"ceiling"`
+}
+
+// handleSetSpendCeiling writes the daily limit and answers with the resulting
+// ledger, so the operator sees immediately whether raising the ceiling above
+// today's spend resumed the board or whether it is still reached.
+func (s *Server) handleSetSpendCeiling(w http.ResponseWriter, r *http.Request) {
+	var req setCeilingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	if req.Ceiling == nil {
+		WriteError(w, http.StatusBadRequest, "ceiling", "ceiling is required (0 means unlimited)")
+		return
+	}
+	st, err := SetDailySpendCeiling(r.Context(), s.db, s.clock, *req.Ceiling)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "set_ceiling", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, st)
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {

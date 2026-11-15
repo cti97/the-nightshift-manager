@@ -75,11 +75,21 @@ func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, 
 
 	// The node_id in the WHERE clause is the ownership check: a node reports
 	// only its own runs, and someone else's run is an error, not a no-op.
+	//
+	// The model's prices come back with the same read, because the cost is part
+	// of settling the run. Left-joined: runs.model_id is nullable and a run
+	// without a model predates pricing, which costs 0 rather than failing the
+	// report of work that really happened.
 	var itemID, runStatus string
 	var attempt int
+	var costIn, costOut float64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT work_item_id, status, attempt FROM runs WHERE id=? AND node_id=?`,
-		runID, nodeID).Scan(&itemID, &runStatus, &attempt); err != nil {
+		`SELECT r.work_item_id, r.status, r.attempt,
+		        COALESCE(m.cost_in_per_mtok,0), COALESCE(m.cost_out_per_mtok,0)
+		   FROM runs r
+		   LEFT JOIN models m ON m.id = r.model_id
+		  WHERE r.id=? AND r.node_id=?`,
+		runID, nodeID).Scan(&itemID, &runStatus, &attempt, &costIn, &costOut); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ReportResult{}, fmt.Errorf("run %s is not a live run owned by node %s", runID, nodeID)
 		}
@@ -98,6 +108,13 @@ func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, 
 		finalRun, itemStatus = "error", "failed"
 	}
 
+	// The run's cost is priced here, once, and frozen on the row. Not derived
+	// later from the model: a price edit must not rewrite a day that has already
+	// been spent, or the number the dashboard showed yesterday would move
+	// underneath the operator and a typo'd price would retroactively trip the
+	// ceiling. See RunCost for how reserved tokens are priced.
+	cost := RunCost(req.TokensIn, req.TokensOut, req.ReservedTokens, costIn, costOut)
+
 	// Both writes carry the live-status predicate and both check their row
 	// count. The read above and these writes are separate statements, so a
 	// writer that commits in between (a reaper pass, another report) must win:
@@ -105,9 +122,9 @@ func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, 
 	// discards any partial write. That is what makes exactly-once true on this
 	// function's own logic, rather than on the connection pool's serialisation.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE runs SET status=?, ended_at=?, input_tokens=?, output_tokens=?, reserved_tokens=?, error=?, transcript_path=?
+		`UPDATE runs SET status=?, ended_at=?, input_tokens=?, output_tokens=?, reserved_tokens=?, cost_estimate=?, error=?, transcript_path=?
 		  WHERE id=? AND status IN ('claimed','running')`,
-		finalRun, clock.Now(), req.TokensIn, req.TokensOut, req.ReservedTokens,
+		finalRun, clock.Now(), req.TokensIn, req.TokensOut, req.ReservedTokens, cost,
 		nullable(req.Error), nullable(req.Transcript), runID)
 	if err != nil {
 		return ReportResult{}, err
@@ -140,7 +157,7 @@ func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, 
 	// "attempt" here is exactly the two-counter confusion this project has
 	// already paid for.
 	if err := AppendEvent(ctx, tx, clock, "node:"+nodeID, "work_item", itemID,
-		"reported", map[string]any{"run": runID, "status": finalRun, "run_attempt": attempt}); err != nil {
+		"reported", map[string]any{"run": runID, "status": finalRun, "run_attempt": attempt, "cost": cost}); err != nil {
 		return ReportResult{}, err
 	}
 	if err := tx.Commit(); err != nil {

@@ -1,0 +1,12 @@
+-- Migration 3 (M2 Task 13): the index the daily spend ledger reads through.
+--
+-- The ceiling is evaluated on every claim, against
+-- `SELECT ... FROM runs WHERE started_at >= <UTC midnight>`. That predicate is
+-- a range on one column, so it wants an index on that column. Without one, the
+-- claim path scans the whole run history every time a node asks for work.
+--
+-- started_at rather than ended_at, because the day a run belongs to is the day
+-- the work was ISSUED -- the decision the ceiling gates -- and started_at is
+-- never NULL while ended_at is. The full argument is in internal/board/spend.go
+-- under SpendDay.
+CREATE INDEX idx_runs_started_at ON runs(started_at);

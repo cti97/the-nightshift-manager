@@ -125,6 +125,7 @@ func TestMigrationCreatesExpectedObjects(t *testing.T) {
 	want := []string{
 		"index idx_events_entity",
 		"index idx_items_claimable",
+		"index idx_runs_started_at",
 		"table config",
 		"table endpoints",
 		"table events",
@@ -172,7 +173,8 @@ func TestMigrateAppliesOnlyNewerMigrations(t *testing.T) {
 	next := []migration{
 		{version: 1, script: schema},
 		{version: 2, script: schema2},
-		{version: 3, script: `CREATE TABLE watches (
+		{version: 3, script: schema3},
+		{version: 4, script: `CREATE TABLE watches (
   id   TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE
 );
@@ -187,15 +189,15 @@ CREATE INDEX idx_watches_name ON watches(name);`},
 	defer raw.Close()
 
 	if err := migrate(context.Background(), raw, next); err != nil {
-		t.Fatalf("migrate v1 -> v2: %v", err)
+		t.Fatalf("migrate v3 -> v4: %v", err)
 	}
 
 	var v int
 	if err := raw.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if v != 3 {
-		t.Fatalf("user_version = %d, want 3", v)
+	if v != 4 {
+		t.Fatalf("user_version = %d, want 4", v)
 	}
 	var nodes int
 	if err := raw.QueryRow(`SELECT count(*) FROM nodes`).Scan(&nodes); err != nil {

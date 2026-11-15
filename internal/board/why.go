@@ -20,6 +20,14 @@ type Explanation struct {
 	Reason        string   `json:"reason"`
 	BlockedReason string   `json:"blocked_reason"`
 	Rejects       []Reject `json:"rejects,omitempty"`
+
+	// Paused and PauseReason are the second half of the answer, and without
+	// them /why lies: placement can say "placed: true, this node would take it"
+	// while the board is refusing to issue anything because the day's spend
+	// ceiling was reached. The item is explainable and unexplained at the same
+	// time, which is the one outcome this endpoint exists to prevent.
+	Paused      bool   `json:"paused"`
+	PauseReason string `json:"pause_reason,omitempty"`
 }
 
 // Explain answers for one item by re-running placement against the board as it
@@ -60,6 +68,19 @@ func Explain(ctx context.Context, db *sql.DB, clock Clock, itemID string) (Expla
 	ex.Rejects = d.Rejects
 	if !d.OK {
 		ex.BlockedReason = d.Reason
+	}
+
+	// A pause outranks placement as the reason a queued item is not running:
+	// the placement verdict is still reported (Placed/Reason), but a queued
+	// item the board will not issue needs to say that, or the operator reads
+	// "placed: true" and goes looking for a bug in placement.
+	paused, pauseReason, _, err := pauseState(ctx, db, clock)
+	if err != nil {
+		return ex, err
+	}
+	ex.Paused, ex.PauseReason = paused, pauseReason
+	if paused && (ex.Status == "queued" || ex.Status == "needs_approval") {
+		ex.BlockedReason = "the board is not issuing work: " + pauseReason
 	}
 	return ex, nil
 }
