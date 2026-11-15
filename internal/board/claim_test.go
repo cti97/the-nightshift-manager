@@ -110,8 +110,10 @@ func TestClaimRecordsRunAndAttempt(t *testing.T) {
 }
 
 // Claim must not even consider a node that has never heartbeated (or is paused
-// or incompatible). An item with no needs is placeable on such a node by every
-// placement rule, so the status filter in LoadCandidates is the only guard.
+// or incompatible). An item with no needs would otherwise be placed on it by
+// the capability rules alone. Two guards enforce this now: LoadCandidates
+// filters the status in SQL, and Eligible rejects a non-online node. This test
+// pins the outcome, not which of the two fires.
 func TestClaimSkipsANodeThatIsNotOnline(t *testing.T) {
 	for _, status := range []string{"offline", "paused", "incompatible"} {
 		t.Run(status, func(t *testing.T) {

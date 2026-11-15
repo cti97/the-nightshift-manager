@@ -34,6 +34,7 @@ type Model struct {
 	Features      []string `json:"features"`
 	ContextWindow int      `json:"context_window"`
 	CostInPerMtok float64  `json:"cost_in_per_mtok"`
+	Enabled       bool     `json:"enabled"`
 }
 
 type WorkItem struct {
@@ -64,13 +65,25 @@ type Decision struct {
 
 // Eligible applies spec §9. It returns false plus a human-readable reason;
 // the reason is what /why prints, so it must name the rule that failed.
+//
+// Availability is checked first, then capability, then policy. That order is
+// deliberate: "your only gpu node is offline" is the answer an operator needs,
+// and it would be hidden behind "no provider for gpu" if capability came first.
+// Every rule is here, not in the loader, so the claiming path and the
+// explanation path cannot drift apart.
 func Eligible(item WorkItem, c Candidate) (bool, string) {
-	provides := append(append([]string{}, c.Node.ProvidesLive...), c.Model.Provides...)
-	if miss := caps.Missing(item.Needs, provides); len(miss) > 0 {
-		return false, "no provider for " + strings.Join(miss, ",")
+	if c.Node.Status != "online" {
+		return false, "node " + c.Node.Name + " is " + c.Node.Status
 	}
 	if c.Endpoint.Health != "ok" {
 		return false, "endpoint " + c.Endpoint.Name + " is " + c.Endpoint.Health
+	}
+	if !c.Model.Enabled {
+		return false, "model " + c.Model.ModelID + " is disabled"
+	}
+	provides := append(append([]string{}, c.Node.ProvidesLive...), c.Model.Provides...)
+	if miss := caps.Missing(item.Needs, provides); len(miss) > 0 {
+		return false, "no provider for " + strings.Join(miss, ",")
 	}
 	if !contains(c.Node.ReachClasses, c.Endpoint.Reach) {
 		return false, fmt.Sprintf("node cannot reach %s endpoints", c.Endpoint.Reach)

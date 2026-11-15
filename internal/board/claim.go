@@ -25,18 +25,40 @@ type ClaimedItem struct {
 }
 
 // LoadCandidates reads every online node, every endpoint that is healthy, and
-// their enabled models: the input to placement. Callers narrow it to the node
+// their enabled models: the input to claiming. Callers narrow it to the node
 // that is asking, because capability eligibility is per node (spec §9).
+//
+// These filters repeat rules Eligible enforces. That is intentional: here they
+// are a prefilter so Claim does not scan rows it would discard, while the rule
+// itself lives in one place. /why uses LoadAllCandidates for the rows this
+// loader removes.
 func LoadCandidates(ctx context.Context, db *sql.DB) ([]Candidate, error) {
-	rows, err := db.QueryContext(ctx, `
+	return loadCandidates(ctx, db, true)
+}
+
+// LoadAllCandidates is LoadCandidates without the availability prefilter: every
+// node, every endpoint and every model, including offline nodes, unhealthy
+// endpoints and disabled models. /why needs the rows the narrow loader drops,
+// because a candidate that is never loaded is a candidate the explanation
+// cannot name — "your only gpu node is offline" is exactly the answer an
+// operator asks /why for.
+func LoadAllCandidates(ctx context.Context, db *sql.DB) ([]Candidate, error) {
+	return loadCandidates(ctx, db, false)
+}
+
+func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly bool) ([]Candidate, error) {
+	query := `
 		SELECT n.id, n.name, n.role, n.provides_live, n.reach_classes, n.concurrency,
 		       n.status, n.agent_version,
 		       e.id, e.name, e.provider, e.reach, e.health,
-		       m.id, m.model_id, m.provides, m.features, m.context_window, m.cost_in_per_mtok
+		       m.id, m.model_id, m.provides, m.features, m.context_window, m.cost_in_per_mtok, m.enabled
 		  FROM nodes n
 		  JOIN endpoints e ON 1=1
-		  JOIN models m ON m.endpoint_id = e.id
-		 WHERE n.status = 'online' AND m.enabled = 1 AND e.health = 'ok'`)
+		  JOIN models m ON m.endpoint_id = e.id`
+	if placeableOnly {
+		query += ` WHERE n.status = 'online' AND m.enabled = 1 AND e.health = 'ok'`
+	}
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +72,8 @@ func LoadCandidates(ctx context.Context, db *sql.DB) ([]Candidate, error) {
 			&c.Node.ID, &c.Node.Name, &c.Node.Role, &live, &reach, &c.Node.Concurrency,
 			&c.Node.Status, &c.Node.AgentVersion,
 			&c.Endpoint.ID, &c.Endpoint.Name, &c.Endpoint.Provider, &c.Endpoint.Reach, &c.Endpoint.Health,
-			&c.Model.ID, &c.Model.ModelID, &provides, &features, &c.Model.ContextWindow, &c.Model.CostInPerMtok,
+			&c.Model.ID, &c.Model.ModelID, &provides, &features, &c.Model.ContextWindow,
+			&c.Model.CostInPerMtok, &c.Model.Enabled,
 		); err != nil {
 			return nil, err
 		}

@@ -4,9 +4,15 @@ import "testing"
 
 func cand(nodeName, role string, provides []string, endpointName, reach, health string, features []string, cost float64) Candidate {
 	return Candidate{
-		Node:     Node{Name: nodeName, Role: role, ProvidesLive: provides, ReachClasses: []string{"host", "lan", "wan"}},
+		Node: Node{
+			Name: nodeName, Role: role, ProvidesLive: provides,
+			ReachClasses: []string{"host", "lan", "wan"}, Status: "online",
+		},
 		Endpoint: Endpoint{Name: endpointName, Reach: reach, Health: health},
-		Model:    Model{ModelID: endpointName + "-m", Features: features, CostInPerMtok: cost, ContextWindow: 200000},
+		Model: Model{
+			ModelID: endpointName + "-m", Features: features,
+			CostInPerMtok: cost, ContextWindow: 200000, Enabled: true,
+		},
 	}
 }
 
@@ -211,6 +217,32 @@ func TestPlaceRejectNamesTheMissingCapability(t *testing.T) {
 	}
 	if d.Rejects[0].Why != "no provider for gpu" {
 		t.Fatalf("reject why %q does not name the missing capability", d.Rejects[0].Why)
+	}
+}
+
+func TestPlaceRejectsAnOfflineNode(t *testing.T) {
+	c := cand("pi", "steward", []string{"reflex"}, "local", "host", "ok", nil, 0)
+	c.Node.Status = "offline"
+
+	ok, why := Eligible(item("reflex"), c)
+	if ok {
+		t.Fatal("placed work on an offline node")
+	}
+	if why != "node pi is offline" {
+		t.Fatalf("reason %q does not name the node-status rule", why)
+	}
+}
+
+func TestPlaceRejectsADisabledModel(t *testing.T) {
+	c := cand("laptop", "executor", []string{"agentic"}, "gpt", "wan", "ok", []string{"tools"}, 0)
+	c.Model.Enabled = false
+
+	ok, why := Eligible(item("agentic"), c)
+	if ok {
+		t.Fatal("placed work on a disabled model")
+	}
+	if why != "model gpt-m is disabled" {
+		t.Fatalf("reason %q does not name the model-enabled rule", why)
 	}
 }
 

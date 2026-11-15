@@ -41,7 +41,11 @@ func Explain(ctx context.Context, db *sql.DB, clock Clock, itemID string) (Expla
 	}
 	ex.Needs = needs
 
-	cands, err := LoadCandidates(ctx, db)
+	// LoadAllCandidates, not LoadCandidates: the narrow loader prefilters
+	// offline nodes, unhealthy endpoints and disabled models, and a candidate
+	// that is never loaded can never appear in Rejects. The explanation has to
+	// be able to say "your only gpu node is offline".
+	cands, err := LoadAllCandidates(ctx, db)
 	if err != nil {
 		return ex, err
 	}

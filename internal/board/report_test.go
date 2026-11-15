@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReportIsIdempotent(t *testing.T) {
@@ -70,14 +71,21 @@ func TestReportIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}
-	reported := 0
+	reported, reportedPayload := 0, ""
 	for _, e := range events {
 		if e.Type == "reported" {
 			reported++
+			reportedPayload = e.Payload
 		}
 	}
 	if reported != 1 {
 		t.Fatalf("got %d reported events, want exactly 1 (a retry wrote one)", reported)
+	}
+	// The payload keys the run counter as run_attempt: work_items.attempt is a
+	// different number (started runs), and a bare "attempt" here is the
+	// two-counter confusion this project has already paid for.
+	if !strings.Contains(reportedPayload, `"run_attempt":`) || strings.Contains(reportedPayload, `"attempt":`) {
+		t.Fatalf("reported payload = %q, want the run ordinal keyed run_attempt", reportedPayload)
 	}
 }
 
@@ -122,6 +130,183 @@ func TestReportRejectsAWrongNode(t *testing.T) {
 // A worker that reports and dies before reading the reply may retry while the
 // first report is still committing. Exactly one of the racing reports may win,
 // and the item must carry the winner's summary.
+// A node may report a run it claimed but never started: the start call is
+// advisory, the report is what settles. The item still completes and the run is
+// still closed exactly once.
+func TestReportCompletesAClaimedRunThatNeverStarted(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	got, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Claim: %v (got %d items)", err, len(got))
+	}
+
+	res, err := Report(ctx, db, clock, got[0].RunID, node,
+		ReportRequest{Status: "ok", Summary: "executed without a start call"})
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if !res.Applied || res.ItemStatus != "done" {
+		t.Fatalf("report = %+v, want applied/done", res)
+	}
+
+	var runStatus string
+	var ended sql.NullInt64
+	if err := db.QueryRow(`SELECT status, ended_at FROM runs WHERE id=?`, got[0].RunID).
+		Scan(&runStatus, &ended); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if runStatus != "ok" || !ended.Valid {
+		t.Fatalf("run = %q (ended=%v), want ok and closed", runStatus, ended.Valid)
+	}
+	var itemStatus string
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, id).Scan(&itemStatus); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if itemStatus != "done" {
+		t.Fatalf("item status = %q, want done", itemStatus)
+	}
+}
+
+// A report that arrives after the reaper has already settled the run is a
+// no-op: the run is lost and the item is back in the queue. A late report must
+// not resurrect either, nor claim credit in the audit log.
+func TestReportAfterAReapIsANoOp(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	got, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Claim: %v (got %d items)", err, len(got))
+	}
+	runID := got[0].RunID
+	if err := StartRun(ctx, db, clock, runID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	clock.Advance(time.Duration(leaseSeconds+1) * time.Second)
+	if res, err := Reap(ctx, db, clock); err != nil || res.Lost != 1 {
+		t.Fatalf("Reap = %+v, %v; want one lost run", res, err)
+	}
+
+	late, err := Report(ctx, db, clock, runID, node, ReportRequest{Status: "ok", Summary: "too late"})
+	if err != nil {
+		t.Fatalf("late Report: %v", err)
+	}
+	if late.Applied {
+		t.Fatal("a report after the reap was applied; the run is already settled")
+	}
+	if late.ItemStatus != "queued" {
+		t.Fatalf("late report item status = %q, want queued", late.ItemStatus)
+	}
+
+	var runStatus, itemStatus string
+	if err := db.QueryRow(`SELECT status FROM runs WHERE id=?`, runID).Scan(&runStatus); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, id).Scan(&itemStatus); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if runStatus != "lost" || itemStatus != "queued" {
+		t.Fatalf("run/item = %q/%q after the late report, want lost/queued", runStatus, itemStatus)
+	}
+
+	events, err := ListEvents(ctx, db, "work_item", id, 50)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	for _, e := range events {
+		if e.Type == "reported" {
+			t.Fatal("the late report wrote a reported event")
+		}
+	}
+}
+
+// The item write is guarded too: if something settled the item while the run
+// was still live, the report must not resurrect it. The whole call rolls back,
+// leaving the run for whoever settled the item to close (obligation 2); this
+// call adds nothing.
+func TestReportDoesNotResurrectAnItemSettledUnderIt(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	got, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Claim: %v (got %d items)", err, len(got))
+	}
+	runID := got[0].RunID
+	if err := StartRun(ctx, db, clock, runID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	// No cancel writer exists yet, so construct the state StartRun's own test
+	// uses: the item is settled, its run is not.
+	if _, err := db.ExecContext(ctx, `UPDATE work_items SET status='cancelled' WHERE id=?`, id); err != nil {
+		t.Fatalf("cancel item: %v", err)
+	}
+
+	res, err := Report(ctx, db, clock, runID, node, ReportRequest{Status: "ok", Summary: "late"})
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if res.Applied {
+		t.Fatal("the report resurrected a cancelled item")
+	}
+	if res.ItemStatus != "cancelled" {
+		t.Fatalf("report item status = %q, want cancelled", res.ItemStatus)
+	}
+
+	var runStatus string
+	var ended sql.NullInt64
+	if err := db.QueryRow(`SELECT status, ended_at FROM runs WHERE id=?`, runID).
+		Scan(&runStatus, &ended); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if runStatus != "running" || ended.Valid {
+		t.Fatalf("run = %q (ended=%v) after a refused item write, want the whole call rolled back", runStatus, ended.Valid)
+	}
+}
+
+// A status the board does not understand is a malformed report, not a failure:
+// an omitted field must not permanently fail an item that may have succeeded.
+func TestReportRejectsAnUnknownStatus(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	got, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Claim: %v (got %d items)", err, len(got))
+	}
+	runID := got[0].RunID
+	if err := StartRun(ctx, db, clock, runID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	for _, status := range []string{"", "OK", "failed", "done"} {
+		if _, err := Report(ctx, db, clock, runID, node,
+			ReportRequest{Status: status, Summary: "x"}); err == nil {
+			t.Fatalf("status %q was accepted", status)
+		}
+	}
+
+	// The rejected calls wrote nothing, so a real report still lands.
+	res, err := Report(ctx, db, clock, runID, node, ReportRequest{Status: "ok", Summary: "real"})
+	if err != nil {
+		t.Fatalf("valid Report after rejected ones: %v", err)
+	}
+	if !res.Applied {
+		t.Fatal("valid report was not applied after rejected ones")
+	}
+}
+
 func TestConcurrentReportsCompleteOnce(t *testing.T) {
 	db, clock := newTestDB(t)
 	ctx := context.Background()
@@ -203,6 +388,82 @@ func TestExplainSaysWhyNothingRan(t *testing.T) {
 	}
 }
 
+// The regression guard for the explanation gap: a candidate the claiming
+// loader filters out must still be named by /why. Before the unfiltered loader,
+// each of these cases produced zero rejects, so the operator saw only
+// "no eligible candidate" while the real reason was hidden in a WHERE clause.
+func TestExplainNamesTheRuleThatDroppedTheOnlyCandidate(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, db *sql.DB, clock *FixedClock)
+		want  string
+	}{
+		{
+			name: "offline node",
+			setup: func(t *testing.T, db *sql.DB, clock *FixedClock) {
+				// Registered, never heartbeated: status 'offline'.
+				if _, _, err := RegisterNode(context.Background(), db, clock, RegisterRequest{
+					Name: "pi", Role: "steward", ProvidesDeclared: []string{"gpu"},
+					ReachClasses: []string{"host", "lan", "wan"}, Concurrency: 1,
+				}); err != nil {
+					t.Fatalf("register: %v", err)
+				}
+				SeedEndpointForTest(t, db, clock, "local", "host", 0)
+			},
+			want: "node pi is offline",
+		},
+		{
+			name: "disabled model",
+			setup: func(t *testing.T, db *sql.DB, clock *FixedClock) {
+				SeedNodeForTest(t, db, clock, "a", "executor", "gpu")
+				SeedEndpointForTest(t, db, clock, "local", "host", 0)
+				if _, err := db.Exec(`UPDATE models SET enabled=0`); err != nil {
+					t.Fatalf("disable model: %v", err)
+				}
+			},
+			want: "model local-model is disabled",
+		},
+		{
+			name: "unhealthy endpoint",
+			setup: func(t *testing.T, db *sql.DB, clock *FixedClock) {
+				SeedNodeForTest(t, db, clock, "a", "executor", "gpu")
+				SeedEndpointForTest(t, db, clock, "local", "host", 0)
+				if _, err := db.Exec(`UPDATE endpoints SET health='down'`); err != nil {
+					t.Fatalf("mark endpoint down: %v", err)
+				}
+			},
+			want: "endpoint local is down",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, clock := newTestDB(t)
+			ctx := context.Background()
+			tc.setup(t, db, clock)
+			id, _ := CreateItem(ctx, db, clock, CreateItemRequest{
+				Title: "t", Brief: "b", Needs: []string{"gpu"},
+			})
+
+			ex, err := Explain(ctx, db, clock, id)
+			if err != nil {
+				t.Fatalf("Explain: %v", err)
+			}
+			if ex.Placed {
+				t.Fatal("Explain says the item is placeable; the only candidate is unavailable")
+			}
+			if len(ex.Rejects) == 0 {
+				t.Fatal("Explain returned no rejects; the unavailable candidate was silently dropped")
+			}
+			if ex.Rejects[0].Why != tc.want {
+				t.Fatalf("reject = %q, want %q", ex.Rejects[0].Why, tc.want)
+			}
+			if ex.BlockedReason == "" {
+				t.Fatal("Explain returned no blocked_reason")
+			}
+		})
+	}
+}
+
 // TestRunRoutesStartReportAndWhy exercises the three new routes through
 // Handler(), so the route patterns, the node/admin auth split and the JSON
 // shapes are pinned rather than assumed from the handler bodies.
@@ -230,6 +491,14 @@ func TestRunRoutesStartReportAndWhy(t *testing.T) {
 	if started["status"] != "running" {
 		t.Fatalf("start body = %v, want status running", started)
 	}
+
+	// A body missing status is a malformed request, not a failed item.
+	rec = doJSON(t, h, "POST", "/runs/"+runID+"/report", token,
+		map[string]any{"summary": "missing status"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status-less report = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "report")
 
 	rec = doJSON(t, h, "POST", "/runs/"+runID+"/report", token,
 		map[string]any{"status": "ok", "summary": "done via http"})
