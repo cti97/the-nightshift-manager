@@ -1,15 +1,22 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/cti97/the-nightshift-manager/internal/board"
 	"github.com/cti97/the-nightshift-manager/internal/version"
 )
+
+// reaperEvery is how often the manager sweeps expired leases (spec §8). It
+// lives beside the process that starts the loop, not in the board package,
+// because the cadence is an operational choice.
+const reaperEvery = 30 * time.Second
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
@@ -65,6 +72,10 @@ func managerServe(args []string, errOut io.Writer) int {
 
 	srv := board.NewServer(db, board.SystemClock(), board.HashToken(admin))
 	fmt.Fprintf(errOut, "nsm manager listening on %s (db %s)\n", *addr, *path)
+	// The reaper is the only thing that expires a lease: without it a node that
+	// dies mid-run holds its item forever. It lives for the life of the process;
+	// a graceful shutdown path is a later task, so the context is not cancelled.
+	go srv.RunReaper(context.Background(), reaperEvery)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		fmt.Fprintf(errOut, "serve: %v\n", err)
 		return 1

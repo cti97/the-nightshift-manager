@@ -103,11 +103,12 @@ func Reap(ctx context.Context, db *sql.DB, clock Clock) (ReapResult, error) {
 			nextRunStatus = "lost"
 		}
 		// Claim deliberately does not check the budget (see Claim), so this is
-		// the only place an over-budget item is ever failed. Without it the row
-		// would be requeued and then sit in queued forever, because the scan
-		// only looks at claimed/running rows.
+		// the only place an over-budget item is ever failed. The budget applies
+		// to runs that actually started: a claim that never started has spent
+		// nothing (spec §8 — "reaped without incrementing attempt, no tokens
+		// spent"), so it is requeued however high its counter has climbed.
 		itemStatus := "queued"
-		if e.attempt >= e.maxAttempts {
+		if runStatus == "running" && e.attempt >= e.maxAttempts {
 			itemStatus = "failed"
 		}
 

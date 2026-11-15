@@ -210,12 +210,10 @@ func TestReapNeverRewindsASettledRun(t *testing.T) {
 	}
 }
 
-// The budget check cannot be limited to started runs: Claim does not look at
-// max_attempts, and a requeued item whose attempt is already at the cap would
-// otherwise cycle claimed↔queued forever while its counter grew. Reaping an
-// over-budget claim as failed is what bounds a node that keeps dying between
-// claim and start.
-func TestReapFailsAnAbandonedClaimThatExhaustedItsAttempts(t *testing.T) {
+// A claim that never started has spent nothing, so the budget must not fire for
+// it even when the counter has reached max_attempts (spec §8: reaped without
+// spending an attempt). Only a run that actually started can exhaust the budget.
+func TestReapRequeuesAClaimThatNeverStartedEvenAtTheBudgetCap(t *testing.T) {
 	db, clock := newTestDB(t)
 	ctx := context.Background()
 	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
@@ -232,16 +230,16 @@ func TestReapFailsAnAbandonedClaimThatExhaustedItsAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
-	if res.Failed != 1 || res.Abandoned != 1 {
-		t.Fatalf("result = %+v, want one abandoned run and one failed item", res)
+	if res.Failed != 0 || res.Abandoned != 1 {
+		t.Fatalf("result = %+v, want one abandoned run and no failure", res)
 	}
 
 	var status string
 	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, id).Scan(&status); err != nil {
 		t.Fatalf("read item: %v", err)
 	}
-	if status != "failed" {
-		t.Fatalf("status = %q, want failed", status)
+	if status != "queued" {
+		t.Fatalf("status = %q, want queued (nothing was spent, so nothing is exhausted)", status)
 	}
 }
 
