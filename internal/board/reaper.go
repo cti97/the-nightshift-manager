@@ -4,21 +4,42 @@ package board
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
 
-// StartRun moves a run from claimed to running. This single transition is what
-// lets the reaper tell a claim that never started from a run that died
-// mid-flight, and therefore whether the attempt should be charged.
+// StartRun moves a run from claimed to running, and records the start time and
+// the audit event in the same transaction as the transition. This single
+// transition is what lets the reaper tell a claim that never started from a run
+// that died mid-flight, and therefore whether the attempt should be charged.
 //
-// The clock is accepted for signature parity with every other board writer and
-// because Task 10's start handler passes it; nothing here needs a timestamp:
-// started_at is the claim time, and the attempt is already recorded.
+// It is transactional for the same reason every other board write is: a report
+// can land immediately after a bare UPDATE, and a transition without an event
+// would be invisible to the dashboard that projects state from the audit spine.
 func StartRun(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string) error {
-	res, err := db.ExecContext(ctx,
-		`UPDATE runs SET status='running' WHERE id=? AND node_id=? AND status='claimed'`,
-		runID, nodeID)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // a commit makes this a no-op
+
+	// Read inside the transaction so the guard, the timestamp and the event all
+	// describe the same row. The run is the only evidence that a start happened,
+	// so a start that is not recorded here is a start the reaper cannot see.
+	var itemID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT work_item_id FROM runs WHERE id=? AND node_id=? AND status='claimed'`,
+		runID, nodeID).Scan(&itemID); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("run %s is not a claimable run for node %s", runID, nodeID)
+		}
+		return err
+	}
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE runs SET status='running', started_at=? WHERE id=? AND status='claimed'`,
+		clock.Now(), runID)
 	if err != nil {
 		return err
 	}
@@ -29,7 +50,11 @@ func StartRun(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 	if n != 1 {
 		return fmt.Errorf("run %s is not a claimable run for node %s", runID, nodeID)
 	}
-	return nil
+	if err := AppendEvent(ctx, tx, clock, "node:"+nodeID, "work_item", itemID, "started",
+		map[string]any{"run": runID}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ReapResult counts what one pass changed. Abandoned and Lost are run
@@ -52,6 +77,10 @@ type reapOutcome struct {
 // attempt is spent: `claimed` never started, so the claim's attempt is refunded;
 // `running` may have had side effects, so it is kept and burns the budget
 // (spec §8).
+//
+// An item that cannot be settled (a corrupted board) is reported through the
+// returned error but does not stop the pass: the rest of the expired leases are
+// still recovered.
 func Reap(ctx context.Context, db *sql.DB, clock Clock) (ReapResult, error) {
 	now := clock.Now()
 	ids, err := expiredItemIDs(ctx, db, now)
@@ -60,12 +89,15 @@ func Reap(ctx context.Context, db *sql.DB, clock Clock) (ReapResult, error) {
 	}
 
 	var res ReapResult
+	var errs []error
 	for _, id := range ids {
 		out, err := reapItem(ctx, db, clock, id, now)
 		if err != nil {
-			// Counted only up to here: ReapResult must never claim work it did
-			// not commit.
-			return res, err
+			// One corrupt item must not stop the pass: the scan order is stable,
+			// so returning here would starve every other lease forever. Collect
+			// and keep going; RunReaper logs the joined error.
+			errs = append(errs, err)
+			continue
 		}
 		switch out.run {
 		case "lost":
@@ -77,7 +109,7 @@ func Reap(ctx context.Context, db *sql.DB, clock Clock) (ReapResult, error) {
 			res.Failed++
 		}
 	}
-	return res, nil
+	return res, errors.Join(errs...)
 }
 
 // expiredItemIDs is the scan. It selects ids only: every column that decides an
@@ -141,6 +173,15 @@ func reapItem(ctx context.Context, db *sql.DB, clock Clock, itemID string, now i
 		return reapOutcome{}, err
 	}
 
+	// No run to settle. A claimed item cannot have started — Claim and StartRun
+	// both need the run row — so it is safe to refund the claim. An item that
+	// says it is running is a different story: its work may have started, and
+	// requeueing it would execute that work twice.
+	if runID == "" && status != "claimed" {
+		return reapOutcome{}, fmt.Errorf(
+			"work item %s is %q but has no non-terminal run; refusing to requeue work that may have started",
+			itemID, status)
+	}
 	started := runStatus == "running"
 	nextRunStatus := "abandoned"
 	if started {
@@ -175,8 +216,13 @@ func reapItem(ctx context.Context, db *sql.DB, clock Clock, itemID string, now i
 		itemStatus, nextAttempt, now, itemID); err != nil {
 		return reapOutcome{}, err
 	}
+	// The attempt change is part of the event: a refund is the one audit question
+	// an operator will ask ("why did the budget go back down?").
 	if err := AppendEvent(ctx, tx, clock, "system", "work_item", itemID, "reaped",
-		map[string]any{"run": nextRunStatus, "item": itemStatus}); err != nil {
+		map[string]any{
+			"run": nextRunStatus, "item": itemStatus,
+			"attempt_from": attempt, "attempt_to": nextAttempt,
+		}); err != nil {
 		return reapOutcome{}, err
 	}
 	if err := tx.Commit(); err != nil {

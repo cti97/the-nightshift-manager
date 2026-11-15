@@ -58,6 +58,22 @@ func TestReapRewardsAClaimThatNeverStarted(t *testing.T) {
 		t.Fatalf("run status = %q, want abandoned", runStatus)
 	}
 
+	// The refund is visible in the audit log with both numbers: that is where an
+	// operator would explain why an item's budget went back down.
+	events, err := ListEvents(ctx, db, "work_item", id, 50)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var reaped string
+	for _, e := range events {
+		if e.Type == "reaped" {
+			reaped = e.Payload
+		}
+	}
+	if !strings.Contains(reaped, `"attempt_from":1`) || !strings.Contains(reaped, `"attempt_to":0`) {
+		t.Fatalf("reaped event payload %q, want attempt_from 1 and attempt_to 0", reaped)
+	}
+
 	// The refund only means something if the budget is usable again: claim the
 	// item a second time and it must arrive as attempt 1 with a fresh run, while
 	// the abandoned run keeps its own ordinal.
@@ -327,6 +343,173 @@ func TestReapRequeuesAClaimThatNeverStartedEvenAtTheBudgetCap(t *testing.T) {
 	}
 }
 
+// A heartbeat can extend a lease between Reap's scan and this item's
+// transaction. The transaction re-reads the lease so a renewed claim is left
+// alone: the node is still working on it. The settle is called directly because
+// the scan would no longer select the item once the lease moved.
+func TestReapSkipsAnItemWhoseLeaseWasRenewed(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	if _, err := Claim(ctx, db, clock, node, 1); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	stepPastLease(clock)
+	now := clock.Now() // the moment the scan decided this lease was expired
+	// A heartbeat lands in the gap and renews the lease.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE work_items SET lease_expires_at=? WHERE id=?`, now+leaseSeconds, id); err != nil {
+		t.Fatalf("renew lease: %v", err)
+	}
+
+	out, err := reapItem(ctx, db, clock, id, now)
+	if err != nil {
+		t.Fatalf("reapItem: %v", err)
+	}
+	if out.run != "skipped" {
+		t.Fatalf("outcome = %+v, want skipped (the lease was renewed)", out)
+	}
+
+	var status, runStatus string
+	var attempt int
+	if err := db.QueryRow(`SELECT status, attempt FROM work_items WHERE id=?`, id).Scan(&status, &attempt); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if err := db.QueryRow(`SELECT status FROM runs WHERE work_item_id=?`, id).Scan(&runStatus); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if status != "claimed" || attempt != 1 {
+		t.Fatalf("item = %q/attempt %d, want claimed/1 (nothing was reaped)", status, attempt)
+	}
+	if runStatus != "claimed" {
+		t.Fatalf("run status = %q, want claimed", runStatus)
+	}
+}
+
+// The refund has a floor. SQLite has no CHECK on attempt, so a claimed item at 0
+// would otherwise be written to -1. Only a bug or DB surgery gets an item there,
+// and the floor is the difference between "refunded" and "corrupted".
+func TestReapRefundNeverGoesNegative(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	if _, err := Claim(ctx, db, clock, node, 1); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE work_items SET attempt=0 WHERE id=?`, id); err != nil {
+		t.Fatalf("force attempt 0: %v", err)
+	}
+	stepPastLease(clock)
+	if _, err := Reap(ctx, db, clock); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if got := itemAttempt(t, db, id); got != 0 {
+		t.Fatalf("attempt = %d, want 0 (the refund must not go below zero)", got)
+	}
+}
+
+// An item that says it is running must never be requeued on the strength of a
+// missing run: its work may have started, and requeueing it would run that work
+// twice. A claimed item with no run cannot have started (there is no run id to
+// start), so that case is refunded instead — it is exercised in
+// TestReapRewardsAClaimThatNeverStarted's sibling paths.
+func TestReapRefusesToRequeueARunningItemWithNoRun(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	if _, err := Claim(ctx, db, clock, node, 1); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	// The corrupt state: the item says running, its run is already terminal.
+	// Nothing on the board can produce this; a bug could.
+	if _, err := db.ExecContext(ctx, `UPDATE runs SET status='lost' WHERE work_item_id=?`, id); err != nil {
+		t.Fatalf("terminalise run: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE work_items SET status='running' WHERE id=?`, id); err != nil {
+		t.Fatalf("mark item running: %v", err)
+	}
+	stepPastLease(clock)
+
+	if _, err := Reap(ctx, db, clock); err == nil {
+		t.Fatal("Reap requeued a running item whose run is gone")
+	} else if !strings.Contains(err.Error(), "may have started") {
+		t.Fatalf("error = %v, want it to name the risk", err)
+	}
+
+	var status string
+	var attempt int
+	if err := db.QueryRow(`SELECT status, attempt FROM work_items WHERE id=?`, id).Scan(&status, &attempt); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if status != "running" || attempt != 1 {
+		t.Fatalf("item = %q/attempt %d, want it left exactly as found (running/1)", status, attempt)
+	}
+}
+
+// One corrupt item must not stop the pass. The scan order is stable, so an
+// early return would starve every other lease forever, and the corrupt item is
+// inserted first on purpose: it is the one the scan reaches first. Both items
+// stay 'claimed' so the corrupt one really is first in scan order.
+func TestReapKeepsGoingPastACorruptItem(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	corruptID, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "bad", Brief: "b", Needs: []string{"agentic"}})
+	healthyID, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "ok", Brief: "b", Needs: []string{"agentic"}})
+	got, err := Claim(ctx, db, clock, node, 2)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("Claim: got %d items, err %v", len(got), err)
+	}
+
+	// Two non-terminal runs for one item: the corrupt state the loud guard exists
+	// for. The item's status is untouched, so the scan order is unchanged.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO runs (id,work_item_id,attempt,node_id,endpoint_id,model_id,started_at,status,placement_reason)
+		 SELECT 'dup-run', work_item_id, 2, node_id, endpoint_id, model_id, started_at, 'claimed', placement_reason
+		   FROM runs WHERE work_item_id=?`, corruptID); err != nil {
+		t.Fatalf("insert second run: %v", err)
+	}
+
+	stepPastLease(clock)
+	res, err := Reap(ctx, db, clock)
+	if err == nil {
+		t.Fatal("Reap accepted two non-terminal runs for one item")
+	}
+	if !strings.Contains(err.Error(), "non-terminal") {
+		t.Fatalf("error = %v, want it to name the non-terminal runs", err)
+	}
+
+	var healthyStatus string
+	var healthyAttempt int
+	if err := db.QueryRow(`SELECT status, attempt FROM work_items WHERE id=?`, healthyID).
+		Scan(&healthyStatus, &healthyAttempt); err != nil {
+		t.Fatalf("read healthy item: %v", err)
+	}
+	if healthyStatus != "queued" || healthyAttempt != 0 {
+		t.Fatalf("healthy item = %q/attempt %d, want queued/0: the pass must keep going past the corrupt item",
+			healthyStatus, healthyAttempt)
+	}
+	if res.Abandoned != 1 {
+		t.Fatalf("Reap = %+v, want the healthy item counted", res)
+	}
+
+	var corruptStatus string
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, corruptID).Scan(&corruptStatus); err != nil {
+		t.Fatalf("read corrupt item: %v", err)
+	}
+	if corruptStatus != "claimed" {
+		t.Fatalf("corrupt item status = %q, want it left alone as claimed", corruptStatus)
+	}
+}
+
 // StartRun is the only thing that makes an attempt expensive, so it must not be
 // a no-op for the wrong node or for a run that is already running: either would
 // let a run be "started" without the transition that charges the attempt.
@@ -354,6 +537,57 @@ func TestStartRunRefusesARunItDoesNotOwnOrAlreadyStarted(t *testing.T) {
 	}
 	if err := StartRun(ctx, db, clock, runID, node); err == nil {
 		t.Fatal("StartRun started the same run twice")
+	}
+}
+
+// StartRun is a state change like any other: it records the start time and the
+// audit event in the same transaction as the transition, so a run can never be
+// "running" without the board knowing when it started and that it happened.
+func TestStartRunRecordsTheStartTimeAndAnEvent(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	got, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Claim: %v", err)
+	}
+	claimedAt := clock.Now()
+
+	clock.Advance(5 * time.Second)
+	if err := StartRun(ctx, db, clock, got[0].RunID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	var status string
+	var startedAt int64
+	if err := db.QueryRow(`SELECT status, started_at FROM runs WHERE id=?`, got[0].RunID).
+		Scan(&status, &startedAt); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("run status = %q, want running", status)
+	}
+	if startedAt != clock.Now() || startedAt == claimedAt {
+		t.Fatalf("started_at = %d, want the start time %d, not the claim time %d", startedAt, clock.Now(), claimedAt)
+	}
+
+	events, err := ListEvents(ctx, db, "work_item", got[0].Item.ID, 50)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var found bool
+	for _, e := range events {
+		if e.Type == "started" {
+			found = true
+			if !strings.Contains(e.Payload, got[0].RunID) {
+				t.Fatalf("started event payload %q does not name run %q", e.Payload, got[0].RunID)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no 'started' event for item %s: %+v", got[0].Item.ID, events)
 	}
 }
 
