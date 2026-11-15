@@ -14,8 +14,12 @@ type ClaimRequest struct {
 	FreeSlots int `json:"free_slots"`
 }
 
+// ClaimedItem is the claim payload. Brief lives here, not on WorkItem:
+// placement must never read prose, so the type it ranks stays prose-free,
+// while the worker still gets the text it is being asked to execute.
 type ClaimedItem struct {
 	Item            WorkItem `json:"item"`
+	Brief           string   `json:"brief"`
 	RunID           string   `json:"run_id"`
 	PlacementReason string   `json:"placement_reason"`
 }
@@ -130,20 +134,20 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 	}
 
 	rows, err := conn.QueryContext(ctx,
-		`SELECT id,title,needs,status,attempt FROM work_items
+		`SELECT id,title,brief,needs,status,attempt FROM work_items
 		  WHERE status='queued' ORDER BY priority DESC, created_at ASC LIMIT 50`)
 	if err != nil {
 		return nil, err
 	}
 
 	type row struct {
-		id, title, needs, status string
-		attempt                  int
+		id, title, brief, needs, status string
+		attempt                         int
 	}
 	var queued []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.id, &r.title, &r.needs, &r.status, &r.attempt); err != nil {
+		if err := rows.Scan(&r.id, &r.title, &r.brief, &r.needs, &r.status, &r.attempt); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -203,7 +207,9 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 		}
 
 		item.Status, item.Attempt = "claimed", r.attempt+1
-		claimed = append(claimed, ClaimedItem{Item: item, RunID: runID, PlacementReason: d.Reason})
+		claimed = append(claimed, ClaimedItem{
+			Item: item, Brief: r.brief, RunID: runID, PlacementReason: d.Reason,
+		})
 	}
 
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
