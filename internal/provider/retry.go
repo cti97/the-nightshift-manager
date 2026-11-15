@@ -61,34 +61,38 @@ type RetryDecision struct {
 }
 
 // DecideRetry classifies err and says whether it is worth another attempt.
-// ctx must be the caller's own context — the one whose ending means "stop this
-// run" — never an adapter's per-attempt timeout context. It is consulted only
-// for whether it has ended, so the decision depends only on err and on whether
-// the work is still wanted; it is pure, reads no clock and blocks on nothing.
-// A nil ctx is treated as "no caller signal", which is useful only to a caller
-// that classifies without one.
+// runCtx must be the run's own context — the one whose ending means "stop this
+// run" — never an adapter's per-attempt timeout context. The name is deliberate:
+// an executor that passes a context it created with WithTimeout around one call
+// makes every per-request timeout look like a shutdown, and the deadline row
+// below silently becomes "no retry". runCtx is consulted only for whether it has
+// ended, so the decision is deterministic, clock-free and blocks on nothing; it
+// is not "pure" in the strict sense because it reads that one fact from runCtx.
+// A nil runCtx is treated as "no caller signal", which is useful only to a
+// caller that classifies without one.
 //
 // The taxonomy's table (design §10) is exactly: transport, server_error and
 // rate_limited retry; auth, model_missing, bad_request and context_overflow do
-// not. context.DeadlineExceeded retries only while ctx is still live, because
+// not. context.DeadlineExceeded retries only while runCtx is still live, because
 // then it must be the adapter's per-request timeout — openai.go's do() documents
 // a Config.Timeout expiry as "a legitimate timeout rather than a cancellation" —
-// and stops once ctx itself has ended, because then it is the run's own deadline.
-// An error whose class nothing recognizes is not retried: failing closed is the
-// only defensible verdict on an error this policy cannot reason about.
-func DecideRetry(ctx context.Context, err error) RetryDecision {
+// and stops once runCtx itself has ended, because then it is the run's own
+// deadline. An error whose class nothing recognizes is not retried: failing
+// closed is the only defensible verdict on an error this policy cannot reason
+// about.
+func DecideRetry(runCtx context.Context, err error) RetryDecision {
 	if err == nil {
 		return RetryDecision{Class: ClassNone}
 	}
 
 	decision := classifyProviderError(err)
 
-	// The caller's context is the veto, and it is checked after classification
-	// so the class still names what went wrong when a retry is refused. This is
-	// the half a policy keyed on ErrTransport alone is missing: a transport
-	// failure observed as the caller shuts down is not evidence that anyone
-	// wants the request re-sent.
-	if callerErr := callerContextError(ctx); callerErr != nil && decision.Retry {
+	// The run's context is the veto, and it is checked after classification so
+	// the class still names what went wrong when a retry is refused. This is the
+	// half a policy keyed on ErrTransport alone is missing: a transport failure
+	// observed as the run shuts down is not evidence that anyone wants the
+	// request re-sent.
+	if callerErr := callerContextError(runCtx); callerErr != nil && decision.Retry {
 		decision.Retry = false
 		decision.Reason = fmt.Sprintf("the caller's context ended (%v) before the retry, so a %s failure is not re-sent into it", callerErr, decision.Class)
 	}
@@ -253,12 +257,21 @@ type SleepFunc func(ctx context.Context, d time.Duration) error
 // The error is returned unchanged so the caller can still errors.Is it; the
 // decision carries the class and the printable reason for the failure event.
 //
+// runCtx is the run's own context, and the same one is passed to attempt and to
+// every wait; it must never be a per-attempt WithTimeout context. Passing one
+// would be self-defeating: its deadline would already be spent when a
+// per-request timeout comes back, so the policy would see an ended context and
+// refuse the retry the deadline row exists to allow. The per-request timeout is
+// the adapter's (Config.Timeout), and this package deliberately does not create
+// one.
+//
 // It never calls time.Sleep: every wait goes through sleep. It also never starts
 // or continues with a context that has ended — the check is at the top of the
-// loop and the decision re-reads ctx after a wait — so a shutdown is prompt and
-// a retry cannot outlive the run that asked for it. A nil sleep or attempt is a
-// wiring bug and panics rather than silently turning a backoff into a hot loop.
-func Retry(ctx context.Context, sleep SleepFunc, attempt func(context.Context) error) (RetryDecision, error) {
+// loop and the decision re-reads runCtx after a wait — so a shutdown is prompt
+// and a retry cannot outlive the run that asked for it. A nil sleep or attempt
+// is a wiring bug and panics rather than silently turning a backoff into a hot
+// loop.
+func Retry(runCtx context.Context, sleep SleepFunc, attempt func(context.Context) error) (RetryDecision, error) {
 	if attempt == nil {
 		panic("provider: Retry called with no attempt function")
 	}
@@ -270,23 +283,23 @@ func Retry(ctx context.Context, sleep SleepFunc, attempt func(context.Context) e
 	for attemptNo := 1; ; attemptNo++ {
 		// Re-read the context before every attempt: the wait may have ended it,
 		// and the caller may have cancelled while the previous attempt ran.
-		if ctxErr := callerContextError(ctx); ctxErr != nil {
+		if ctxErr := callerContextError(runCtx); ctxErr != nil {
 			if lastErr == nil {
-				return DecideRetry(ctx, ctxErr), ctxErr
+				return DecideRetry(runCtx, ctxErr), ctxErr
 			}
-			decision := DecideRetry(ctx, lastErr)
+			decision := DecideRetry(runCtx, lastErr)
 			decision.Retry = false
 			decision.Reason = fmt.Sprintf("the caller's context ended (%v) before the next attempt, so the %s failure is not re-sent", ctxErr, decision.Class)
 			return decision, lastErr
 		}
 
-		err := attempt(ctx)
+		err := attempt(runCtx)
 		if err == nil {
 			return RetryDecision{Class: ClassNone}, nil
 		}
 		lastErr = err
 
-		decision := DecideRetry(ctx, err)
+		decision := DecideRetry(runCtx, err)
 		if !decision.Retry {
 			return decision, err
 		}
@@ -295,7 +308,7 @@ func Retry(ctx context.Context, sleep SleepFunc, attempt func(context.Context) e
 			decision.Reason = fmt.Sprintf("%s; the %d-attempt budget is spent, so the run fails on this error instead of re-queueing it", decision.Reason, MaxAttempts)
 			return decision, err
 		}
-		if err := sleep(ctx, Backoff(attemptNo)); err != nil {
+		if err := sleep(runCtx, Backoff(attemptNo)); err != nil {
 			// The wait was interrupted (normally by the caller's context
 			// ending). The provider error is still what surfaces, but the
 			// decision must not say "retry": the loop is over.

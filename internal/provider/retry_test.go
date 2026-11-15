@@ -137,6 +137,43 @@ func TestContextEndingsDoNotMaskTransport(t *testing.T) {
 	})
 }
 
+// TestTheRunContextVetoesEveryRetryableClass: the veto is one class-independent
+// line, and this table proves it fires for every class that can reach it. A
+// future edit that special-cased transport (the class the veto was written for)
+// would leave the other rows retrying into a dead context, and only this test
+// would notice.
+func TestTheRunContextVetoesEveryRetryableClass(t *testing.T) {
+	retryable := []struct {
+		name  string
+		err   error
+		class ErrorClass
+	}{
+		{name: "transport", err: fmt.Errorf("%w: connection reset", ErrTransport), class: ClassTransport},
+		{name: "server_error", err: fmt.Errorf("%w: HTTP 503", ErrServer), class: ClassServer},
+		{name: "rate_limited", err: fmt.Errorf("%w: HTTP 429", ErrRateLimited), class: ClassRateLimited},
+		{name: "deadline_exceeded", err: context.DeadlineExceeded, class: ClassDeadlineExceeded},
+	}
+	for _, tc := range retryable {
+		t.Run(tc.name, func(t *testing.T) {
+			if live := DecideRetry(context.Background(), tc.err); !live.Retry {
+				t.Fatalf("under a live run context: retry = false, want true (reason: %s)", live.Reason)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			got := DecideRetry(ctx, tc.err)
+			if got.Retry {
+				t.Fatalf("under a canceled run context: retry = true, want false (reason: %s)", got.Reason)
+			}
+			if got.Class != tc.class {
+				t.Fatalf("class = %q, want %q: the veto must not lose the class", got.Class, tc.class)
+			}
+			if !strings.Contains(got.Reason, "context ended") {
+				t.Fatalf("reason %q does not say the run's context ended", got.Reason)
+			}
+		})
+	}
+}
+
 // TestContextOverflowIsNotRetriedAndIsTaggedAsAPlacementBug: a context overflow
 // is not a runtime condition. Placement computed the token fit (design §9), so
 // the request did not fit — that is a placement bug, and the surfaced failure
@@ -183,6 +220,10 @@ func TestBackoffIsMonotonicCappedAndBounded(t *testing.T) {
 			t.Fatalf("Backoff(%d) = %v, above the cap %v", retry, wait, retryBackoffCap)
 		}
 		prev = wait
+	}
+
+	if got := Backoff(MaxAttempts + 1); got != retryBackoffCap {
+		t.Fatalf("Backoff(%d) = %v, want the cap %v: asserting only an upper bound would let a schedule that flattens early pass while 'capped' is unproven", MaxAttempts+1, got, retryBackoffCap)
 	}
 
 	if Backoff(0) != Backoff(1) {
@@ -254,6 +295,42 @@ func TestRetryRetriesTransientClassesAndRecordsTheSchedule(t *testing.T) {
 				t.Fatalf("decision on success = %+v, want class none and retry false", decision)
 			}
 		})
+	}
+}
+
+// TestRetryRetriesAPerRequestTimeoutUnderALiveRunContext pins the row whose
+// decision depends on which context the loop is handed. A WithTimeout around one
+// attempt is the natural executor shape, and it would make the adapter's
+// per-request timeout arrive with an ended context, silently turning this row
+// into "no retry". The loop must be given the run's context and must spend one
+// backoff on the timeout.
+func TestRetryRetriesAPerRequestTimeoutUnderALiveRunContext(t *testing.T) {
+	var attempts int
+	var waits []time.Duration
+	decision, err := Retry(context.Background(),
+		func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil },
+		func(ctx context.Context) error {
+			attempts++
+			if attempts == 1 {
+				if ctx.Err() != nil {
+					t.Fatalf("attempt 1: the run context was already ended: %v", ctx.Err())
+				}
+				return fmt.Errorf("provider: openai: %w", context.DeadlineExceeded)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("err = %v, want nil after the retried attempt succeeded", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2: a per-request timeout under a live run context is retryable", attempts)
+	}
+	if len(waits) != 1 || waits[0] != Backoff(1) {
+		t.Fatalf("waits = %v, want exactly [%v]", waits, Backoff(1))
+	}
+	if decision.Class != ClassNone || decision.Retry {
+		t.Fatalf("decision on success = %+v, want class none and retry false", decision)
 	}
 }
 
