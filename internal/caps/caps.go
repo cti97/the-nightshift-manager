@@ -1,8 +1,9 @@
-// internal/caps/caps.go
+// Package caps defines the closed capability vocabulary, its canonical parsing, and subset matching (spec §6).
 package caps
 
 import (
 	"fmt"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,8 +23,9 @@ const (
 	lanPrefix     = "lan:"
 )
 
-// Parse validates and canonicalises a capability list: sorted, de-duplicated,
-// and free of unknown names or malformed parameters.
+// Parse validates and canonicalises a capability list: trimmed, sorted, and
+// de-duplicated; local_fs paths are reduced to their canonical form, and
+// unknown names or malformed parameters are rejected.
 func Parse(raw []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(raw))
 	out := make([]string, 0, len(raw))
@@ -33,46 +35,56 @@ func Parse(raw []string) ([]string, error) {
 		if c == "" {
 			return nil, fmt.Errorf("empty capability")
 		}
-		if err := validate(c); err != nil {
+		canon, err := validate(c)
+		if err != nil {
 			return nil, err
 		}
-		if _, dup := seen[c]; dup {
+		if _, dup := seen[canon]; dup {
 			continue
 		}
-		seen[c] = struct{}{}
-		out = append(out, c)
+		seen[canon] = struct{}{}
+		out = append(out, canon)
 	}
 	sort.Strings(out)
 	return out, nil
 }
 
-func validate(c string) error {
+// validate checks c and returns its canonical spelling.
+func validate(c string) (string, error) {
 	switch {
 	case strings.HasPrefix(c, localFSPrefix):
 		p := strings.TrimPrefix(c, localFSPrefix)
 		if !strings.HasPrefix(p, "/") {
-			return fmt.Errorf("capability %q: local_fs path must be absolute", c)
+			return "", fmt.Errorf("capability %q: local_fs path must be absolute", c)
 		}
-		if len(p) < 2 {
-			return fmt.Errorf("capability %q: local_fs path must not be root", c)
+		p = path.Clean(p)
+		if p == "/" {
+			// path.Clean("/") is "/", so this also catches paths that only
+			// collapse to root after cleaning: no node claims the whole
+			// filesystem.
+			return "", fmt.Errorf("capability %q: local_fs path must not be root", c)
 		}
-		return nil
+		return localFSPrefix + p, nil
 	case strings.HasPrefix(c, tokensPrefix):
 		n, err := strconv.Atoi(strings.TrimPrefix(c, tokensPrefix))
 		if err != nil || n <= 0 {
-			return fmt.Errorf("capability %q: tokens must be a positive integer", c)
+			return "", fmt.Errorf("capability %q: tokens must be a positive integer", c)
 		}
-		return nil
+		return c, nil
 	case strings.HasPrefix(c, lanPrefix):
-		if strings.TrimSpace(strings.TrimPrefix(c, lanPrefix)) == "" {
-			return fmt.Errorf("capability %q: lan needs a service name", c)
+		name := strings.TrimSpace(strings.TrimPrefix(c, lanPrefix))
+		if name == "" {
+			return "", fmt.Errorf("capability %q: lan needs a service name", c)
 		}
-		return nil
+		if len(strings.Fields(name)) != 1 {
+			return "", fmt.Errorf("capability %q: lan service name must not contain whitespace", c)
+		}
+		return lanPrefix + name, nil
 	default:
 		if _, ok := vocabulary[c]; !ok {
-			return fmt.Errorf("unknown capability %q", c)
+			return "", fmt.Errorf("unknown capability %q", c)
 		}
-		return nil
+		return c, nil
 	}
 }
 
@@ -91,21 +103,49 @@ func Missing(needs, provides []string) []string {
 	return miss
 }
 
+// parameterised reports whether c carries one of the parameterised prefixes.
+// Such capabilities match only through their typed rule, never plain string
+// equality, so two identical malformed spellings cannot satisfy each other.
+func parameterised(c string) bool {
+	return strings.HasPrefix(c, localFSPrefix) ||
+		strings.HasPrefix(c, tokensPrefix) ||
+		strings.HasPrefix(c, lanPrefix)
+}
+
+// lanName extracts the service name of a lan: capability and reports whether
+// it is well-formed: exactly one whitespace-free token.
+func lanName(c string) (string, bool) {
+	fields := strings.Fields(strings.TrimPrefix(c, lanPrefix))
+	if len(fields) != 1 {
+		return "", false
+	}
+	return fields[0], true
+}
+
 func satisfiedBy(need string, provides []string) bool {
 	for _, p := range provides {
 		switch {
-		case p == need:
+		case !parameterised(need) && !parameterised(p) && p == need:
 			return true
 		case strings.HasPrefix(need, localFSPrefix) && strings.HasPrefix(p, localFSPrefix):
-			np := strings.TrimPrefix(need, localFSPrefix)
-			pp := strings.TrimPrefix(p, localFSPrefix)
-			if pp == np || strings.HasPrefix(np, strings.TrimSuffix(pp, "/")+"/") {
+			// Defensive normalisation: canonical lists from Parse are already
+			// clean, but cleaning here keeps stray trailing slashes and
+			// traversal segments from faking containment.
+			np := path.Clean(strings.TrimPrefix(need, localFSPrefix))
+			pp := path.Clean(strings.TrimPrefix(p, localFSPrefix))
+			if np == pp || strings.HasPrefix(np, pp+"/") {
 				return true
 			}
 		case strings.HasPrefix(need, tokensPrefix) && strings.HasPrefix(p, tokensPrefix):
 			n, e1 := strconv.Atoi(strings.TrimPrefix(need, tokensPrefix))
 			m, e2 := strconv.Atoi(strings.TrimPrefix(p, tokensPrefix))
-			if e1 == nil && e2 == nil && m >= n {
+			if e1 == nil && e2 == nil && n > 0 && m >= n {
+				return true
+			}
+		case strings.HasPrefix(need, lanPrefix) && strings.HasPrefix(p, lanPrefix):
+			n, ok1 := lanName(need)
+			pn, ok2 := lanName(p)
+			if ok1 && ok2 && n == pn {
 				return true
 			}
 		}
