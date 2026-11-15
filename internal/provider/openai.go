@@ -153,17 +153,16 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 
 // EstimateTokens is the package's shared input-token heuristic: about four
 // bytes per token, plus a fixed overhead per chat turn and per tool definition
-// (estimateTokens in estimate.go, where the contract and its biases are
-// documented). There is no tokenizer in this package and no dependency is
-// allowed, so inventing a second heuristic for this family would buy nothing
-// but a second number for the budget to disagree with itself about.
+// (estimateTokens in estimate.go, where the contract, its measured ratios and
+// its biases are documented — one source for those facts). There is no
+// tokenizer in this package and no dependency is allowed, so inventing a second
+// heuristic for this family would buy nothing but a second number for the
+// budget to disagree with itself about.
 //
-// It lands inside the conformance suite's ±40% band: the suite's oracle is 4/3
-// tokens per word of the prose it placed in the request, and this heuristic runs
-// 70 tokens for the one-paragraph request (oracle 60, +16.7%) and 265 for the
-// four-paragraph one (oracle 240, +10.4%). The band exists because a real
-// tokenizer differs from the word oracle; the estimate errs high on purpose,
-// because the budget reserves above it.
+// The value lands inside the conformance suite's ±40% band on prose; the band
+// exists because a real tokenizer differs from the word oracle, and
+// paragraph-scale prose is estimated high on purpose because the budget
+// reserves above it.
 func (o *OpenAI) EstimateTokens(req Request) int { return estimateTokens(req) }
 
 // Probe asks the endpoint for its model list. The four health states are the

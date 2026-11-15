@@ -37,9 +37,11 @@ const (
 //   - Every tool definition contributes 8 tokens of framing plus ceil(len/4)
 //     for each of Name, Description and Schema. A schema is what the model
 //     reads before it can call the tool; it is prompt input.
-//   - Model and MaxTokens are not counted. The model name selects an endpoint
-//     and MaxTokens caps the reply; neither is prompt text. A request carrying
-//     only those is not a sendable completion request and estimates 0.
+//   - Model, MaxTokens and the transport/egress selectors (Reach,
+//     RequireLocal) are not counted. The model name selects an endpoint,
+//     MaxTokens caps the reply, and the reach fields are a policy declaration;
+//     none is prompt text. A request carrying only those is not a sendable
+//     completion request and estimates 0.
 //
 // Three invariants follow, and estimate_test.go holds the default to them; the
 // per-adapter tests pin that each adapter returns it, and the conformance
@@ -62,10 +64,13 @@ const (
 // There is no tokenizer in this package and no dependency is allowed, so the
 // default is calibrated on English prose at about four bytes per token. Against
 // the conformance suite's independent word oracle (4/3 tokens per word) it errs
-// HIGH on prose: measured 70 tokens for the one-paragraph fixture (oracle 60,
-// +16.7%) and 265 for the four-paragraph one (oracle 240, +10.4%). Short turns
-// err high too, because each one is charged four tokens of framing. Erring high
-// is the safe direction for a budget that reserves up front.
+// HIGH at paragraph scale: measured 70 tokens for the one-paragraph fixture
+// (oracle 60, +16.7%) and 265 for the four-paragraph one (oracle 240, +10.4%),
+// and TestEstimateTokensPinsTheDocumentedProseRatios holds those figures. A
+// one-line turn is roughly neutral instead — the 4-token framing offsets the
+// byte ratio's overcount — so the high-bias claim is about prose chunks, not
+// every request. Erring high on prose is the safe direction for a budget that
+// reserves up front.
 //
 // It errs LOW wherever bytes-per-token is not about four:
 //
@@ -78,6 +83,17 @@ const (
 //     half. Emoji (four bytes, often two to four tokens) are likewise low.
 //   - High-entropy text: hex ids, base64, digests and URLs tokenize at roughly
 //     two to three bytes per token, so the 4-byte rule undercounts them.
+//
+// Two cost classes are deliberately outside the contract, and a consumer must
+// not read the enumeration above as covering them:
+//
+//   - Attachments and multimodal parts. Request has no image or file field, so
+//     there is nothing to count today. If such a field is added, estimateTokens
+//     must gain a term for it; otherwise that cost is silently free.
+//   - Cache and prefix credits. The estimate is gross: a replayed prefix is
+//     charged in full even when a provider would bill it cached. A discount
+//     appears only when the budget settles against Usage; a reservation must
+//     never depend on one.
 //
 // The 1.2x reserve absorbs a 20% miss, not a 2x one, so a schema-heavy or
 // non-ASCII prompt can under-reserve. The post-settle re-check is what catches
@@ -107,14 +123,14 @@ func estimateTokens(req Request) int {
 		for _, c := range m.ToolCalls {
 			tokens += textTokens(c.ID)
 			tokens += textTokens(c.Name)
-			tokens += textTokens(string(c.Arguments))
+			tokens += byteTokens(len(c.Arguments))
 		}
 	}
 	for _, t := range req.Tools {
 		tokens += toolOverhead
 		tokens += textTokens(t.Name)
 		tokens += textTokens(t.Description)
-		tokens += textTokens(string(t.Schema))
+		tokens += byteTokens(len(t.Schema))
 	}
 	// The floor cannot fire today — a system prompt, a message or a tool each
 	// already contributes at least one token — but it states the invariant any
@@ -127,10 +143,13 @@ func estimateTokens(req Request) int {
 	return tokens
 }
 
-// textTokens is a ceiling division: an 8-byte field is two tokens, not one.
-func textTokens(s string) int {
-	if s == "" {
+// byteTokens is the ceiling division for a field of n bytes.
+func byteTokens(n int) int {
+	if n == 0 {
 		return 0
 	}
-	return (len(s) + bytesPerToken - 1) / bytesPerToken
+	return (n + bytesPerToken - 1) / bytesPerToken
 }
+
+// textTokens is a ceiling division: an 8-byte string is two tokens, not one.
+func textTokens(s string) int { return byteTokens(len(s)) }

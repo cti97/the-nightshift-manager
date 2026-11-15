@@ -2,6 +2,7 @@ package provider
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
@@ -256,6 +257,49 @@ func TestEstimateTokensWithinFactorOfTwoOfAHandCount(t *testing.T) {
 		if ratio < 0.5 || ratio > 2 {
 			t.Errorf("%s: estimate %d is %.2fx the hand count of %.1f, want within a factor of two",
 				tc.name, got, ratio, hand)
+		}
+	}
+}
+
+// TestEstimateTokensPinsTheDocumentedProseRatios pins the figures quoted in
+// estimate.go. The conformance suite's ±40% band is far too loose to notice a
+// drift from +16.7% to +39%, and the per-adapter tests only check delegation,
+// so without this test the documented numbers are unpinned prose: editing
+// conformanceProse or bytesPerToken would make them false with every test
+// green. Both the absolute counts and the ratio are asserted because the
+// contract quotes both.
+func TestEstimateTokensPinsTheDocumentedProseRatios(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		paragraphs int
+		wantTokens int
+		wantOracle float64
+		wantRatio  float64
+	}{
+		// estimate.go: "70 tokens for the one-paragraph fixture (oracle 60,
+		// +16.7%) and 265 for the four-paragraph one (oracle 240, +10.4%)".
+		{"one paragraph", 1, 70, 60, 70.0 / 60.0},
+		{"four paragraphs", 4, 265, 240, 265.0 / 240.0},
+	} {
+		req := proseRequest(tc.paragraphs)
+		got := estimateTokens(req)
+		oracle := wordTokenCount(req)
+
+		if got != tc.wantTokens {
+			t.Errorf("%s: EstimateTokens = %d, want %d; estimate.go's documented figure is now false", tc.name, got, tc.wantTokens)
+		}
+		if math.Abs(oracle-tc.wantOracle) > 0.5 {
+			t.Errorf("%s: word oracle = %.0f, want %.0f; the fixture changed and estimate.go's figures are stale", tc.name, oracle, tc.wantOracle)
+		}
+
+		ratio := float64(got) / oracle
+		// The band states the contract's shape: high on prose, but nowhere near
+		// the conformance suite's ±40% ceiling on the low side.
+		if ratio < 1.05 || ratio > 1.25 {
+			t.Errorf("%s: estimate/oracle = %.3f, want within [1.05, 1.25]; the heuristic's documented bias no longer holds", tc.name, ratio)
+		}
+		if math.Abs(ratio-tc.wantRatio) > 0.005 {
+			t.Errorf("%s: estimate/oracle = %.3f, want the documented %.3f to within 0.005; update estimate.go when the ratio changes", tc.name, ratio, tc.wantRatio)
 		}
 	}
 }
