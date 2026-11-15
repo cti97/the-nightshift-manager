@@ -360,11 +360,12 @@ func TestStubStopsOnACancelledContext(t *testing.T) {
 	}
 }
 
-// TestStubRefusesAnUnattributableToolResult pins the fixture half of check 2's
-// contract. A real endpoint attributes a tool result to the call it answers
-// (OpenAI an unknown tool_call_id, Anthropic an unknown tool_use_id) and rejects
-// one it cannot place. If the stub answered instead, check 2 would prove only
-// that messages are accepted, and an adapter that dropped the id would pass.
+// TestStubRefusesAnUnattributableToolResult pins the shared rule through
+// Complete: a tool result is attributed to a call carried by a preceding
+// assistant turn (OpenAI an unknown tool_call_id, Anthropic an unknown
+// tool_use_id), and one that cannot be placed is refused. If the stub answered
+// instead, check 2 would prove only that messages are accepted, and an adapter
+// that dropped the id would pass.
 func TestStubRefusesAnUnattributableToolResult(t *testing.T) {
 	ctx := context.Background()
 	call := Call{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"/tmp/brief.md"}`)}

@@ -60,23 +60,25 @@ const (
 //     are valid JSON, and answer the follow-up request that replays the
 //     assistant turn carrying those calls (Message.ToolCalls) and one tool
 //     result (Message.Role "tool") per call, each with Message.CallID set to the
-//     call's ID, with a final completion that calls no tool. A tool result that
-//     does not answer a call carried by a *preceding* assistant turn must be
-//     refused, as the real endpoints refuse an unknown tool_call_id /
-//     tool_use_id: that refusal is what makes a dropped correlation id a
-//     failure instead of a successful call;
+//     call's ID, with a final completion that calls no tool. In the follow-up's
+//     serialized form every result must be attributable: a fake endpoint must
+//     reject a tool message whose id names no preceding call, exactly as the real
+//     endpoints do (tool_call_id / tool_use_id). That is the half that catches an
+//     id dropped during translation, and the stub has no translation layer, so
+//     the stub satisfies it through the provider rule below;
 //   - report the same Usage for the same request twice;
 //   - answer the four ConformanceModel* names with the matching failure.
 //
-// The provider must also refuse a tool result whose CallID is empty with
-// ErrBadRequest (check 2's last leg), and must be built with an unset
-// Config.Reach. Check 6 asserts that local-only work is refused when the
-// endpoint's reach was never configured, even when the request claims "host": a
-// reach that cannot be verified is not local, and an adapter that forgets to
-// carry its endpoint's reach must fail closed (M2 Task 2). The converse — a provider built with a
-// local reach accepts local-only work — cannot be expressed through
-// func() Provider, which cannot rebuild the provider with a different Config; it
-// is covered by the stub's own tests and, once endpoints land, by their wiring.
+// The provider must also refuse a tool result whose CallID is empty, unknown, or
+// carried by no preceding assistant turn, with ErrBadRequest (check 2's refusal
+// legs), and must be built with an unset Config.Reach. Check 6 asserts that
+// local-only work is refused when the endpoint's reach was never configured, even
+// when the request claims "host": a reach that cannot be verified is not local,
+// and an adapter that forgets to carry its endpoint's reach must fail closed
+// (M2 Task 2). The converse — a provider built with a local reach accepts
+// local-only work — cannot be expressed through func() Provider, which cannot
+// rebuild the provider with a different Config; it is covered by the stub's own
+// tests and, once endpoints land, by their wiring.
 //
 // Each check runs under its own deadline (conformanceCheckTimeout), so a
 // provider that hangs fails that one check and the rest of the suite still runs
@@ -127,18 +129,29 @@ var conformanceCheckTimeout = 5 * time.Second
 // ignores it, because a context alone cannot end a Complete that never returns.
 // On timeout the check fails and the goroutine is abandoned rather than waited
 // for: the provider it is stuck in is already broken, the next check builds a
-// fresh one, and waiting is the hang the timeout exists to prevent.
+// fresh one, and waiting is the hang the timeout exists to prevent. A panic is
+// recovered in the goroutine for the same reason: a crashing adapter must fail
+// its own check, with its type named, instead of killing the test binary.
 func runCheck(check conformanceCheck, p Provider) error {
 	timeout := conformanceCheckTimeout
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- check.run(ctx, p) }()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("check panicked (provider %T): %v", p, r)
+			}
+		}()
+		done <- check.run(ctx, p)
+	}()
 
 	select {
 	case err := <-done:
-		if err != nil && errors.Is(err, context.DeadlineExceeded) {
+		// ctx.Err() distinguishes the suite's deadline from an adapter's own
+		// context.DeadlineExceeded: only the former is "did not finish within".
+		if err != nil && ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("did not finish within %s: %w", timeout, err)
 		}
 		return err
@@ -186,11 +199,12 @@ func checkCompletion(ctx context.Context, p Provider) error {
 // unless it names the call it answers: the assistant turn carries
 // Message.ToolCalls (the full Call values, ids included) and the result carries
 // Message.CallID equal to the id of the call it answers. The fixture is required
-// to refuse a result it cannot attribute — that is what the real endpoints do
-// with tool_call_id and tool_use_id — so a provider that drops either half fails
-// here rather than completing. The last leg goes the other way: a result with no
-// CallID at all must be refused with ErrBadRequest, so a provider cannot pass by
-// forwarding whatever it was handed even when the fixture happens to be lax.
+// to reject an unattributable result in its serialized form — that is where an id
+// dropped during translation becomes visible — but the refusal legs at the end do
+// not rely on it: an empty id, an unknown id and a result whose call has no
+// preceding assistant turn must each be refused with ErrBadRequest by the
+// provider itself. That is what fails an adapter that only checks for empty
+// strings, and it does not depend on the fixture being honest.
 func checkToolRoundTrip(ctx context.Context, p Provider) error {
 	req := plainRequest(conformanceModel)
 	req.Tools = conformanceTools()
@@ -239,19 +253,31 @@ func checkToolRoundTrip(ctx context.Context, p Provider) error {
 		return fmt.Errorf("after the tool result Complete returned no final content")
 	}
 
-	// The result cannot be attributed, so the provider must say so. This leg is
-	// the one that does not trust the fixture: a provider that drops or ignores
-	// CallID would send the turn on, and only a fixture that happens to be strict
-	// would stop it.
-	unattributable := plainRequest(conformanceModel)
-	unattributable.Tools = conformanceTools()
-	unattributable.Messages = append(unattributable.Messages,
-		assistant,
-		Message{Role: "tool", Name: first.ToolCalls[0].Name, Content: `{"content":"# The brief"}`},
-	)
-	resp, err := p.Complete(ctx, unattributable)
-	if !errors.Is(err, ErrBadRequest) {
-		return fmt.Errorf("a tool turn with no CallID: resp = %+v, err = %v; want ErrBadRequest, because its result cannot be attributed to the call it answers", resp, err)
+	// Refusal legs: a result that cannot be attributed must fail with
+	// ErrBadRequest. They do not trust the fixture — the provider must refuse even
+	// when its endpoint would accept the turn — and each one fails a different
+	// kind of half-correlation: no id at all, an id no call carries, and a
+	// correct id whose call has no preceding assistant turn.
+	callID := first.ToolCalls[0].ID
+	result := func(id string) Message {
+		return Message{Role: "tool", Name: first.ToolCalls[0].Name, CallID: id, Content: `{"content":"# The brief"}`}
+	}
+	refusals := []struct {
+		name string
+		msgs []Message
+	}{
+		{"a tool result with no CallID", []Message{assistant, result("")}},
+		{"a tool result answering an unknown call id", []Message{assistant, result(callID + "-wrong")}},
+		{"a tool result whose call has no preceding assistant turn", []Message{result(callID)}},
+	}
+	for _, tc := range refusals {
+		unattributable := plainRequest(conformanceModel)
+		unattributable.Tools = conformanceTools()
+		unattributable.Messages = append(unattributable.Messages, tc.msgs...)
+		resp, err := p.Complete(ctx, unattributable)
+		if !errors.Is(err, ErrBadRequest) {
+			return fmt.Errorf("%s: resp = %+v, err = %v; want ErrBadRequest, because the result cannot be attributed to the call it answers", tc.name, resp, err)
+		}
 	}
 	return nil
 }

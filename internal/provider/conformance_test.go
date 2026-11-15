@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -209,7 +210,7 @@ func (p correlationDroppingProvider) Complete(ctx context.Context, req Request) 
 // TestConformanceCatchesADroppedCorrelation is the self-review question made
 // into a test: does check 2 fail for a provider that drops the correlation id?
 // Both halves of the pairing are dropped in turn, and the failure has to be the
-// endpoint refusing the unattributable result with ErrBadRequest — not an
+// provider refusing the unattributable result with ErrBadRequest — not an
 // exhausted script or some unrelated complaint.
 func TestConformanceCatchesADroppedCorrelation(t *testing.T) {
 	cases := []struct {
@@ -235,7 +236,7 @@ func TestConformanceCatchesADroppedCorrelation(t *testing.T) {
 				t.Fatalf("check 2 passed after dropping %s; the tool round trip does not require the correlation", tc.name)
 			}
 			if !errors.Is(err, ErrBadRequest) {
-				t.Fatalf("check 2 failed with %v; want the fixture to refuse the unattributable result with ErrBadRequest, so the failure is attributable to the drop", err)
+				t.Fatalf("check 2 failed with %v; want the provider to refuse the unattributable result with ErrBadRequest, so the failure is attributable to the drop", err)
 			}
 		})
 	}
@@ -289,6 +290,36 @@ func (p *deadlineProvider) Complete(ctx context.Context, _ Request) (Response, e
 	return Response{}, ctx.Err()
 }
 
+// ownDeadlineProvider returns its own context.DeadlineExceeded promptly, like a
+// provider whose HTTP client timed out internally.
+type ownDeadlineProvider struct{}
+
+func (p *ownDeadlineProvider) Name() string               { return "own-deadline" }
+func (p *ownDeadlineProvider) EstimateTokens(Request) int { return 0 }
+func (p *ownDeadlineProvider) Probe(context.Context) (Health, error) {
+	return HealthOK, nil
+}
+func (p *ownDeadlineProvider) Complete(context.Context, Request) (Response, error) {
+	return Response{}, fmt.Errorf("adapter: %w", context.DeadlineExceeded)
+}
+
+// TestRunCheckDoesNotBlameTheSuiteForAnAdaptersTimeout: an adapter's own timeout
+// is its failure, not the suite's. The "did not finish within" message is for a
+// check that actually ran out of conformanceCheckTimeout; an adapter that
+// returns promptly with its own deadline error must keep its own message.
+func TestRunCheckDoesNotBlameTheSuiteForAnAdaptersTimeout(t *testing.T) {
+	err := runCheck(conformanceCheck{name: "own deadline", run: func(ctx context.Context, p Provider) error {
+		_, err := p.Complete(ctx, Request{Model: conformanceModel})
+		return err
+	}}, &ownDeadlineProvider{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runCheck = %v; want the adapter's deadline error preserved", err)
+	}
+	if strings.Contains(err.Error(), "did not finish within") {
+		t.Fatalf("runCheck = %v; the adapter's own timeout was reported as a suite timeout", err)
+	}
+}
+
 // TestConformanceCheckTimesOut proves the timeout is taken, not merely set. The
 // second leg is the one that matters: a provider that never looks at its context
 // must still fail its own check rather than hang the suite until the go test
@@ -305,8 +336,25 @@ func TestConformanceCheckTimesOut(t *testing.T) {
 		}}, p)
 	}
 
+	// Every leg is watched. A runner with no deadline at all would block the
+	// first leg until the go test panic, and because subtests are sequential the
+	// second leg's watchdog would never get to report it: a regression test whose
+	// failure mode is "hangs the binary" gets deleted as flaky instead of read.
+	watched := func(t *testing.T, p Provider) error {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- run(p) }()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Second):
+			t.Fatal("runCheck did not return; a check without a working deadline would hang the suite")
+			return nil
+		}
+	}
+
 	t.Run("a provider that respects the context", func(t *testing.T) {
-		err := run(&deadlineProvider{})
+		err := watched(t, &deadlineProvider{})
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("runCheck = %v; want an error wrapping context.DeadlineExceeded", err)
 		}
@@ -319,20 +367,43 @@ func TestConformanceCheckTimesOut(t *testing.T) {
 		p := &blockingProvider{release: make(chan struct{})}
 		t.Cleanup(func() { close(p.release) }) // release the abandoned goroutine
 
-		done := make(chan error, 1)
-		go func() { done <- run(p) }()
-		select {
-		case err := <-done:
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("runCheck = %v; want an error wrapping context.DeadlineExceeded", err)
-			}
-			if !strings.Contains(err.Error(), "did not finish within") {
-				t.Errorf("runCheck = %v; the failure does not name the timeout", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("runCheck did not return after a provider ignored its context; the check would hang the suite")
+		err := watched(t, p)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("runCheck = %v; want an error wrapping context.DeadlineExceeded", err)
+		}
+		if !strings.Contains(err.Error(), "did not finish within") {
+			t.Errorf("runCheck = %v; the failure does not name the timeout", err)
 		}
 	})
+}
+
+// panickingProvider crashes inside Complete, which is what an adapter with a nil
+// dereference does.
+type panickingProvider struct{}
+
+func (p *panickingProvider) Name() string               { return "panics" }
+func (p *panickingProvider) EstimateTokens(Request) int { return 0 }
+func (p *panickingProvider) Probe(context.Context) (Health, error) {
+	return HealthOK, nil
+}
+func (p *panickingProvider) Complete(context.Context, Request) (Response, error) {
+	panic("the adapter crashed")
+}
+
+// TestConformanceCheckRecoversAPanic: a panicking adapter fails its own check,
+// with the adapter named, instead of killing the test binary. Without the
+// recover in runCheck this test does not fail — it takes the process down.
+func TestConformanceCheckRecoversAPanic(t *testing.T) {
+	err := runCheck(conformanceCheck{name: "panics", run: func(ctx context.Context, p Provider) error {
+		_, err := p.Complete(ctx, Request{Model: conformanceModel})
+		return err
+	}}, &panickingProvider{})
+	if err == nil {
+		t.Fatal("runCheck returned nil after the provider panicked")
+	}
+	if !strings.Contains(err.Error(), "panicked") || !strings.Contains(err.Error(), "panickingProvider") {
+		t.Fatalf("runCheck = %v; want the panic reported with the provider named", err)
+	}
 }
 
 // permissiveProvider answers from its own script and validates nothing, which is
@@ -342,6 +413,10 @@ func TestConformanceCheckTimesOut(t *testing.T) {
 type permissiveProvider struct {
 	script []Response
 	next   int
+	// refuse, when non-nil, is consulted for every message before a response is
+	// replayed. It is how a subtest makes the provider strict about one thing
+	// only, so each refusal leg of check 2 can be given its own teeth.
+	refuse func(Message) bool
 }
 
 func (p *permissiveProvider) Name() string               { return "permissive" }
@@ -349,9 +424,16 @@ func (p *permissiveProvider) EstimateTokens(Request) int { return 1 }
 func (p *permissiveProvider) Probe(context.Context) (Health, error) {
 	return HealthOK, nil
 }
-func (p *permissiveProvider) Complete(ctx context.Context, _ Request) (Response, error) {
+func (p *permissiveProvider) Complete(ctx context.Context, req Request) (Response, error) {
 	if err := ctx.Err(); err != nil {
 		return Response{}, err
+	}
+	if p.refuse != nil {
+		for _, m := range req.Messages {
+			if p.refuse(m) {
+				return Response{}, fmt.Errorf("%w: the permissive provider refuses %+v", ErrBadRequest, m)
+			}
+		}
 	}
 	if p.next >= len(p.script) {
 		return Response{}, errors.New("script exhausted")
@@ -361,21 +443,42 @@ func (p *permissiveProvider) Complete(ctx context.Context, _ Request) (Response,
 	return resp, nil
 }
 
-// TestCheck2RefusesAnUnattributableResult gives the last leg of check 2 its own
-// teeth. The permissive provider completes both attributable legs and then
-// answers the tool turn that carries no CallID, so only the correlation
-// assertion can fail it.
+// TestCheck2RefusesAnUnattributableResult gives each refusal leg of check 2 its
+// own teeth. A provider that refuses only an empty CallID passes the first leg
+// and then answers the unknown-id turn, so only the unknown-id assertion can
+// fail it — that is the case an adapter with no correlation logic reaches.
 func TestCheck2RefusesAnUnattributableResult(t *testing.T) {
 	script := append(conformanceScript(), Response{
 		Content: "The brief is planned.",
 		Usage:   Usage{In: 120, Out: 30},
 		Stop:    "end_turn",
 	})
-	err := checkToolRoundTrip(context.Background(), &permissiveProvider{script: script})
-	if err == nil {
-		t.Fatal("check 2 passed a provider that accepted a tool result with no CallID; the correlation is not enforced")
+	cases := []struct {
+		name   string
+		refuse func(Message) bool
+		want   string
+	}{
+		{
+			name: "a provider that accepts everything",
+			want: "no CallID",
+		},
+		{
+			name: "a provider that only rejects an empty CallID",
+			refuse: func(m Message) bool {
+				return m.Role == "tool" && m.CallID == ""
+			},
+			want: "unknown call id",
+		},
 	}
-	if !strings.Contains(err.Error(), "no CallID") {
-		t.Fatalf("check 2 failed with %v; want the unattributable-result leg, not a failure of the earlier legs", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkToolRoundTrip(context.Background(), &permissiveProvider{script: script, refuse: tc.refuse})
+			if err == nil {
+				t.Fatalf("check 2 passed %s; the correlation is not enforced", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("check 2 failed with %v; want the %q leg, not a failure of an earlier leg", err, tc.want)
+			}
+		})
 	}
 }

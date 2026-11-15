@@ -34,11 +34,12 @@ import (
 // is what makes a result attributable to the call it answers. It is empty on
 // every other role.
 //
-// A provider must refuse a tool turn whose CallID is empty with ErrBadRequest:
-// a result that names no call cannot be attributed to one, every family rejects
-// it, and a refusal at this seam keeps the failure legible instead of turning it
-// into a transport round trip. checkToolMessages is that refusal; call it at the
-// top of Complete, next to checkReach.
+// A provider must refuse a tool turn whose CallID is empty, or names no call
+// carried by a *preceding* assistant turn, with ErrBadRequest: a result that
+// answers nothing cannot be attributed to a call, every family rejects it, and a
+// refusal at this seam keeps the failure legible instead of turning it into a
+// transport round trip. checkToolMessages is that refusal; call it at the top of
+// Complete, next to checkReach.
 type Message struct {
 	Role      string
 	Content   string
@@ -120,11 +121,11 @@ const (
 // against before sending, because most APIs report usage only afterwards.
 //
 // Complete must call checkReach before it touches the network, and must refuse
-// a tool turn with an empty Message.CallID with ErrBadRequest (checkToolMessages)
-// rather than send an unattributable result. Nothing in Go can make an
-// implementation call either, so both are documented requirements plus the
-// conformance suite's checks — and every adapter must pass the suite (M2
-// Task 2).
+// a tool turn that cannot be attributed (an empty or unknown Message.CallID)
+// with ErrBadRequest (checkToolMessages) rather than send an unattributable
+// result. Nothing in Go can make an implementation call either, so both are
+// documented requirements plus the conformance suite's checks — and every
+// adapter must pass the suite (M2 Task 2).
 //
 // Complete must return promptly when ctx is cancelled and must not leave
 // requests running behind the context.
@@ -140,24 +141,46 @@ type Provider interface {
 // the retry taxonomy (M2 Task 6): retrying would send the same bytes again.
 var ErrEgressRefused = errors.New("provider: refusing to send to a non-local endpoint")
 
-// checkToolMessages is the provider layer's tool-correlation requirement: a
-// tool turn that names no call is refused with ErrBadRequest before it is sent.
-// Every family rejects an unattributable result — OpenAI an unknown
-// tool_call_id, Anthropic an unknown tool_use_id — so refusing it here costs
+// checkToolMessages is the provider layer's tool-correlation rule, and the one
+// implementation of it: a tool turn's Message.CallID must name a call carried by
+// a *preceding* assistant turn in the same request. An empty id names nothing and
+// an id no earlier turn carries names nothing either, so both are refused with
+// ErrBadRequest before anything is sent.
+//
+// Every family enforces the same rule at the wire — OpenAI rejects an unknown
+// tool_call_id, Anthropic an unknown tool_use_id — so refusing here costs
 // nothing and keeps the failure at the seam that caused it instead of turning it
-// into a transport round trip. Check 2 requires the observable (a tool turn with
-// no CallID must fail with ErrBadRequest); at this seam a local refusal and an
-// endpoint's 400 are the same error class, so the helper is what makes an
-// adapter's refusal local and retry-free rather than a round trip. It checks
-// only the caller's request: a provider that returns a Call with an empty ID is
-// caught by check 2's response assertions instead.
+// into a transport round trip. Check 2 requires the observable: an empty id, an
+// unknown id and a result whose call has no preceding turn must all fail with
+// ErrBadRequest. At this seam a local refusal and an endpoint's 400 are the same
+// error class, so the helper is what makes an adapter's refusal local and
+// retry-free; an adapter that only rejects empty strings fails the unknown-id
+// leg. It checks only the caller's request: a provider that returns a Call with
+// an empty ID is caught by check 2's response assertions instead.
+//
+// A call carried with an empty ID is not a match — it cannot be answered, and
+// indexing "" would make the empty-CallID refusal look satisfied. Only a
+// *preceding* assistant turn counts, so a result cannot answer a call the
+// conversation has not made yet.
 func checkToolMessages(req Request) error {
+	calls := make(map[string]bool)
 	for i, m := range req.Messages {
+		if m.Role == "assistant" {
+			for _, c := range m.ToolCalls {
+				if c.ID != "" {
+					calls[c.ID] = true
+				}
+			}
+			continue
+		}
 		if m.Role != "tool" {
 			continue
 		}
 		if m.CallID == "" {
 			return fmt.Errorf("%w: message %d is a tool turn with no call id, so its result cannot be attributed to the call it answers", ErrBadRequest, i)
+		}
+		if !calls[m.CallID] {
+			return fmt.Errorf("%w: message %d is a tool turn answering call %q, which no preceding assistant turn carries", ErrBadRequest, i, m.CallID)
 		}
 	}
 	return nil
