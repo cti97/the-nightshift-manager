@@ -71,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/items", s.adminAuth(http.HandlerFunc(s.handleCreateItem)))
 	mux.Handle("POST /admin/endpoints", s.adminAuth(http.HandlerFunc(s.handleCreateEndpoint)))
 	mux.Handle("GET /admin/endpoints", s.adminAuth(http.HandlerFunc(s.handleListEndpoints)))
+	mux.Handle("POST /admin/endpoints/{id}/probe", s.adminAuth(http.HandlerFunc(s.handleProbeEndpoint)))
 	mux.Handle("POST /admin/models", s.adminAuth(http.HandlerFunc(s.handleCreateModel)))
 	mux.Handle("PATCH /admin/models/{id}", s.adminAuth(http.HandlerFunc(s.handlePatchModel)))
 	mux.Handle("POST /nodes/register", s.enrollAuth(http.HandlerFunc(s.handleRegister)))
@@ -258,6 +259,25 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
+// createEndpointResponse is EndpointView plus the one instruction creation owes
+// the operator (Task 9 decision 6): a new endpoint is inert until a probe makes
+// a claim about it, and a 201 that does not say so leaves the operator with a
+// row that never places and no next step. The hint is create-only — the listing
+// is a view of what exists, not a list of things to do — which is why it lives
+// in a wrapper here rather than on EndpointView. The embedding keeps the body's
+// original shape, so a client that decodes the endpoint still does.
+type createEndpointResponse struct {
+	EndpointView
+	Next string `json:"next"`
+}
+
+// probePath builds the hint's URL. The route pattern above spells {id} because
+// ServeMux requires it; the test that probes through the hinted path is what
+// keeps the two spellings in agreement.
+func probePath(endpointID string) string {
+	return "/admin/endpoints/" + endpointID + "/probe"
+}
+
 // handleCreateEndpoint is the operator's way into the endpoints table. The
 // provider name is checked against the registry the server was built with, so a
 // typo is a 400 here rather than a row that never places.
@@ -272,7 +292,30 @@ func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeAdminWriteError(w, "create_endpoint", err)
 		return
 	}
-	WriteJSON(w, http.StatusCreated, ep)
+	WriteJSON(w, http.StatusCreated, createEndpointResponse{
+		EndpointView: ep,
+		Next:         "POST " + probePath(ep.ID),
+	})
+}
+
+// handleProbeEndpoint is the on-demand health check (Task 9 decision 5: on
+// demand first, scheduled second). It is the only route that writes health, and
+// a 200 means "the probe ran and recorded a state" — including `down`, and
+// including an adapter that could not be built (decision 2), because both are
+// conclusions about the endpoint. A 500 here means the board could not record
+// anything at all, which is the only case the operator cannot act on by reading
+// the endpoint.
+func (s *Server) handleProbeEndpoint(w http.ResponseWriter, r *http.Request) {
+	res, err := ProbeEndpoint(r.Context(), s.db, s.clock, s.providers, r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			WriteError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		WriteError(w, http.StatusInternalServerError, "probe", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, res)
 }
 
 // handleListEndpoints is the read side: every endpoint with its models and its

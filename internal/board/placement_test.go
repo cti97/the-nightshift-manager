@@ -1,6 +1,9 @@
 package board
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func cand(nodeName, role string, provides []string, endpointName, reach, health string, features []string, cost float64) Candidate {
 	return Candidate{
@@ -263,5 +266,47 @@ func TestPlaceOrderIsTotalAcrossEqualCostModelsOnOneNode(t *testing.T) {
 		if d.Chosen.Model.ModelID != "m-a" {
 			t.Fatalf("chose model %q, want m-a regardless of input order", d.Chosen.Model.ModelID)
 		}
+	}
+}
+
+// TestPlaceRefusesWarmingAndAuthFailed pins Task 9's acceptance for the two
+// states that are not `down`: placement requires health "ok", so neither is
+// placeable, and the reason names the state rather than a bare refusal.
+func TestPlaceRefusesWarmingAndAuthFailed(t *testing.T) {
+	for _, state := range []string{"warming", "auth_failed", "unknown"} {
+		t.Run(state, func(t *testing.T) {
+			c := cand("laptop", "executor", []string{"agentic"}, "local", "host", state, []string{"tools"}, 0)
+			d := Place(item("agentic"), []Candidate{c})
+			if d.OK {
+				t.Fatalf("placed on an endpoint whose health is %q", state)
+			}
+			if len(d.Rejects) != 1 {
+				t.Fatalf("got %d rejects, want 1", len(d.Rejects))
+			}
+			if !strings.Contains(d.Rejects[0].Why, state) {
+				t.Fatalf("reject %q does not name the health state %q", d.Rejects[0].Why, state)
+			}
+		})
+	}
+}
+
+// TestEligibleCarriesTheProbe'sReason is decision 3 at its source: the reject
+// text is what /why prints, so the reason the probe wrote has to survive into
+// it. Without this the operator gets "down" and no next step.
+func TestEligibleCarriesTheProbeReason(t *testing.T) {
+	c := cand("laptop", "executor", []string{"agentic"}, "cloud", "wan", "down", []string{"tools"}, 0)
+	c.Endpoint.HealthReason = "401 from /v1/models"
+	ok, why := Eligible(item("agentic"), c)
+	if ok {
+		t.Fatal("Eligible accepted a down endpoint")
+	}
+	if !strings.Contains(why, "401 from /v1/models") {
+		t.Fatalf("why = %q, want it to carry the probe's reason", why)
+	}
+
+	// A state with no reason must not sprout a dangling separator.
+	quiet := cand("laptop", "executor", []string{"agentic"}, "cloud", "wan", "warming", []string{"tools"}, 0)
+	if _, why := Eligible(item("agentic"), quiet); strings.Contains(why, ": ") {
+		t.Fatalf("why = %q, want no colon when there is no reason", why)
 	}
 }

@@ -25,6 +25,14 @@ type Endpoint struct {
 	Provider string `json:"provider"`
 	Reach    string `json:"reach"`
 	Health   string `json:"health"`
+	// HealthReason is what the last probe recorded, and it is here because
+	// Eligible needs it, not because placement ranks by it (Task 9 decision 3).
+	// The explanation path prints Eligible's reason, and "endpoint cloud is
+	// down: 401 from /v1/models" is the difference between an operator checking
+	// their network and an operator checking their credential. The loader
+	// selects the column; nothing in placement reads it except the refusal
+	// message.
+	HealthReason string `json:"health_reason,omitempty"`
 }
 
 type Model struct {
@@ -76,7 +84,7 @@ func Eligible(item WorkItem, c Candidate) (bool, string) {
 		return false, "node " + c.Node.Name + " is " + c.Node.Status
 	}
 	if c.Endpoint.Health != "ok" {
-		return false, "endpoint " + c.Endpoint.Name + " is " + c.Endpoint.Health
+		return false, unhealthyWhy(c.Endpoint)
 	}
 	if !c.Model.Enabled {
 		return false, "model " + c.Model.ModelID + " is disabled"
@@ -163,6 +171,22 @@ func Place(item WorkItem, cands []Candidate) Decision {
 		Reason:  fmt.Sprintf("no eligible candidate for [%s]", strings.Join(item.Needs, ",")),
 		Rejects: rejects,
 	}
+}
+
+// unhealthyWhy is the refusal text for an endpoint whose health is not ok.
+//
+// It names the state, and then the reason the last probe recorded when there is
+// one. /why prints this text verbatim, so the probe's own sentence has to travel
+// with it: "down" alone sends the operator looking for a network fault when the
+// answer was a rejected credential, and "unknown" alone does not say that
+// nobody has asked yet (Task 9 decision 3). A state with no reason gets no
+// dangling separator.
+func unhealthyWhy(e Endpoint) string {
+	why := "endpoint " + e.Name + " is " + e.Health
+	if e.HealthReason != "" {
+		why += ": " + e.HealthReason
+	}
+	return why
 }
 
 func reasonFor(item WorkItem, c Candidate, skipped int) string {

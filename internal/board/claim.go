@@ -50,7 +50,7 @@ func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly bool) ([]Cand
 	query := `
 		SELECT n.id, n.name, n.role, n.provides_live, n.reach_classes, n.concurrency,
 		       n.status, n.agent_version,
-		       e.id, e.name, e.provider, e.reach, e.health,
+		       e.id, e.name, e.provider, e.reach, e.health, COALESCE(e.health_reason,''),
 		       m.id, m.model_id, m.provides, m.features, m.context_window, m.cost_in_per_mtok, m.enabled
 		  FROM nodes n
 		  JOIN endpoints e ON 1=1
@@ -72,6 +72,7 @@ func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly bool) ([]Cand
 			&c.Node.ID, &c.Node.Name, &c.Node.Role, &live, &reach, &c.Node.Concurrency,
 			&c.Node.Status, &c.Node.AgentVersion,
 			&c.Endpoint.ID, &c.Endpoint.Name, &c.Endpoint.Provider, &c.Endpoint.Reach, &c.Endpoint.Health,
+			&c.Endpoint.HealthReason,
 			&c.Model.ID, &c.Model.ModelID, &provides, &features, &c.Model.ContextWindow,
 			&c.Model.CostInPerMtok, &c.Model.Enabled,
 		); err != nil {
