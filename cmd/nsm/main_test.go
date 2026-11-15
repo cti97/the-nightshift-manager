@@ -156,8 +156,9 @@ func TestParseAgentConfigRequiresSandboxRoot(t *testing.T) {
 }
 
 // TestParseAgentConfigForgetsTheNodeTokenInTheEnvironment pins the scrub: the
-// token reaches the config and is gone from the process environment, so a
-// sandboxed child cannot read it back with ps or /proc.
+// token reaches the config and is gone from the in-process environment, so a
+// child started later does not inherit it. It does not claim the token is gone
+// from /proc/<pid>/environ, which preserves the exec-time block on Linux.
 func TestParseAgentConfigForgetsTheNodeTokenInTheEnvironment(t *testing.T) {
 	t.Setenv("NSM_NODE_TOKEN", "secret-token-value")
 	var errOut bytes.Buffer

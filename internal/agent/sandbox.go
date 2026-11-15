@@ -23,8 +23,11 @@ import (
 // A blast-radius reducer, not a security boundary. The design is explicit
 // (§10, §19 weakness 2): sandbox-exec is deprecated and Seatbelt profiles fail
 // open in ways that are easy to get wrong. The structural guarantee it does
-// make is narrow: nothing in the run directory can reach the operator's home
-// directory or credentials.
+// make is narrow and qualified: at the tool layer, nothing in the run directory
+// can reach the operator's home directory or credentials. A shell started
+// through Command is held to that only when the process layer below is actually
+// applied; on a machine where it is not, the shell can still read the home
+// directory and this type cannot stop it (KernelConfinement says so).
 //
 // # Two layers, covering different things
 //
@@ -89,8 +92,9 @@ type Sandbox struct {
 	// refuse to delete a different one that appeared at the same path.
 	dirInfo os.FileInfo
 
-	mu     sync.RWMutex
-	closed bool
+	mu       sync.RWMutex
+	closed   bool
+	closeErr error // the first Close outcome, repeated by later calls
 }
 
 // NewSandbox creates Root/RunID fresh and opens it as the root every path is
@@ -169,7 +173,9 @@ func (s *Sandbox) Dir() string { return s.dir }
 func (s *Sandbox) Network() bool { return s.network }
 
 // Env returns a copy of the environment child processes get. It is built from
-// nothing: every entry here was set by this package.
+// a fixed list rather than filtered from os.Environ(), so an inherited variable
+// cannot leak in. The one value read from the parent is SystemRoot on Windows,
+// which is a path, not a credential.
 func (s *Sandbox) Env() []string { return append([]string(nil), s.env...) }
 
 // ReadFile reads one file inside the run directory. Traversal, absolute paths
@@ -332,18 +338,25 @@ func (s *Sandbox) Command(ctx context.Context, name string, args ...string) (*ex
 }
 
 // Close disposes of the run directory unless KeepArtifacts was set. It is
-// idempotent: the second call is a no-op, not an error.
+// idempotent: a second call returns the same outcome as the first — nil after a
+// successful disposal, and the same error after a refusal, so a refused removal
+// is not silently lost to a later call.
 //
 // Close removes only the directory this sandbox created. If that path was
 // renamed away and something else now sits there, Close refuses and says so
 // rather than deleting another process's directory.
-func (s *Sandbox) Close() error {
+//
+// A deferred Close discards its error by construction. A caller that needs to
+// know whether the removal actually happened must call Close explicitly at
+// least once.
+func (s *Sandbox) Close() (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil
+		return s.closeErr
 	}
 	s.closed = true
+	defer func() { s.closeErr = err }()
 
 	var first error
 	if s.root != nil {
@@ -436,9 +449,11 @@ func validateRunID(id string) error {
 	return nil
 }
 
-// sandboxEnv is the entire child environment. It is constructed, not filtered:
-// a variable this package does not name cannot leak in, which is the only
-// version of "env -i" that stays true as the operator's shell grows.
+// sandboxEnv is the entire child environment. It is constructed from a fixed
+// list rather than filtered from os.Environ(): a variable this package does not
+// name cannot leak in, which is the only version of "env -i" that stays true as
+// the operator's shell grows. On Windows the list includes SystemRoot, read
+// from the parent because the loader needs it; it is a path, not a credential.
 func sandboxEnv(dir string) []string {
 	tmp := filepath.Join(dir, "tmp")
 	env := []string{
@@ -580,7 +595,7 @@ func detectKernel() kernelSupport {
 			} else {
 				detail = fmt.Sprintf("%v: %s", err, detail)
 			}
-			kernelInfo.reason = "sandbox-exec is present but cannot apply a profile in this process (" + detail + "); a nested sandbox_apply is denied when the agent itself runs inside a sandbox"
+			kernelInfo.reason = "sandbox-exec is present but cannot apply a profile in this process (" + detail + "); the quoted failure is the authoritative reason"
 			return
 		}
 		kernelInfo.path = path

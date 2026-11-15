@@ -401,6 +401,11 @@ func TestCloseRefusesToRemoveAReplacedDirectory(t *testing.T) {
 	if _, err := os.Stat(other); err != nil {
 		t.Fatalf("Close removed the replacement directory: %v", err)
 	}
+	// The refusal is the first Close's outcome, not a one-shot event: a later
+	// Close must repeat it rather than return a clean nil that hides it.
+	if err := sb.Close(); err == nil {
+		t.Fatal("a second Close reported success after the first refused")
+	}
 }
 
 func TestSandboxClosesAfterAFailedCommand(t *testing.T) {

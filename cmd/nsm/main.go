@@ -256,12 +256,14 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 		fmt.Fprintln(errOut, "warning: --provides is empty; this node will claim nothing")
 	}
 
-	// The token is read once and then removed from the environment: a child
-	// process cannot read it back out of ps or /proc/<pid>/environ, while the
-	// config keeps it for the Authorization header. This is defense in depth,
-	// not the sandbox: a same-user process can still reach this process's
-	// memory. It happens only after parsing succeeds, so a rejected
-	// configuration does not consume the credential.
+	// The token is read once and then removed from this process's environment.
+	// What that buys is inheritance, not secrecy: a command started after this
+	// point does not receive the token in its environment, which is what the
+	// sandbox's scrubbed child environment builds on. It does NOT hide the
+	// token from the process table: /proc/<pid>/environ reports the exec-time
+	// environment block and unsetenv(3) only edits the in-process environ, so
+	// on Linux a process the kernel permits to read us can still see it (and
+	// ps e where permitted). This is defense in depth, not the sandbox.
 	_ = os.Unsetenv("NSM_NODE_TOKEN")
 
 	return agent.Config{
