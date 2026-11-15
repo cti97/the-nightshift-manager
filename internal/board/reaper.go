@@ -41,111 +41,181 @@ type ReapResult struct {
 	Failed    int `json:"failed"`
 }
 
+// reapOutcome is what settling one item did. A skipped item was settled or its
+// lease was renewed between the scan and its transaction, and was left alone.
+type reapOutcome struct {
+	run  string // "abandoned", "lost", or "skipped"
+	item string // "queued" or "failed"; empty when skipped
+}
+
 // Reap requeues work whose lease expired. The run's status decides whether the
-// attempt is spent: `claimed` never started, so it costs nothing; `running`
-// may have had side effects, so it burns an attempt (spec §8).
+// attempt is spent: `claimed` never started, so the claim's attempt is refunded;
+// `running` may have had side effects, so it is kept and burns the budget
+// (spec §8).
 func Reap(ctx context.Context, db *sql.DB, clock Clock) (ReapResult, error) {
-	var res ReapResult
 	now := clock.Now()
-
-	rows, err := db.QueryContext(ctx,
-		`SELECT id, attempt, max_attempts FROM work_items
-		  WHERE status IN ('claimed','running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ?`,
-		now)
+	ids, err := expiredItemIDs(ctx, db, now)
 	if err != nil {
-		return res, err
-	}
-	type expiring struct {
-		id          string
-		attempt     int
-		maxAttempts int
-	}
-	var list []expiring
-	for rows.Next() {
-		var e expiring
-		if err := rows.Scan(&e.id, &e.attempt, &e.maxAttempts); err != nil {
-			rows.Close()
-			return res, err
-		}
-		list = append(list, e)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return res, err
+		return ReapResult{}, err
 	}
 
-	for _, e := range list {
-		// The scan above ran outside a transaction, so the run is re-read inside
-		// this one: a report that landed in the gap must win, or a completed run
-		// would be rewound to lost and its item requeued — the one thing this
-		// board must never do silently. The pool holds a single connection, so
-		// no other transaction can interleave once this one is open.
-		tx, err := db.BeginTx(ctx, nil)
+	var res ReapResult
+	for _, id := range ids {
+		out, err := reapItem(ctx, db, clock, id, now)
 		if err != nil {
+			// Counted only up to here: ReapResult must never claim work it did
+			// not commit.
 			return res, err
 		}
-
-		var runID, runStatus string
-		err = tx.QueryRowContext(ctx,
-			`SELECT id, status FROM runs WHERE work_item_id=? AND attempt=?`, e.id, e.attempt).
-			Scan(&runID, &runStatus)
-		if err != nil && err != sql.ErrNoRows {
-			tx.Rollback()
-			return res, err
-		}
-		if runID != "" && runStatus != "claimed" && runStatus != "running" {
-			tx.Rollback() // already settled by a report; leave it alone
-			continue
-		}
-
-		nextRunStatus := "abandoned"
-		if runStatus == "running" {
-			nextRunStatus = "lost"
-		}
-		// Claim deliberately does not check the budget (see Claim), so this is
-		// the only place an over-budget item is ever failed. The budget applies
-		// to runs that actually started: a claim that never started has spent
-		// nothing (spec §8 — "reaped without incrementing attempt, no tokens
-		// spent"), so it is requeued however high its counter has climbed.
-		itemStatus := "queued"
-		if runStatus == "running" && e.attempt >= e.maxAttempts {
-			itemStatus = "failed"
-		}
-
-		if runID != "" {
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE runs SET status=?, ended_at=?, error=? WHERE id=?`,
-				nextRunStatus, now, "lease expired", runID); err != nil {
-				tx.Rollback()
-				return res, err
-			}
-		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE work_items SET status=?, claimed_by=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?`,
-			itemStatus, now, e.id); err != nil {
-			tx.Rollback()
-			return res, err
-		}
-		if err := AppendEvent(ctx, tx, clock, "system", "work_item", e.id, "reaped",
-			map[string]any{"run": nextRunStatus, "item": itemStatus}); err != nil {
-			tx.Rollback()
-			return res, err
-		}
-		if err := tx.Commit(); err != nil {
-			return res, err
-		}
-
-		// Counted only now: ReapResult must never claim work it did not commit.
-		if nextRunStatus == "lost" {
+		switch out.run {
+		case "lost":
 			res.Lost++
-		} else {
+		case "abandoned":
 			res.Abandoned++
 		}
-		if itemStatus == "failed" {
+		if out.item == "failed" {
 			res.Failed++
 		}
 	}
 	return res, nil
+}
+
+// expiredItemIDs is the scan. It selects ids only: every column that decides an
+// outcome is re-read inside reapItem's transaction, because anything read here
+// can be stale by the time the write happens.
+func expiredItemIDs(ctx context.Context, db *sql.DB, now int64) ([]string, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT id FROM work_items
+		  WHERE status IN ('claimed','running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ?`,
+		now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// reapItem settles one expired claim in its own transaction.
+func reapItem(ctx context.Context, db *sql.DB, clock Clock, itemID string, now int64) (reapOutcome, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return reapOutcome{}, err
+	}
+	defer func() { _ = tx.Rollback() }() // a commit makes this a no-op
+
+	// The scan ran outside a transaction. Anything that settled this item (a
+	// report) or renewed its lease (a heartbeat) since then must win: rewinding
+	// a settled run is the one thing this board must never do silently.
+	var (
+		status      string
+		attempt     int
+		maxAttempts int
+		lease       sql.NullInt64
+	)
+	if err := tx.QueryRowContext(ctx,
+		`SELECT status, attempt, max_attempts, lease_expires_at FROM work_items WHERE id=?`, itemID).
+		Scan(&status, &attempt, &maxAttempts, &lease); err != nil {
+		if err == sql.ErrNoRows {
+			return reapOutcome{run: "skipped"}, nil
+		}
+		return reapOutcome{}, err
+	}
+	if status != "claimed" && status != "running" {
+		return reapOutcome{run: "skipped"}, nil
+	}
+	if !lease.Valid || lease.Int64 >= now {
+		return reapOutcome{run: "skipped"}, nil
+	}
+
+	runID, runStatus, err := currentRun(ctx, tx, itemID)
+	if err != nil {
+		return reapOutcome{}, err
+	}
+
+	started := runStatus == "running"
+	nextRunStatus := "abandoned"
+	if started {
+		nextRunStatus = "lost"
+	}
+
+	// Attempt accounting (spec §8): work_items.attempt counts attempts that
+	// actually started. A lost run keeps the attempt its claim charged; a claim
+	// that never started is refunded, so a node that dies between claim and
+	// start costs the item nothing. That is why the budget can only fire for a
+	// started run — and Claim deliberately never checks the budget, making this
+	// the one place an over-budget item is failed.
+	itemStatus := "queued"
+	nextAttempt := attempt
+	if started {
+		if attempt >= maxAttempts {
+			itemStatus = "failed"
+		}
+	} else if nextAttempt > 0 {
+		nextAttempt--
+	}
+
+	if runID != "" {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE runs SET status=?, ended_at=?, error=? WHERE id=?`,
+			nextRunStatus, now, "lease expired", runID); err != nil {
+			return reapOutcome{}, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE work_items SET status=?, claimed_by=NULL, lease_expires_at=NULL, attempt=?, updated_at=? WHERE id=?`,
+		itemStatus, nextAttempt, now, itemID); err != nil {
+		return reapOutcome{}, err
+	}
+	if err := AppendEvent(ctx, tx, clock, "system", "work_item", itemID, "reaped",
+		map[string]any{"run": nextRunStatus, "item": itemStatus}); err != nil {
+		return reapOutcome{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return reapOutcome{}, err
+	}
+	return reapOutcome{run: nextRunStatus, item: itemStatus}, nil
+}
+
+// currentRun returns the item's single non-terminal run. An item is requeued
+// only in the same transaction that settles its run (Claim inserts a run only
+// for a queued item), so at most one run per item is ever non-terminal. Seeing
+// two is a corrupted board: guessing which one owns the lease would corrupt it
+// further, so the reaper fails loudly instead.
+func currentRun(ctx context.Context, tx *sql.Tx, itemID string) (id, status string, err error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, status FROM runs WHERE work_item_id=? AND status IN ('claimed','running')`, itemID)
+	if err != nil {
+		return "", "", err
+	}
+	defer rows.Close()
+
+	var n int
+	for rows.Next() {
+		var runID, runStatus string
+		if err := rows.Scan(&runID, &runStatus); err != nil {
+			return "", "", err
+		}
+		n++
+		if n == 1 {
+			id, status = runID, runStatus
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", err
+	}
+	if n > 1 {
+		return "", "", fmt.Errorf("work item %s has %d non-terminal runs; refusing to guess which one owns the lease", itemID, n)
+	}
+	return id, status, nil
 }
 
 // RunReaper ticks forever; cancel ctx to stop it.

@@ -3,6 +3,8 @@ package board
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -22,8 +24,9 @@ func TestReapRewardsAClaimThatNeverStarted(t *testing.T) {
 	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
 	id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
 
-	if _, err := Claim(ctx, db, clock, node, 1); err != nil {
-		t.Fatalf("Claim: %v", err)
+	first, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("Claim: got %d items, err %v", len(first), err)
 	}
 
 	stepPastLease(clock)
@@ -43,8 +46,8 @@ func TestReapRewardsAClaimThatNeverStarted(t *testing.T) {
 	if status != "queued" {
 		t.Fatalf("status = %q, want queued", status)
 	}
-	if attempt != 1 {
-		t.Fatalf("attempt = %d, want 1 (a claim that never started must not burn an attempt)", attempt)
+	if attempt != 0 {
+		t.Fatalf("attempt = %d, want 0 (a claim that never started must be refunded, not left spent)", attempt)
 	}
 
 	var runStatus string
@@ -53,6 +56,29 @@ func TestReapRewardsAClaimThatNeverStarted(t *testing.T) {
 	}
 	if runStatus != "abandoned" {
 		t.Fatalf("run status = %q, want abandoned", runStatus)
+	}
+
+	// The refund only means something if the budget is usable again: claim the
+	// item a second time and it must arrive as attempt 1 with a fresh run, while
+	// the abandoned run keeps its own ordinal.
+	second, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("second Claim: got %d items, err %v", len(second), err)
+	}
+	if second[0].Item.Attempt != 1 {
+		t.Fatalf("second claim attempt = %d, want 1 (the abandoned claim cost the item nothing)", second[0].Item.Attempt)
+	}
+	if second[0].RunID == first[0].RunID {
+		t.Fatalf("second claim reused run %q", first[0].RunID)
+	}
+	if got := itemAttempt(t, db, id); got != 1 {
+		t.Fatalf("item attempt after reclaim = %d, want 1", got)
+	}
+	if got := runOrdinals(t, db, id); !slices.Equal(got, []int{1, 2}) {
+		t.Fatalf("run ordinals = %v, want [1 2]: the abandoned run keeps ordinal 1 and the new claim takes 2", got)
+	}
+	if got, want := itemAttempt(t, db, id), nonAbandonedRuns(t, db, id); got != want {
+		t.Fatalf("item attempt = %d, non-abandoned runs = %d; the attempt counter must equal what was actually spent", got, want)
 	}
 }
 
@@ -136,6 +162,22 @@ func TestReapMarksAStartedRunLostAndBurnsAnAttempt(t *testing.T) {
 	if runStatus != "lost" {
 		t.Fatalf("run status = %q, want lost", runStatus)
 	}
+
+	// The contrast with the abandoned case: this attempt was spent, so the next
+	// claim is genuinely attempt 2, on a new run ordinal.
+	second, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("second Claim: got %d items, err %v", len(second), err)
+	}
+	if second[0].Item.Attempt != 2 {
+		t.Fatalf("second claim attempt = %d, want 2 (a started run keeps its attempt)", second[0].Item.Attempt)
+	}
+	if got := runOrdinals(t, db, id); !slices.Equal(got, []int{1, 2}) {
+		t.Fatalf("run ordinals = %v, want [1 2]", got)
+	}
+	if got, want := itemAttempt(t, db, id), nonAbandonedRuns(t, db, id); got != want {
+		t.Fatalf("item attempt = %d, non-abandoned runs = %d; the attempt counter must equal what was actually spent", got, want)
+	}
 }
 
 func TestReapFailsAnItemThatExhaustedItsAttempts(t *testing.T) {
@@ -166,11 +208,12 @@ func TestReapFailsAnItemThatExhaustedItsAttempts(t *testing.T) {
 }
 
 // Reap's scan runs outside a transaction, so a report can commit in the gap
-// between the scan and the per-item write. That interleaving cannot be forced
-// from a unit test, so this reproduces the state it leaves behind: a terminal
-// run whose item still looks reapable. The reaper must neither rewind the run
-// nor requeue the item — resurrecting settled work is the silent failure this
-// board exists to avoid.
+// between the scan and this item's transaction. That interleaving cannot be
+// forced from a unit test, so this reproduces the state it leaves behind: the
+// run is final and the item is settled (Report writes both in one transaction).
+// The per-item settle is called directly because Reap's scan would no longer
+// select a settled item — the guard exists for the window, not for the scan.
+// Rewinding settled work is the silent failure this board exists to avoid.
 func TestReapNeverRewindsASettledRun(t *testing.T) {
 	db, clock := newTestDB(t)
 	ctx := context.Background()
@@ -186,13 +229,17 @@ func TestReapNeverRewindsASettledRun(t *testing.T) {
 		`UPDATE runs SET status='ok', ended_at=? WHERE id=?`, clock.Now(), got[0].RunID); err != nil {
 		t.Fatalf("settle run: %v", err)
 	}
-
-	res, err := Reap(ctx, db, clock)
-	if err != nil {
-		t.Fatalf("Reap: %v", err)
+	if _, err := db.ExecContext(ctx,
+		`UPDATE work_items SET status='done', result_summary='settled' WHERE id=?`, id); err != nil {
+		t.Fatalf("settle item: %v", err)
 	}
-	if res != (ReapResult{}) {
-		t.Fatalf("Reap = %+v, want nothing (a settled run is not reapable)", res)
+
+	out, err := reapItem(ctx, db, clock, id, clock.Now())
+	if err != nil {
+		t.Fatalf("reapItem: %v", err)
+	}
+	if out.run != "skipped" {
+		t.Fatalf("outcome = %+v, want a skipped item (a settled run is not reapable)", out)
 	}
 
 	var runStatus, itemStatus string
@@ -205,8 +252,45 @@ func TestReapNeverRewindsASettledRun(t *testing.T) {
 	if runStatus != "ok" {
 		t.Fatalf("run status = %q, want ok (a settled run must not be rewound)", runStatus)
 	}
-	if itemStatus != "claimed" {
-		t.Fatalf("item status = %q, want it left untouched", itemStatus)
+	if itemStatus != "done" {
+		t.Fatalf("item status = %q, want done (a settled item must not be requeued)", itemStatus)
+	}
+}
+
+// The reaper finds the current run by status, so it depends on an item having at
+// most one non-terminal run. Claim only inserts a run for a queued item, and
+// every requeue happens in the same transaction that settles the run, so two is
+// a corrupted board. Picking one would compound it; the reaper fails loudly.
+func TestReapRefusesTwoNonTerminalRuns(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	if _, err := Claim(ctx, db, clock, node, 1); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	// A second non-terminal run: the state a bug would leave, never the API.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO runs (id,work_item_id,attempt,node_id,endpoint_id,model_id,started_at,status,placement_reason)
+		 SELECT 'dup-run', work_item_id, 2, node_id, endpoint_id, model_id, started_at, 'claimed', placement_reason
+		   FROM runs WHERE work_item_id=?`, id); err != nil {
+		t.Fatalf("insert second run: %v", err)
+	}
+	stepPastLease(clock)
+
+	if _, err := Reap(ctx, db, clock); err == nil {
+		t.Fatal("Reap accepted two non-terminal runs for one item")
+	} else if !strings.Contains(err.Error(), "non-terminal") {
+		t.Fatalf("error = %v, want it to name the non-terminal runs", err)
+	}
+
+	var status string
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, id).Scan(&status); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if status != "claimed" {
+		t.Fatalf("item status = %q, want claimed (the reaper must not guess)", status)
 	}
 }
 

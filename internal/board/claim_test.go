@@ -3,6 +3,7 @@ package board
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"slices"
@@ -188,8 +189,19 @@ func TestClaimRecordsAClaimedRunAndEvent(t *testing.T) {
 	if runNode != node {
 		t.Fatalf("run node = %q, want %q", runNode, node)
 	}
-	if runAttempt != itemAttempt {
-		t.Fatalf("run attempt = %d, item attempt = %d; the run must record the attempt the item now holds", runAttempt, itemAttempt)
+	// The two counters mean different things since the reaper landed: a run's
+	// attempt is its per-item claim ordinal (append-only and unique), while
+	// work_items.attempt counts attempts that actually started. Both halves of
+	// that invariant are pinned here; the old "run attempt == item attempt"
+	// assertion is deliberately replaced rather than deleted.
+	if runAttempt != 1 {
+		t.Fatalf("run attempt = %d, want 1 (the first claim is ordinal 1)", runAttempt)
+	}
+	if want := nonAbandonedRuns(t, db, id); itemAttempt != want {
+		t.Fatalf("item attempt = %d, want %d (the number of runs that were not abandoned)", itemAttempt, want)
+	}
+	if got := runOrdinals(t, db, id); !slices.Equal(got, []int{1}) {
+		t.Fatalf("run ordinals = %v, want [1] (contiguous from 1)", got)
 	}
 	if startedAt != clock.Now() {
 		t.Fatalf("run started_at = %d, want the injected clock's %d", startedAt, clock.Now())
@@ -359,8 +371,9 @@ func TestCreateItemAndClaimRejectMalformedJSON(t *testing.T) {
 }
 
 // A requeued item must come back at the next attempt with a new run, not a
-// reused one. Nothing in this task requeues, so the test puts the row back the
-// way the reaper will: that is the state Task 9 hands to the next claim.
+// reused one. The requeue is driven through the reaper rather than hand-written
+// SQL: a hardcoded copy of the requeue is what let this test drift from the
+// reaper once already.
 func TestClaimReclaimAdvancesTheAttemptAndStartsANewRun(t *testing.T) {
 	db, clock := newTestDB(t)
 	ctx := context.Background()
@@ -379,11 +392,16 @@ func TestClaimReclaimAdvancesTheAttemptAndStartsANewRun(t *testing.T) {
 		t.Fatalf("first claim attempt = %d, want 1", first[0].Item.Attempt)
 	}
 
-	// The requeue a reaper performs: status back to queued, claim fields
-	// cleared, attempt left alone (a claim that never started costs nothing).
-	if _, err := db.ExecContext(ctx,
-		`UPDATE work_items SET status='queued', claimed_by=NULL, lease_expires_at=NULL WHERE id=?`, id); err != nil {
-		t.Fatalf("requeue: %v", err)
+	// This claim starts and then dies: the attempt is spent, so the reaper
+	// requeues the item with the attempt kept.
+	if err := StartRun(ctx, db, clock, first[0].RunID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	stepPastLease(clock)
+	if res, err := Reap(ctx, db, clock); err != nil {
+		t.Fatalf("Reap: %v", err)
+	} else if res.Lost != 1 {
+		t.Fatalf("Reap = %+v, want one lost run", res)
 	}
 
 	second, err := Claim(ctx, db, clock, node, 1)
@@ -394,43 +412,76 @@ func TestClaimReclaimAdvancesTheAttemptAndStartsANewRun(t *testing.T) {
 		t.Fatalf("second claim got item %q, want %q", second[0].Item.ID, id)
 	}
 	if second[0].Item.Attempt != 2 {
-		t.Fatalf("second claim attempt = %d, want 2", second[0].Item.Attempt)
+		t.Fatalf("second claim attempt = %d, want 2 (a started run keeps its attempt)", second[0].Item.Attempt)
 	}
 	if second[0].RunID == first[0].RunID {
-		t.Fatalf("second claim reused run id %q", second[0].RunID)
+		t.Fatalf("second claim reused run id %q", first[0].RunID)
 	}
 
-	var itemAttempt, secondRunAttempt int
-	if err := db.QueryRow(`SELECT attempt FROM work_items WHERE id=?`, id).Scan(&itemAttempt); err != nil {
-		t.Fatalf("read item: %v", err)
+	// work_items.attempt is the number of attempts actually spent, and the run
+	// ordinals are a separate, contiguous, never-reused sequence.
+	if got := itemAttempt(t, db, id); got != 2 {
+		t.Fatalf("item attempt = %d, want 2", got)
 	}
-	if itemAttempt != 2 {
-		t.Fatalf("item attempt = %d, want 2", itemAttempt)
+	if got, want := itemAttempt(t, db, id), nonAbandonedRuns(t, db, id); got != want {
+		t.Fatalf("item attempt = %d, non-abandoned runs = %d; the attempt counter must equal what was actually spent", got, want)
 	}
+	if got := runOrdinals(t, db, id); !slices.Equal(got, []int{1, 2}) {
+		t.Fatalf("run ordinals = %v, want [1 2]", got)
+	}
+	var secondRunAttempt int
 	if err := db.QueryRow(`SELECT attempt FROM runs WHERE id=?`, second[0].RunID).Scan(&secondRunAttempt); err != nil {
 		t.Fatalf("read second run: %v", err)
 	}
 	if secondRunAttempt != 2 {
 		t.Fatalf("second run attempt = %d, want 2", secondRunAttempt)
 	}
+}
 
-	rows, err := db.Query(`SELECT attempt FROM runs WHERE work_item_id=? ORDER BY attempt`, id)
+// itemAttempt is work_items.attempt: the number of attempts that actually
+// started, refunded when a claim is abandoned without starting.
+func itemAttempt(t *testing.T, db *sql.DB, itemID string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT attempt FROM work_items WHERE id=?`, itemID).Scan(&n); err != nil {
+		t.Fatalf("read item attempt: %v", err)
+	}
+	return n
+}
+
+// nonAbandonedRuns is the other half of the invariant itemAttempt must equal:
+// the runs that were not abandoned before starting. This replaced the old
+// "run attempt == item attempt" parity pin, which a refunded abandoned claim
+// makes impossible to keep.
+func nonAbandonedRuns(t *testing.T, db *sql.DB, itemID string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM runs WHERE work_item_id=? AND status <> 'abandoned'`, itemID).Scan(&n); err != nil {
+		t.Fatalf("count non-abandoned runs: %v", err)
+	}
+	return n
+}
+
+// runOrdinals is the item's claim ordinals in order: contiguous from 1 and
+// never reused, because runs is append-only with UNIQUE(work_item_id, attempt).
+func runOrdinals(t *testing.T, db *sql.DB, itemID string) []int {
+	t.Helper()
+	rows, err := db.Query(`SELECT attempt FROM runs WHERE work_item_id=? ORDER BY attempt`, itemID)
 	if err != nil {
-		t.Fatalf("list runs: %v", err)
+		t.Fatalf("list run ordinals: %v", err)
 	}
 	defer rows.Close()
-	var attempts []int
+	var out []int
 	for rows.Next() {
-		var a int
-		if err := rows.Scan(&a); err != nil {
-			t.Fatalf("scan run: %v", err)
+		var n int
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("scan run ordinal: %v", err)
 		}
-		attempts = append(attempts, a)
+		out = append(out, n)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("list runs: %v", err)
+		t.Fatalf("list run ordinals: %v", err)
 	}
-	if want := []int{1, 2}; !slices.Equal(attempts, want) {
-		t.Fatalf("runs at attempts %v, want exactly %v", attempts, want)
-	}
+	return out
 }

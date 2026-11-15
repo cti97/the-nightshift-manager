@@ -88,6 +88,13 @@ func decodeList(raw string) ([]string, error) {
 // BEGIN IMMEDIATE on a dedicated connection plus the claimed_by IS NULL guard
 // plus a rowcount check is the whole concurrency story (spec §8). Do not
 // replace it with optimistic retries; the single writer is the design.
+//
+// Two counters move here, and they mean different things. `work_items.attempt`
+// counts attempts that actually started: it is incremented at claim and
+// refunded by the reaper when a claim is abandoned without starting. A run's
+// `attempt` is its per-item claim ordinal, which must never be reused because
+// runs is append-only with UNIQUE(work_item_id, attempt) — deriving it from the
+// refundable counter would collide on the claim after an abandonment.
 func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots int) ([]ClaimedItem, error) {
 	if slots < 1 {
 		slots = 1
@@ -196,8 +203,8 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 
 		if _, err := conn.ExecContext(ctx,
 			`INSERT INTO runs (id,work_item_id,attempt,node_id,endpoint_id,model_id,started_at,status,placement_reason)
-			 VALUES (?,?,?,?,?,?,?,'claimed',?)`,
-			runID, r.id, r.attempt+1, nodeID, d.Chosen.Endpoint.ID, d.Chosen.Model.ID,
+			 VALUES (?,?,(SELECT COALESCE(MAX(attempt),0)+1 FROM runs WHERE work_item_id=?),?,?,?,?,'claimed',?)`,
+			runID, r.id, r.id, nodeID, d.Chosen.Endpoint.ID, d.Chosen.Model.ID,
 			clock.Now(), d.Reason); err != nil {
 			return nil, err
 		}
