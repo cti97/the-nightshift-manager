@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 // conformanceScript is the scripted transcript the stub replays for the suite.
@@ -13,6 +15,11 @@ import (
 // it: check 1 wants content plus usage from a plain request, and check 2 wants a
 // call from the request that offers a tool. The two responses carry the same
 // usage because check 3 compares them across two identical runs.
+//
+// Both report positive usage on purpose: the Usage doc says a text response that
+// reports none is broken, and check 1 refuses it. The script is the fake
+// endpoint's answer, so a zero here would be a broken fixture, not a provider
+// that is allowed to omit usage.
 func conformanceScript() []Response {
 	return []Response{
 		{
@@ -175,5 +182,200 @@ func TestStubRefusesConformanceFailureModelWithoutSpendingItsScript(t *testing.T
 	}
 	if resp.Content != conformanceScript()[0].Content {
 		t.Fatalf("call after four failure models returned %q, want the first scripted response", resp.Content)
+	}
+}
+
+// correlationDroppingProvider wraps a correct provider and damages the request
+// the way a translation layer with a bug would: the correlation data is dropped
+// on the floor before the endpoint sees it. check 2 has to notice, or it only
+// proves that messages are accepted.
+type correlationDroppingProvider struct {
+	Provider
+	drop func(*Message)
+}
+
+func (p correlationDroppingProvider) Complete(ctx context.Context, req Request) (Response, error) {
+	// A real adapter would not mutate the caller's slice; the copy keeps this
+	// fake from corrupting the suite's own request.
+	msgs := make([]Message, len(req.Messages))
+	copy(msgs, req.Messages)
+	for i := range msgs {
+		p.drop(&msgs[i])
+	}
+	req.Messages = msgs
+	return p.Provider.Complete(ctx, req)
+}
+
+// TestConformanceCatchesADroppedCorrelation is the self-review question made
+// into a test: does check 2 fail for a provider that drops the correlation id?
+// Both halves of the pairing are dropped in turn, and the failure has to be the
+// endpoint refusing the unattributable result with ErrBadRequest — not an
+// exhausted script or some unrelated complaint.
+func TestConformanceCatchesADroppedCorrelation(t *testing.T) {
+	cases := []struct {
+		name string
+		drop func(*Message)
+	}{
+		{"the result's CallID", func(m *Message) {
+			if m.Role == "tool" {
+				m.CallID = ""
+			}
+		}},
+		{"the assistant's ToolCalls", func(m *Message) {
+			if m.Role == "assistant" {
+				m.ToolCalls = nil
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := correlationDroppingProvider{Provider: NewStub(conformanceScript()), drop: tc.drop}
+			err := checkToolRoundTrip(context.Background(), p)
+			if err == nil {
+				t.Fatalf("check 2 passed after dropping %s; the tool round trip does not require the correlation", tc.name)
+			}
+			if !errors.Is(err, ErrBadRequest) {
+				t.Fatalf("check 2 failed with %v; want the fixture to refuse the unattributable result with ErrBadRequest, so the failure is attributable to the drop", err)
+			}
+		})
+	}
+}
+
+// TestCheck1RequiresPositiveUsage pins the Usage decision: a text response that
+// reports no usage is broken, not merely unknown, because the budget settles
+// against it. The Usage doc says so and check 1 enforces it; without this test
+// the doc could drift back to permitting zero and only the doc would notice.
+func TestCheck1RequiresPositiveUsage(t *testing.T) {
+	for _, usage := range []Usage{{}, {In: 5}, {Out: 5}} {
+		p := NewStub([]Response{{Content: "The brief asks for a provider seam.", Usage: usage, Stop: "end_turn"}})
+		if err := checkCompletion(context.Background(), p); err == nil {
+			t.Errorf("check 1 accepted Usage %+v on a text response; a non-positive count cannot be settled", usage)
+		}
+	}
+	p := NewStub([]Response{{Content: "The brief asks for a provider seam.", Usage: Usage{In: 5, Out: 1}, Stop: "end_turn"}})
+	if err := checkCompletion(context.Background(), p); err != nil {
+		t.Errorf("check 1 rejected a positive Usage: %v", err)
+	}
+}
+
+// blockingProvider ignores its context: Complete waits for the test to release
+// it, so only the runner's own deadline can end the check. This is the "hung
+// adapter" the per-check timeout exists for.
+type blockingProvider struct {
+	release chan struct{}
+}
+
+func (p *blockingProvider) Name() string               { return "blocking" }
+func (p *blockingProvider) EstimateTokens(Request) int { return 0 }
+func (p *blockingProvider) Probe(context.Context) (Health, error) {
+	return HealthOK, nil
+}
+func (p *blockingProvider) Complete(context.Context, Request) (Response, error) {
+	<-p.release
+	return Response{Content: "late", Usage: Usage{In: 1, Out: 1}}, nil
+}
+
+// deadlineProvider respects its context and reports the deadline, which is what
+// a well-behaved adapter's HTTP client does.
+type deadlineProvider struct{}
+
+func (p *deadlineProvider) Name() string               { return "deadline" }
+func (p *deadlineProvider) EstimateTokens(Request) int { return 0 }
+func (p *deadlineProvider) Probe(context.Context) (Health, error) {
+	return HealthOK, nil
+}
+func (p *deadlineProvider) Complete(ctx context.Context, _ Request) (Response, error) {
+	<-ctx.Done()
+	return Response{}, ctx.Err()
+}
+
+// TestConformanceCheckTimesOut proves the timeout is taken, not merely set. The
+// second leg is the one that matters: a provider that never looks at its context
+// must still fail its own check rather than hang the suite until the go test
+// panic, and that is what the runner's goroutine and select are for.
+func TestConformanceCheckTimesOut(t *testing.T) {
+	old := conformanceCheckTimeout
+	conformanceCheckTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { conformanceCheckTimeout = old })
+
+	run := func(p Provider) error {
+		return runCheck(conformanceCheck{name: "hangs", run: func(ctx context.Context, p Provider) error {
+			_, err := p.Complete(ctx, Request{Model: conformanceModel})
+			return err
+		}}, p)
+	}
+
+	t.Run("a provider that respects the context", func(t *testing.T) {
+		err := run(&deadlineProvider{})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("runCheck = %v; want an error wrapping context.DeadlineExceeded", err)
+		}
+		if !strings.Contains(err.Error(), "did not finish within") {
+			t.Errorf("runCheck = %v; the failure does not name the timeout", err)
+		}
+	})
+
+	t.Run("a provider that ignores the context", func(t *testing.T) {
+		p := &blockingProvider{release: make(chan struct{})}
+		t.Cleanup(func() { close(p.release) }) // release the abandoned goroutine
+
+		done := make(chan error, 1)
+		go func() { done <- run(p) }()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("runCheck = %v; want an error wrapping context.DeadlineExceeded", err)
+			}
+			if !strings.Contains(err.Error(), "did not finish within") {
+				t.Errorf("runCheck = %v; the failure does not name the timeout", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("runCheck did not return after a provider ignored its context; the check would hang the suite")
+		}
+	})
+}
+
+// permissiveProvider answers from its own script and validates nothing, which is
+// the shape of an adapter that forwards whatever it is handed. Check 2 must fail
+// it on the unattributable result: the last leg exists so a provider cannot pass
+// just because its fixture happens to be strict.
+type permissiveProvider struct {
+	script []Response
+	next   int
+}
+
+func (p *permissiveProvider) Name() string               { return "permissive" }
+func (p *permissiveProvider) EstimateTokens(Request) int { return 1 }
+func (p *permissiveProvider) Probe(context.Context) (Health, error) {
+	return HealthOK, nil
+}
+func (p *permissiveProvider) Complete(ctx context.Context, _ Request) (Response, error) {
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
+	if p.next >= len(p.script) {
+		return Response{}, errors.New("script exhausted")
+	}
+	resp := p.script[p.next]
+	p.next++
+	return resp, nil
+}
+
+// TestCheck2RefusesAnUnattributableResult gives the last leg of check 2 its own
+// teeth. The permissive provider completes both attributable legs and then
+// answers the tool turn that carries no CallID, so only the correlation
+// assertion can fail it.
+func TestCheck2RefusesAnUnattributableResult(t *testing.T) {
+	script := append(conformanceScript(), Response{
+		Content: "The brief is planned.",
+		Usage:   Usage{In: 120, Out: 30},
+		Stop:    "end_turn",
+	})
+	err := checkToolRoundTrip(context.Background(), &permissiveProvider{script: script})
+	if err == nil {
+		t.Fatal("check 2 passed a provider that accepted a tool result with no CallID; the correlation is not enforced")
+	}
+	if !strings.Contains(err.Error(), "no CallID") {
+		t.Fatalf("check 2 failed with %v; want the unattributable-result leg, not a failure of the earlier legs", err)
 	}
 }

@@ -260,12 +260,64 @@ func TestEstimateTokensIsMonotonic(t *testing.T) {
 	})
 	// A turn with no content still costs the delimiters that frame it.
 	add("an empty appended message", func(r *Request) { r.Messages = append(r.Messages, Message{}) })
+	// The assistant turn that replays a call is input too: its ids, names and
+	// arguments go back on the wire, so the estimator has to grow with them.
+	add("an assistant turn carrying a call", func(r *Request) {
+		r.Messages = append(r.Messages, Message{
+			Role: "assistant",
+			ToolCalls: []Call{{
+				ID:        "call-1",
+				Name:      "read_file",
+				Arguments: json.RawMessage(`{"path":"/tmp/brief.md"}`),
+			}},
+		})
+	})
+	add("a tool result carrying its call id", func(r *Request) {
+		r.Messages = append(r.Messages, Message{Role: "tool", Name: "read_file", CallID: "call-1", Content: "x"})
+	})
 
 	for _, tc := range longer {
 		if got := s.EstimateTokens(tc.req); got <= baseTokens {
 			t.Errorf("%s: EstimateTokens = %d, want > %d (a longer request must not estimate fewer tokens)",
 				tc.name, got, baseTokens)
 		}
+	}
+
+	// The call fields themselves, with the number of turns held fixed: growing an
+	// appended turn would raise the estimate through its framing alone, so a
+	// mutation that stopped counting ids or arguments would still survive. These
+	// cases make the call text the only thing that changes.
+	callTurn := Message{Role: "assistant", ToolCalls: []Call{{
+		ID:        "call-1",
+		Name:      "read_file",
+		Arguments: json.RawMessage(`{"path":"/tmp/a"}`),
+	}}}
+	shortCall := s.EstimateTokens(Request{Messages: []Message{callTurn}})
+	for _, tc := range []struct {
+		name string
+		msg  Message
+	}{
+		{"longer call arguments", Message{Role: "assistant", ToolCalls: []Call{{
+			ID:        "call-1",
+			Name:      "read_file",
+			Arguments: json.RawMessage(`{"path":"/tmp/` + strings.Repeat("a", 64) + `"}`),
+		}}}},
+		{"a longer call id", Message{Role: "assistant", ToolCalls: []Call{{
+			ID:        "call-" + strings.Repeat("1", 32),
+			Name:      "read_file",
+			Arguments: json.RawMessage(`{"path":"/tmp/a"}`),
+		}}}},
+	} {
+		if got := s.EstimateTokens(Request{Messages: []Message{tc.msg}}); got <= shortCall {
+			t.Errorf("%s: EstimateTokens = %d, want > %d (the call text goes back on the wire)", tc.name, got, shortCall)
+		}
+	}
+
+	toolTurn := Message{Role: "tool", Name: "read_file", CallID: "call-1", Content: "x"}
+	shortResult := s.EstimateTokens(Request{Messages: []Message{toolTurn}})
+	toolTurn.CallID = "call-" + strings.Repeat("1", 32)
+	if got := s.EstimateTokens(Request{Messages: []Message{toolTurn}}); got <= shortResult {
+		t.Errorf("a longer tool result CallID: EstimateTokens = %d, want > %d (the id goes on the wire)", got, shortResult)
 	}
 
 	// The property itself, one byte at a time: rounding may leave the estimate
@@ -305,5 +357,53 @@ func TestStubStopsOnACancelledContext(t *testing.T) {
 	}
 	if h, err := s.Probe(ctx); err != nil || h != HealthOK {
 		t.Fatalf("live Probe = %q, %v; want ok, nil", h, err)
+	}
+}
+
+// TestStubRefusesAnUnattributableToolResult pins the fixture half of check 2's
+// contract. A real endpoint attributes a tool result to the call it answers
+// (OpenAI an unknown tool_call_id, Anthropic an unknown tool_use_id) and rejects
+// one it cannot place. If the stub answered instead, check 2 would prove only
+// that messages are accepted, and an adapter that dropped the id would pass.
+func TestStubRefusesAnUnattributableToolResult(t *testing.T) {
+	ctx := context.Background()
+	call := Call{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"/tmp/brief.md"}`)}
+	assistant := Message{Role: "assistant", ToolCalls: []Call{call}}
+	script := []Response{{Content: "the tool was read", Usage: Usage{In: 9, Out: 3}, Stop: "end_turn"}}
+
+	cases := []struct {
+		name string
+		msgs []Message
+	}{
+		{"a result with no call id", []Message{assistant, {Role: "tool", Name: "read_file", Content: "x"}}},
+		{"a call id no turn carries", []Message{assistant, {Role: "tool", Name: "read_file", CallID: "call-2", Content: "x"}}},
+		{"a result before the call it answers", []Message{{Role: "tool", Name: "read_file", CallID: "call-1", Content: "x"}, assistant}},
+		{"a result with no assistant turn", []Message{{Role: "tool", Name: "read_file", CallID: "call-1", Content: "x"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewStub(script)
+			resp, err := s.Complete(ctx, Request{Model: "stub-model", Messages: tc.msgs})
+			if !errors.Is(err, ErrBadRequest) {
+				t.Fatalf("Complete = %+v, %v; want ErrBadRequest for an unattributable tool result", resp, err)
+			}
+			// The refusal happens before the script is spent, exactly as a real
+			// endpoint rejects the request without answering it.
+			got, err := s.Complete(ctx, Request{Model: "stub-model"})
+			if err != nil || got.Content != "the tool was read" {
+				t.Fatalf("call after a refused tool result = %+v, %v; want the first scripted response", got, err)
+			}
+		})
+	}
+
+	// The positive case: a result that answers a call carried by an earlier
+	// assistant turn is served.
+	s := NewStub(script)
+	got, err := s.Complete(ctx, Request{Model: "stub-model", Messages: []Message{
+		assistant,
+		{Role: "tool", Name: "read_file", CallID: "call-1", Content: `{"content":"# The brief"}`},
+	}})
+	if err != nil || got.Content != "the tool was read" {
+		t.Fatalf("Complete = %+v, %v; want the scripted response for an attributable tool result", got, err)
 	}
 }

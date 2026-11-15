@@ -19,12 +19,32 @@ import (
 )
 
 // Message is one turn of a conversation. Role is one of system, user,
-// assistant or tool; Name is the tool's name on a tool turn and is otherwise
+// assistant or tool. Name is the tool's name on a tool turn and is otherwise
 // optional.
+//
+// ToolCalls holds an assistant turn's emitted calls: the same Call values the
+// provider returned in the Response that produced the turn, ids included. The
+// endpoint needs the calls themselves, not just their ids, because each family
+// makes the assistant replay them (OpenAI assistant.tool_calls, Anthropic
+// tool_use blocks). It is empty on every other role.
+//
+// CallID is a tool turn's correlation id: the Call.ID of the call whose result
+// this turn carries, copied from the assistant turn that emitted it. Each family
+// has its own field for it (OpenAI tool_call_id, Anthropic tool_use_id), and it
+// is what makes a result attributable to the call it answers. It is empty on
+// every other role.
+//
+// A provider must refuse a tool turn whose CallID is empty with ErrBadRequest:
+// a result that names no call cannot be attributed to one, every family rejects
+// it, and a refusal at this seam keeps the failure legible instead of turning it
+// into a transport round trip. checkToolMessages is that refusal; call it at the
+// top of Complete, next to checkReach.
 type Message struct {
-	Role    string
-	Content string
-	Name    string
+	Role      string
+	Content   string
+	Name      string
+	ToolCalls []Call
+	CallID    string
 }
 
 // ToolDef describes a tool the model may call. Schema is the JSON Schema of the
@@ -36,8 +56,11 @@ type ToolDef struct {
 	Schema      json.RawMessage
 }
 
-// Call is a tool call the model asked for. Arguments are the model's own JSON,
-// preserved byte-for-byte so an adapter cannot "fix" what the model wrote.
+// Call is a tool call the model asked for. ID identifies it for the rest of the
+// conversation: the result turn names it in Message.CallID and the assistant
+// turn replays the whole call, so an adapter returns it unchanged and never
+// invents one. Arguments are the model's own JSON, preserved byte-for-byte so an
+// adapter cannot "fix" what the model wrote.
 type Call struct {
 	ID        string
 	Name      string
@@ -60,8 +83,13 @@ type Request struct {
 	Reach        string
 }
 
-// Usage is what the provider reported for one request. Providers that do not
-// report usage leave it zero; the budget layer treats that as unknown, not free.
+// Usage is what the provider reported for one request. A successful Complete
+// must report positive In and Out: the budget reserves against the estimate
+// before sending and settles against this afterwards, and cost accounting reads
+// it for every run, so "no usage reported" is not a case this seam accepts. A
+// provider that cannot obtain the counts on a text response is broken, not free;
+// the conformance suite's check 1 refuses a zero, and only a failed Complete may
+// return an empty Usage.
 type Usage struct{ In, Out int }
 
 // Response is one completion: either content, or tool calls, or both.
@@ -91,10 +119,12 @@ const (
 // error; EstimateTokens is the input-token estimate the budget reserves
 // against before sending, because most APIs report usage only afterwards.
 //
-// Complete must call checkReach before it touches the network. Nothing in Go
-// can make an implementation call a method, so the call is a documented
-// requirement plus the conformance suite's refusal check — and every adapter
-// must pass the suite (M2 Task 2).
+// Complete must call checkReach before it touches the network, and must refuse
+// a tool turn with an empty Message.CallID with ErrBadRequest (checkToolMessages)
+// rather than send an unattributable result. Nothing in Go can make an
+// implementation call either, so both are documented requirements plus the
+// conformance suite's checks — and every adapter must pass the suite (M2
+// Task 2).
 //
 // Complete must return promptly when ctx is cancelled and must not leave
 // requests running behind the context.
@@ -109,6 +139,29 @@ type Provider interface {
 // endpoint's declared reach is not host or lan. It is deliberately not part of
 // the retry taxonomy (M2 Task 6): retrying would send the same bytes again.
 var ErrEgressRefused = errors.New("provider: refusing to send to a non-local endpoint")
+
+// checkToolMessages is the provider layer's tool-correlation requirement: a
+// tool turn that names no call is refused with ErrBadRequest before it is sent.
+// Every family rejects an unattributable result — OpenAI an unknown
+// tool_call_id, Anthropic an unknown tool_use_id — so refusing it here costs
+// nothing and keeps the failure at the seam that caused it instead of turning it
+// into a transport round trip. Check 2 requires the observable (a tool turn with
+// no CallID must fail with ErrBadRequest); at this seam a local refusal and an
+// endpoint's 400 are the same error class, so the helper is what makes an
+// adapter's refusal local and retry-free rather than a round trip. It checks
+// only the caller's request: a provider that returns a Call with an empty ID is
+// caught by check 2's response assertions instead.
+func checkToolMessages(req Request) error {
+	for i, m := range req.Messages {
+		if m.Role != "tool" {
+			continue
+		}
+		if m.CallID == "" {
+			return fmt.Errorf("%w: message %d is a tool turn with no call id, so its result cannot be attributed to the call it answers", ErrBadRequest, i)
+		}
+	}
+	return nil
+}
 
 // checkReach is the provider layer's no_egress guarantee: the last place a
 // request can be stopped before it leaves the machine. Placement already refuses

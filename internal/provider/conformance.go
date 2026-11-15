@@ -8,6 +8,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The conformance suite injects its four failure cases through the request's
@@ -56,19 +57,30 @@ const (
 //   - answer an ordinary request with non-empty content and positive Usage;
 //   - answer a request that offers tools with at least one Call whose Name is
 //     one of the offered tools (the suite offers read_file) and whose Arguments
-//     are valid JSON, and answer the follow-up request that carries the tool
-//     result (Message.Role "tool") with a final completion that calls no tool;
+//     are valid JSON, and answer the follow-up request that replays the
+//     assistant turn carrying those calls (Message.ToolCalls) and one tool
+//     result (Message.Role "tool") per call, each with Message.CallID set to the
+//     call's ID, with a final completion that calls no tool. A tool result that
+//     does not answer a call carried by a *preceding* assistant turn must be
+//     refused, as the real endpoints refuse an unknown tool_call_id /
+//     tool_use_id: that refusal is what makes a dropped correlation id a
+//     failure instead of a successful call;
 //   - report the same Usage for the same request twice;
 //   - answer the four ConformanceModel* names with the matching failure.
 //
-// The provider must also be built with an unset Config.Reach. Check 6 asserts
-// that local-only work is refused when the endpoint's reach was never
-// configured, even when the request claims "host": a reach that cannot be
-// verified is not local, and an adapter that forgets to carry its endpoint's
-// reach must fail closed (M2 Task 2). The converse — a provider built with a
+// The provider must also refuse a tool result whose CallID is empty with
+// ErrBadRequest (check 2's last leg), and must be built with an unset
+// Config.Reach. Check 6 asserts that local-only work is refused when the
+// endpoint's reach was never configured, even when the request claims "host": a
+// reach that cannot be verified is not local, and an adapter that forgets to
+// carry its endpoint's reach must fail closed (M2 Task 2). The converse — a provider built with a
 // local reach accepts local-only work — cannot be expressed through
 // func() Provider, which cannot rebuild the provider with a different Config; it
 // is covered by the stub's own tests and, once endpoints land, by their wiring.
+//
+// Each check runs under its own deadline (conformanceCheckTimeout), so a
+// provider that hangs fails that one check and the rest of the suite still runs
+// instead of hanging until the go test binary panics.
 //
 // The stub is the reference implementation: it answers the ConformanceModel*
 // names itself (conformanceFailure in stub.go), so the suite can be passed with
@@ -85,7 +97,7 @@ func Conformance(t *testing.T, newProvider func() Provider) {
 			if p == nil {
 				t.Fatalf("%s: newProvider returned a nil provider", check.name)
 			}
-			if err := check.run(context.Background(), p); err != nil {
+			if err := runCheck(check, p); err != nil {
 				t.Fatalf("%s: %v", check.name, err)
 			}
 		})
@@ -103,6 +115,38 @@ type conformanceCheck struct {
 	run  func(ctx context.Context, p Provider) error
 }
 
+// conformanceCheckTimeout bounds one check. It is a var rather than a const so a
+// test can shrink it — TestConformanceCheckTimesOut does — and so an operator can
+// widen it for a slow but live endpoint. Five seconds is far longer than any
+// fake endpoint needs and far shorter than the go test panic a hung adapter would
+// otherwise reach.
+var conformanceCheckTimeout = 5 * time.Second
+
+// runCheck runs one check under its own deadline. The context is the deadline a
+// well-behaved provider aborts on; the select is the backstop for one that
+// ignores it, because a context alone cannot end a Complete that never returns.
+// On timeout the check fails and the goroutine is abandoned rather than waited
+// for: the provider it is stuck in is already broken, the next check builds a
+// fresh one, and waiting is the hang the timeout exists to prevent.
+func runCheck(check conformanceCheck, p Provider) error {
+	timeout := conformanceCheckTimeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- check.run(ctx, p) }()
+
+	select {
+	case err := <-done:
+		if err != nil && errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("did not finish within %s: %w", timeout, err)
+		}
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("did not finish within %s: %w", timeout, ctx.Err())
+	}
+}
+
 func conformanceChecks() []conformanceCheck {
 	return []conformanceCheck{
 		{name: "completion_returns_content_and_usage", run: checkCompletion},
@@ -117,7 +161,9 @@ func conformanceChecks() []conformanceCheck {
 // checkCompletion is check 1. A tool call alongside the content is allowed: the
 // OpenAI-shaped APIs may return both, and check 2 is the one that requires the
 // call. What matters here is that a plain request produces something the
-// executor can report and usage the budget can settle against.
+// executor can report and usage the budget can settle against — both counts
+// positive, because a text response that reports none is broken (see the Usage
+// doc) and a zero would leave the budget reconciling against nothing.
 func checkCompletion(ctx context.Context, p Provider) error {
 	resp, err := p.Complete(ctx, plainRequest(conformanceModel))
 	if err != nil {
@@ -132,13 +178,19 @@ func checkCompletion(ctx context.Context, p Provider) error {
 	return nil
 }
 
-// checkToolRoundTrip is check 2: the provider emits a call, accepts the tool
-// result as a later message in the same conversation, and finishes.
+// checkToolRoundTrip is check 2: the provider emits a call, the caller replays
+// the assistant turn that carried it together with a result attributed to that
+// call, and the provider finishes with content and no further calls.
 //
-// Message has no field for the assistant's tool_calls or the call ID, so this
-// exercises the Provider-level round trip, not the wire shape: whether a real
-// endpoint needs the assistant turn and tool_call_id is the adapter's own
-// acceptance test. The gap is recorded in the M2 Task 2 report.
+// The correlation is the point, not the acceptance. A result turn means nothing
+// unless it names the call it answers: the assistant turn carries
+// Message.ToolCalls (the full Call values, ids included) and the result carries
+// Message.CallID equal to the id of the call it answers. The fixture is required
+// to refuse a result it cannot attribute — that is what the real endpoints do
+// with tool_call_id and tool_use_id — so a provider that drops either half fails
+// here rather than completing. The last leg goes the other way: a result with no
+// CallID at all must be refused with ErrBadRequest, so a provider cannot pass by
+// forwarding whatever it was handed even when the fixture happens to be lax.
 func checkToolRoundTrip(ctx context.Context, p Provider) error {
 	req := plainRequest(conformanceModel)
 	req.Tools = conformanceTools()
@@ -150,22 +202,32 @@ func checkToolRoundTrip(ctx context.Context, p Provider) error {
 	if len(first.ToolCalls) == 0 {
 		return fmt.Errorf("Complete returned no tool call for a request offering %q (response %+v)", conformanceToolName, first)
 	}
-	call := first.ToolCalls[0]
-	if strings.TrimSpace(call.ID) == "" {
-		return fmt.Errorf("tool call %+v has no ID; its result cannot be correlated with it", call)
-	}
-	if call.Name != conformanceToolName {
-		return fmt.Errorf("tool call names %q, but the only tool offered was %q", call.Name, conformanceToolName)
-	}
-	if !json.Valid(call.Arguments) {
-		return fmt.Errorf("tool call arguments %s are not valid JSON; the tool layer hands them to json.Unmarshal", call.Arguments)
+	for i, call := range first.ToolCalls {
+		if strings.TrimSpace(call.ID) == "" {
+			return fmt.Errorf("tool call %d (%+v) has no ID; its result cannot be correlated with it", i, call)
+		}
+		if call.Name != conformanceToolName {
+			return fmt.Errorf("tool call %d names %q, but the only tool offered was %q", i, call.Name, conformanceToolName)
+		}
+		if !json.Valid(call.Arguments) {
+			return fmt.Errorf("tool call %d arguments %s are not valid JSON; the tool layer hands them to json.Unmarshal", i, call.Arguments)
+		}
 	}
 
-	req.Messages = append(req.Messages, Message{
-		Role:    "tool",
-		Name:    call.Name,
-		Content: `{"content":"# The brief"}`,
-	})
+	// The assistant turn goes back the way the provider returned it: the calls
+	// are the record of what the results answer, so their ids, names and
+	// arguments all belong in the conversation, not just the ids.
+	assistant := Message{Role: "assistant", Content: first.Content, ToolCalls: first.ToolCalls}
+	req.Messages = append(req.Messages, assistant)
+	for _, call := range first.ToolCalls {
+		req.Messages = append(req.Messages, Message{
+			Role:    "tool",
+			Name:    call.Name,
+			CallID:  call.ID,
+			Content: `{"content":"# The brief"}`,
+		})
+	}
+
 	finished, err := p.Complete(ctx, req)
 	if err != nil {
 		return fmt.Errorf("second Complete (tool result): %w", err)
@@ -175,6 +237,21 @@ func checkToolRoundTrip(ctx context.Context, p Provider) error {
 	}
 	if strings.TrimSpace(finished.Content) == "" {
 		return fmt.Errorf("after the tool result Complete returned no final content")
+	}
+
+	// The result cannot be attributed, so the provider must say so. This leg is
+	// the one that does not trust the fixture: a provider that drops or ignores
+	// CallID would send the turn on, and only a fixture that happens to be strict
+	// would stop it.
+	unattributable := plainRequest(conformanceModel)
+	unattributable.Tools = conformanceTools()
+	unattributable.Messages = append(unattributable.Messages,
+		assistant,
+		Message{Role: "tool", Name: first.ToolCalls[0].Name, Content: `{"content":"# The brief"}`},
+	)
+	resp, err := p.Complete(ctx, unattributable)
+	if !errors.Is(err, ErrBadRequest) {
+		return fmt.Errorf("a tool turn with no CallID: resp = %+v, err = %v; want ErrBadRequest, because its result cannot be attributed to the call it answers", resp, err)
 	}
 	return nil
 }

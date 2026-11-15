@@ -64,12 +64,12 @@ func cloneScript(script []Response) []Response {
 
 func (s *Stub) Name() string { return "stub" }
 
-// Complete replays the next scripted response. The reach check runs first and
-// consumes nothing, exactly as a real adapter refuses before it writes the
-// request, and a cancelled context is refused before a scripted response is
-// spent. A conformance failure model is answered with its taxonomy sentinel,
-// also without spending a scripted response: the stub is the provider-side end
-// of the conformance suite's fixture contract (see conformanceFailure).
+// Complete replays the next scripted response. The reach, context and tool
+// refusals run before a scripted response is spent, exactly as a real adapter
+// refuses before it writes the request; a conformance failure model is answered
+// with its taxonomy sentinel, also without spending a response, because the stub
+// is the provider-side end of the suite's fixture contract (see
+// conformanceFailure and correlateToolResults).
 func (s *Stub) Complete(ctx context.Context, req Request) (Response, error) {
 	if err := checkReach(req, s.Reach); err != nil {
 		return Response{}, err
@@ -77,7 +77,13 @@ func (s *Stub) Complete(ctx context.Context, req Request) (Response, error) {
 	if err := ctx.Err(); err != nil {
 		return Response{}, fmt.Errorf("provider: stub: %w", err)
 	}
+	if err := checkToolMessages(req); err != nil {
+		return Response{}, err
+	}
 	if err := conformanceFailure(req.Model); err != nil {
+		return Response{}, err
+	}
+	if err := correlateToolResults(req.Messages); err != nil {
 		return Response{}, err
 	}
 
@@ -107,6 +113,41 @@ func conformanceFailure(model string) error {
 		return ErrContextOverflow
 	case ConformanceModelServerError:
 		return ErrServer
+	}
+	return nil
+}
+
+// correlateToolResults is the stub's endpoint half of the conformance fixture
+// contract. A real endpoint attributes a tool result to the call it answers —
+// OpenAI rejects a tool message whose tool_call_id names no earlier tool_call,
+// and Anthropic the same for tool_use_id — so the stub does too. Without it the
+// stub would answer an unattributable result and check 2 would prove only that
+// messages are accepted, not that the correlation survives; with it, a provider
+// whose translation drops the id fails exactly as it would against a real
+// endpoint.
+//
+// Only a call carried by a *preceding* assistant turn counts: a result cannot
+// answer a call the conversation has not made yet. It runs before a scripted
+// response is spent, like every other refusal.
+func correlateToolResults(msgs []Message) error {
+	// A call with no id cannot be answered — checkToolMessages already refuses
+	// an empty CallID, and indexing "" would make that refusal look like a match.
+	calls := make(map[string]bool)
+	for i, m := range msgs {
+		if m.Role == "assistant" {
+			for _, c := range m.ToolCalls {
+				if c.ID != "" {
+					calls[c.ID] = true
+				}
+			}
+			continue
+		}
+		if m.Role != "tool" {
+			continue
+		}
+		if !calls[m.CallID] {
+			return fmt.Errorf("%w: message %d answers call %q, which no preceding assistant turn carries", ErrBadRequest, i, m.CallID)
+		}
 	}
 	return nil
 }
@@ -166,7 +207,17 @@ func estimateTokens(req Request) int {
 		tokens += messageOverhead
 		tokens += textTokens(m.Role)
 		tokens += textTokens(m.Name)
+		tokens += textTokens(m.CallID)
 		tokens += textTokens(m.Content)
+		// An assistant turn's calls are sent back on every later request in the
+		// conversation, so they are input like any other text: a large tool
+		// argument must raise the estimate or the budget under-reserves the
+		// step that replays it.
+		for _, c := range m.ToolCalls {
+			tokens += textTokens(c.ID)
+			tokens += textTokens(c.Name)
+			tokens += textTokens(string(c.Arguments))
+		}
 	}
 	for _, t := range req.Tools {
 		tokens += toolOverhead
