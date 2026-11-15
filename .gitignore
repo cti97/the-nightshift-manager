@@ -4,6 +4,7 @@
 # Build output — built locally, published by the manager at /dist, never committed
 dist/
 dist.new/
+dist.old/
 bin/
 *.exe
 *.test
