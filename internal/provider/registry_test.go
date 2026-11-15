@@ -1,11 +1,29 @@
 package provider
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 )
+
+// namedStub is the stub under a different name. New requires a constructor to
+// return a provider that reports the name it was registered under, so a test
+// that registers "openai" needs a provider whose Name() is "openai".
+type namedStub struct {
+	*Stub
+	name string
+}
+
+func (n namedStub) Name() string { return n.name }
+
+// ctorFor builds the shape a real adapter has: Name() and the registration key
+// agree.
+func ctorFor(name string) func(Config) (Provider, error) {
+	return func(Config) (Provider, error) { return namedStub{Stub: NewStub(nil), name: name}, nil }
+}
 
 // stubCtor is a valid constructor that needs no endpoint. The registry tests do
 // not care what it builds, only that a name is taken.
@@ -55,9 +73,10 @@ func TestRegistryRejectsUnknownProvider(t *testing.T) {
 
 func TestRegistryRejectsDuplicateRegistration(t *testing.T) {
 	r := NewRegistry()
-	r.Register("openai", stubCtor)
+	openai := ctorFor("openai")
+	r.Register("openai", openai)
 
-	recovered := mustPanic(t, func() { r.Register("openai", stubCtor) })
+	recovered := mustPanic(t, func() { r.Register("openai", openai) })
 	if msg := fmt.Sprint(recovered); !strings.Contains(msg, "openai") {
 		t.Fatalf("duplicate-registration panic %q does not name the provider", msg)
 	}
@@ -160,5 +179,37 @@ func TestRegistryIsSafeForConcurrentUse(t *testing.T) {
 	}
 	if p, err := NewRegistry().New(Config{Provider: "stub"}); err != nil || p == nil || p.Name() != "stub" {
 		t.Fatalf("New(stub) = %v, %v; want a stub", p, err)
+	}
+}
+
+func TestRegistryNewRejectsConstructorWhoseNameDisagrees(t *testing.T) {
+	// The copy-paste mistake a real adapter makes: the file is registered as
+	// "openai" but its Name() method still says "stub". Nothing before the first
+	// construction can see it, and by then dispatch would be pointed at the
+	// wrong protocol.
+	r := NewRegistry()
+	r.Register("openai", stubCtor) // the stub reports "stub"
+
+	_, err := r.New(Config{Provider: "openai"})
+	if err == nil {
+		t.Fatal("New(openai) accepted a provider whose Name() is \"stub\"; dispatch would reach the wrong adapter")
+	}
+	for _, want := range []string{"openai", "stub"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not name %q", err, want)
+		}
+	}
+}
+
+func TestRegistryCarriesTheEndpointReachToTheProvider(t *testing.T) {
+	// The endpoint row is where the declared reach lives; a provider built from
+	// it must still refuse a request whose own Reach says host. This is the
+	// wiring between Config and the adapter's half of checkReach.
+	p, err := NewRegistry().New(Config{Provider: "stub", Reach: "wan"})
+	if err != nil {
+		t.Fatalf("New(stub, reach wan): %v", err)
+	}
+	if _, err := p.Complete(context.Background(), Request{Model: "m", RequireLocal: true, Reach: "host"}); !errors.Is(err, ErrEgressRefused) {
+		t.Fatalf("stub built from a wan endpoint accepted a host-declared local-only request: %v", err)
 	}
 }

@@ -120,6 +120,25 @@ func TestStubRefusesWhenLocalRequiredButReachIsWAN(t *testing.T) {
 		t.Fatalf("configured wan endpoint: err = %v, want ErrEgressRefused", err)
 	}
 
+	// The sharp case the adapter's own declaration exists for: the caller
+	// believes it is talking to a host endpoint, but the endpoint the process
+	// would actually reach is wan. The request is internally consistent, so
+	// only the configured reach can stop it.
+	contradiction := NewStub(script)
+	contradiction.Reach = "wan"
+	if _, err := contradiction.Complete(ctx, Request{Model: "m", RequireLocal: true, Reach: "host"}); !errors.Is(err, ErrEgressRefused) {
+		t.Fatalf("request says host, endpoint is wan: err = %v, want ErrEgressRefused", err)
+	}
+
+	// And the reverse: the endpoint is local, but the caller declares wan.
+	// Disagreeing records are refused rather than resolved, because either
+	// resolution is a guess about which one is lying.
+	declaredWAN := NewStub(script)
+	declaredWAN.Reach = "host"
+	if _, err := declaredWAN.Complete(ctx, Request{Model: "m", RequireLocal: true, Reach: "wan"}); !errors.Is(err, ErrEgressRefused) {
+		t.Fatalf("request says wan, endpoint is host: err = %v, want ErrEgressRefused", err)
+	}
+
 	// A refusal happens before the script is consumed, exactly as a real adapter
 	// refuses before writing the request: the stub's next local call still gets
 	// the first scripted response.
@@ -234,5 +253,32 @@ func TestEstimateTokensIsMonotonic(t *testing.T) {
 			t.Fatalf("content of %d bytes estimates %d tokens, fewer than %d for %d bytes", i, got, prev, i-1)
 		}
 		prev = got
+	}
+}
+
+func TestStubStopsOnACancelledContext(t *testing.T) {
+	ctx := context.Background()
+	s := NewStub([]Response{{Content: "scripted reply"}})
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	// Complete must not spend a scripted response on a dead context: the call
+	// never happened, so the schedule must not advance.
+	if _, err := s.Complete(cancelled, Request{Model: "m"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Complete with a cancelled context: err = %v, want context.Canceled", err)
+	}
+	// Probe must not report a state it never determined.
+	if h, err := s.Probe(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Probe with a cancelled context = %q, %v; want context.Canceled", h, err)
+	}
+
+	// The cancelled calls consumed nothing and poisoned nothing.
+	got, err := s.Complete(ctx, Request{Model: "m"})
+	if err != nil || got.Content != "scripted reply" {
+		t.Fatalf("live call after cancelled calls = %+v, %v; want the first scripted response", got, err)
+	}
+	if h, err := s.Probe(ctx); err != nil || h != HealthOK {
+		t.Fatalf("live Probe = %q, %v; want ok, nil", h, err)
 	}
 }

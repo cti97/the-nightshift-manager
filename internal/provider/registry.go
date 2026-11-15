@@ -126,6 +126,15 @@ func (r *Registry) New(cfg Config) (Provider, error) {
 	if p == nil {
 		return nil, fmt.Errorf("provider %q: constructor returned no provider", cfg.Provider)
 	}
+	// A provider's Name is what dispatch and the endpoint row believe they are
+	// talking to. A copy-pasted Name() that disagrees with its registration key
+	// would be invisible until the wrong adapter ran, so the first construction
+	// checks it. Register cannot: it holds only a function, and running it
+	// without a real endpoint configuration would test the constructor against a
+	// lie.
+	if name := p.Name(); name != cfg.Provider {
+		return nil, fmt.Errorf("provider %q: constructor returned a provider named %q", cfg.Provider, name)
+	}
 	return p, nil
 }
 

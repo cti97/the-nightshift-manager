@@ -4,8 +4,11 @@
 // suite is proved against.
 //
 // One policy lives in this package rather than in placement: no_egress is
-// re-checked here, in the path every adapter's request passes through, because
-// placement is a decision and this is the guarantee.
+// re-checked by every adapter's Complete before it sends, because placement is
+// a decision made elsewhere and this is the guarantee that has to hold even if a
+// code path skips it. Enforcement is a per-adapter call to checkReach plus the
+// conformance suite's refusal check (M2 Task 2) — not a structural property of
+// the interface, which in Go cannot carry one.
 package provider
 
 import (
