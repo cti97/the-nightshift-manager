@@ -578,3 +578,38 @@ func TestHandlersRejectMalformedJSON(t *testing.T) {
 		t.Fatalf("heartbeat error code = %q, want bad_json", code)
 	}
 }
+
+// A pause has to survive both heartbeat paths. The incompatible path used to
+// overwrite it, so the next good beat saw 'incompatible' and went 'online'.
+func TestPauseSurvivesIncompatibleThenGoodHeartbeat(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	id, _, err := RegisterNode(ctx, db, clock, RegisterRequest{Name: "pi", Role: "steward"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE nodes SET status='paused' WHERE id=?`, id); err != nil {
+		t.Fatalf("pause node: %v", err)
+	}
+
+	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: 99}); err != nil {
+		t.Fatalf("incompatible heartbeat: %v", err)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM nodes WHERE id=?`, id).Scan(&status); err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if status != "paused" {
+		t.Fatalf("status = %q after an incompatible heartbeat, want the pause preserved", status)
+	}
+
+	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: 1}); err != nil {
+		t.Fatalf("good heartbeat: %v", err)
+	}
+	if err := db.QueryRow(`SELECT status FROM nodes WHERE id=?`, id).Scan(&status); err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if status != "paused" {
+		t.Fatalf("status = %q after a good heartbeat, want the pause preserved", status)
+	}
+}

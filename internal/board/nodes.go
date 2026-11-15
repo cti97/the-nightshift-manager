@@ -131,7 +131,8 @@ func RegisterNode(ctx context.Context, db *sql.DB, clock Clock, req RegisterRequ
 func Heartbeat(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req HeartbeatRequest) (HeartbeatResponse, error) {
 	if req.Protocol < ProtocolMin || req.Protocol > ProtocolMax {
 		res, err := db.ExecContext(ctx,
-			`UPDATE nodes SET status='incompatible', provides_live=?, last_seen_at=? WHERE id=?`,
+			`UPDATE nodes SET status = CASE WHEN status='paused' THEN 'paused' ELSE 'incompatible' END,
+			 provides_live=?, last_seen_at=? WHERE id=?`,
 			emptyJSONList, clock.Now(), nodeID)
 		if err != nil {
 			return HeartbeatResponse{}, err
