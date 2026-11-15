@@ -22,6 +22,37 @@ type ClaimedItem struct {
 	Brief           string   `json:"brief"`
 	RunID           string   `json:"run_id"`
 	PlacementReason string   `json:"placement_reason"`
+
+	// Endpoint and Model are the run's chosen execution target. The claim
+	// transaction already writes their ids into the run row; they are repeated
+	// here because the node that claimed the item has no other route to them
+	// (the claim payload is the node's only read of the board's endpoint
+	// tables). Placement chooses them once, and the node executes exactly that
+	// choice rather than re-deriving it.
+	Endpoint ClaimEndpoint `json:"endpoint"`
+	Model    ClaimModel    `json:"model"`
+}
+
+// ClaimEndpoint is the construction config for the endpoint that placement
+// chose: the family, the URL, the reach the adapter must declare, and the name
+// of the provider key. AuthRef is a name, never a value — the value is resolved
+// by the node from its own environment under provider.AuthRefPrefix, so a
+// credential never travels over the board's wire.
+type ClaimEndpoint struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	BaseURL  string `json:"base_url"`
+	Reach    string `json:"reach"`
+	AuthRef  string `json:"auth_ref,omitempty"`
+}
+
+// ClaimModel names the model to send: ID is the board row (what runs.model_id
+// records) and ModelID is the wire name the provider expects. They are
+// different values and the node needs the second.
+type ClaimModel struct {
+	ID      string `json:"id"`
+	ModelID string `json:"model_id"`
 }
 
 // LoadCandidates reads every online node, every endpoint that is healthy, and
@@ -51,6 +82,7 @@ func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly bool) ([]Cand
 		SELECT n.id, n.name, n.role, n.provides_live, n.reach_classes, n.concurrency,
 		       n.status, n.agent_version,
 		       e.id, e.name, e.provider, e.reach, e.health, COALESCE(e.health_reason,''),
+		       e.base_url, COALESCE(e.auth_ref,''),
 		       m.id, m.model_id, m.provides, m.features, m.context_window, m.cost_in_per_mtok, m.enabled
 		  FROM nodes n
 		  JOIN endpoints e ON 1=1
@@ -73,6 +105,7 @@ func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly bool) ([]Cand
 			&c.Node.Status, &c.Node.AgentVersion,
 			&c.Endpoint.ID, &c.Endpoint.Name, &c.Endpoint.Provider, &c.Endpoint.Reach, &c.Endpoint.Health,
 			&c.Endpoint.HealthReason,
+			&c.Connection.BaseURL, &c.Connection.AuthRef,
 			&c.Model.ID, &c.Model.ModelID, &provides, &features, &c.Model.ContextWindow,
 			&c.Model.CostInPerMtok, &c.Model.Enabled,
 		); err != nil {
@@ -240,6 +273,15 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 		item.Status, item.Attempt = "claimed", r.attempt+1
 		claimed = append(claimed, ClaimedItem{
 			Item: item, Brief: r.brief, RunID: runID, PlacementReason: d.Reason,
+			Endpoint: ClaimEndpoint{
+				ID:       d.Chosen.Endpoint.ID,
+				Name:     d.Chosen.Endpoint.Name,
+				Provider: d.Chosen.Endpoint.Provider,
+				BaseURL:  d.Chosen.Connection.BaseURL,
+				Reach:    d.Chosen.Endpoint.Reach,
+				AuthRef:  d.Chosen.Connection.AuthRef,
+			},
+			Model: ClaimModel{ID: d.Chosen.Model.ID, ModelID: d.Chosen.Model.ModelID},
 		})
 	}
 

@@ -717,3 +717,35 @@ func TestWhyRouteDistinguishesACorruptRowFromAMissingItem(t *testing.T) {
 		t.Fatalf("why error %s does not name the item that exists", rec.Body)
 	}
 }
+
+// TestReportRecordsReservedTokens pins the second spend channel: the budget a
+// failed attempt charged is stored on the run, separately from the actuals, so
+// Task 13's ledger can count a retried run without pretending the failed
+// attempt produced output.
+func TestReportRecordsReservedTokens(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	_, _ = CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	got, _ := Claim(ctx, db, clock, node, 1)
+	runID := got[0].RunID
+	if err := StartRun(ctx, db, clock, runID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	if _, err := Report(ctx, db, clock, runID, node, ReportRequest{
+		Status: "ok", Summary: "done", TokensIn: 10, TokensOut: 5, ReservedTokens: 1234,
+	}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+
+	var in, out, reserved int
+	if err := db.QueryRow(`SELECT input_tokens, output_tokens, reserved_tokens FROM runs WHERE id=?`, runID).
+		Scan(&in, &out, &reserved); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if in != 10 || out != 5 || reserved != 1234 {
+		t.Fatalf("run tokens = (in %d, out %d, reserved %d), want (10, 5, 1234)", in, out, reserved)
+	}
+}

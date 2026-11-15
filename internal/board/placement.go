@@ -53,10 +53,25 @@ type WorkItem struct {
 	Attempt int      `json:"attempt"`
 }
 
+// EndpointConnection is the endpoint configuration a claiming node needs to
+// construct an adapter for the run: where to send requests, and the *name* of
+// the provider key to resolve from the node's own environment. The value never
+// transits the board; only the name does, and the node applies
+// provider.CheckAuthRef before reading anything.
+//
+// It is a separate field on Candidate rather than more columns on Endpoint
+// because Endpoint is placement's narrow projection, and placement must never
+// read a URL or a credential name. The claim path is the only reader.
+type EndpointConnection struct {
+	BaseURL string
+	AuthRef string
+}
+
 type Candidate struct {
-	Node     Node
-	Endpoint Endpoint
-	Model    Model
+	Node       Node
+	Endpoint   Endpoint
+	Model      Model
+	Connection EndpointConnection
 }
 
 type Reject struct {

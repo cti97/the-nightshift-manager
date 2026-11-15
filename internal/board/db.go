@@ -16,6 +16,9 @@ import (
 //go:embed schema.sql
 var schema string
 
+//go:embed schema2.sql
+var schema2 string
+
 // A migration upgrades a database one version, to Version.
 type migration struct {
 	version int
@@ -29,8 +32,10 @@ type migration struct {
 // the list below, so there is nothing else to keep in sync.
 var migrations = []migration{
 	{version: 1, script: schema},
-	// Migration 2 (M4): append {version: 2, script: schema2} here, with a
-	// //go:embed for schema2 above; the version below follows.
+	// Migration 2 (M2 Task 12): runs.reserved_tokens, the budget charge for
+	// attempts that reported no usage. M4 appends version 3 with the watches
+	// tables; the version below follows from the list.
+	{version: 2, script: schema2},
 }
 
 // schemaVersion is the schema version this binary implements: the version

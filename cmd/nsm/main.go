@@ -270,13 +270,18 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 		BaseURL: *baseURL,
 		Token:   token,
 		NodeID:  *nodeID,
-		// M2 replaces the stub with the agentic executor. Until then the loop is
-		// real and the work is not.
-		Executor:    agent.StubExecutor{},
-		Protocol:    board.ProtocolMax,
-		Provides:    providesLive,
-		Reaches:     reaches,
-		SandboxRoot: *sandboxRoot,
+		// The node executes with the real loop. The endpoint and model arrive
+		// per claim (placement chose them); the registry constructs the adapter
+		// from the claim's config, and the credential is resolved by name from
+		// this process's environment. The sandbox root is the flag, not a
+		// second configuration: it is the one thing the claim cannot supply.
+		Executor: &agent.AgenticExecutor{
+			Registry:    provider.NewRegistry(),
+			SandboxRoot: *sandboxRoot,
+		},
+		Protocol: board.ProtocolMax,
+		Provides: providesLive,
+		Reaches:  reaches,
 	}, true
 }
 

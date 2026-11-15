@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cti97/the-nightshift-manager/internal/agent"
 	"github.com/cti97/the-nightshift-manager/internal/board"
 	"github.com/cti97/the-nightshift-manager/internal/provider"
 )
@@ -86,8 +87,12 @@ func TestParseAgentConfigCarriesLiveCapabilities(t *testing.T) {
 	if cfg.Protocol != board.ProtocolMax {
 		t.Fatalf("protocol = %d, want %d", cfg.Protocol, board.ProtocolMax)
 	}
-	if cfg.Executor == nil {
-		t.Fatal("executor = nil, want the stub executor")
+	exec, ok := cfg.Executor.(*agent.AgenticExecutor)
+	if !ok {
+		t.Fatalf("executor = %T, want *agent.AgenticExecutor: the node must execute, not stub", cfg.Executor)
+	}
+	if exec.Registry == nil {
+		t.Fatal("executor has no provider registry: no endpoint could be constructed")
 	}
 	if got := strings.Join(cfg.Provides, ","); got != "agentic,vision" {
 		t.Fatalf("provides = %q", got)
@@ -95,8 +100,8 @@ func TestParseAgentConfigCarriesLiveCapabilities(t *testing.T) {
 	if got := strings.Join(cfg.Reaches, ","); got != "host,lan" {
 		t.Fatalf("reaches = %q", got)
 	}
-	if cfg.SandboxRoot != sandboxRoot {
-		t.Fatalf("sandbox root = %q, want %q: the run root is configuration, not a constant", cfg.SandboxRoot, sandboxRoot)
+	if exec.SandboxRoot != sandboxRoot {
+		t.Fatalf("executor sandbox root = %q, want %q: the run root is the flag, not a second configuration", exec.SandboxRoot, sandboxRoot)
 	}
 	if errOut.Len() != 0 {
 		t.Fatalf("unexpected warning: %s", errOut.String())

@@ -150,7 +150,8 @@ CREATE TABLE runs (
   ended_at          INTEGER,
   status            TEXT NOT NULL,      -- claimed | running | ok | error | lost | abandoned | escalated
   input_tokens      INTEGER DEFAULT 0,
-  output_tokens     INTEGER DEFAULT 0,
+  output_tokens     INTEGER DEFAULT 0,  -- provider-reported actuals
+  reserved_tokens   INTEGER DEFAULT 0,  -- budget charged for attempts with no usage
   cost_estimate     REAL DEFAULT 0,
   placement_reason  TEXT NOT NULL,
   transcript_path   TEXT,
@@ -328,6 +329,20 @@ atomic with no locking cleverness. A loser gets an empty result and long-polls a
 The `WHERE` clause above is abbreviated — §9 is the normative eligibility rule, including the
 reach, health and role checks. Keep the two in sync or the code will implement a subset of the
 policy and the `/why` endpoint will confidently explain the wrong thing.
+
+**The claim payload carries the chosen execution target.** A claimed item includes the endpoint
+(id, name, provider, base URL, reach) and the model (row id and wire `model_id`), because the
+node has no other route to those tables: `GET /admin/endpoints` is admin-only and endpoints have
+no node-facing read. The endpoint's `auth_ref` travels as a **name**, never a value; the node
+resolves it from its own environment under the same `NSM_PROVIDER_*` rule the manager applies
+(§5), so a credential never transits the board. This is protocol 2: a node that speaks 2 needs
+the fields, and `ProtocolMax` is 2 so one talking to a protocol-1 board is marked incompatible
+and claims nothing rather than claiming work it cannot execute.
+
+**Reserved spend.** `runs.input_tokens`/`output_tokens` are provider-reported actuals.
+`runs.reserved_tokens` is the separate budget charge for attempts that failed and reported no
+usage (a retried `Complete` can be billed twice); the spend ledger counts both rather than
+pretending the failed attempt produced output.
 
 **Capabilities are dynamic.** A laptop that has driven to the office can no longer reach
 `lan:home-nas`, and its `provides_live` says so on the next heartbeat (15s). Placement uses

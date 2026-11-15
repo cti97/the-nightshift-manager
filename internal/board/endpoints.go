@@ -137,48 +137,6 @@ func checkProviderRegistered(reg *provider.Registry, name string) error {
 	return fmt.Errorf("unknown provider %q (registered: %s)", name, strings.Join(names, ", "))
 }
 
-// authRefPrefix is the only namespace an endpoints.auth_ref may name.
-//
-// The rule exists because auth_ref is the one column that makes the manager read
-// its own environment on a row's instruction. A free-form name turns that into a
-// credential-exfiltration primitive: a row naming NSM_ADMIN_TOKEN, pointed at any
-// URL, would have the manager send its own admin token as a bearer header. A
-// reserved namespace makes the manager's tokens unmatchable by construction
-// rather than by review — and provider keys are exactly what belongs in it.
-const authRefPrefix = "NSM_PROVIDER_"
-
-// checkAuthRef refuses any value that is not a name in the provider-key
-// namespace: NSM_PROVIDER_ followed by an uppercase name (A-Z, 0-9, _ starting
-// with a letter). It is the same rule at both ends — the write path calls it so a
-// typo is a 400 at creation, and the probe calls it again so a row the write path
-// never saw (a fixture, a migration, raw SQL) cannot reach outside the namespace.
-//
-// An empty auth_ref is legitimate: a local llama.cpp or LM Studio server usually
-// has no key, and a row that names nothing must be able to say so.
-func checkAuthRef(ref string) error {
-	if ref == "" {
-		return nil
-	}
-	if !strings.HasPrefix(ref, authRefPrefix) {
-		return fmt.Errorf("auth_ref %q: must name a provider key in the %s* namespace", ref, authRefPrefix)
-	}
-	name := strings.TrimPrefix(ref, authRefPrefix)
-	if name == "" {
-		return fmt.Errorf("auth_ref %q: names must be %s followed by an uppercase name", ref, authRefPrefix)
-	}
-	for i, r := range name {
-		switch {
-		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
-		default:
-			return fmt.Errorf("auth_ref %q: character %q is not allowed after %s (want A-Z, 0-9 or _)", ref, r, authRefPrefix)
-		}
-		if i == 0 && (r < 'A' || r > 'Z') {
-			return fmt.Errorf("auth_ref %q: the name after %s must start with an uppercase letter", ref, authRefPrefix)
-		}
-	}
-	return nil
-}
-
 // EndpointView is an endpoint row as the admin API shows it: the store's columns
 // plus its models. It is deliberately not placement's Endpoint type, which is a
 // narrow projection (id, name, provider, reach, health) that must stay free of
@@ -249,8 +207,8 @@ func CreateEndpoint(ctx context.Context, db *sql.DB, clock Clock, reg *provider.
 	// auth_ref names a provider key, and only a provider key. Validated here as
 	// well as at resolve time so the refusal reaches the operator who typed it,
 	// with the row uncreated; the probe's re-check covers rows this path never
-	// saw. See authRefPrefix for why the namespace exists at all.
-	if err := checkAuthRef(authRef); err != nil {
+	// saw. See provider.AuthRefPrefix for why the namespace exists at all.
+	if err := provider.CheckAuthRef(authRef); err != nil {
 		return EndpointView{}, err
 	}
 	reach, err := parseReach(req.Reach)

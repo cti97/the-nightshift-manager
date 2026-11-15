@@ -10,15 +10,21 @@ import (
 
 // ReportRequest is what a node posts when a run finishes. Status is "ok" or
 // "error"; every other field is recorded for the audit trail and the spend
-// view, never interpreted by the board's state machine. Any other Status value
+// view, never interpreted by the board's state machine.
+//
+// TokensIn and TokensOut are the provider-reported actuals. ReservedTokens is
+// the separate budget charge for attempts that failed and reported no usage; it
+// is not a measurement, but it is what the run actually cost in reservation, and
+// the spend ledger needs both to avoid under-counting a retried run. Any other Status value
 // is rejected before any write, so a body missing the field cannot fail an item.
 type ReportRequest struct {
-	Status     string `json:"status"` // "ok" | "error"
-	Summary    string `json:"summary"`
-	TokensIn   int    `json:"tokens_in"`
-	TokensOut  int    `json:"tokens_out"`
-	Error      string `json:"error"`
-	Transcript string `json:"transcript_path"`
+	Status         string `json:"status"` // "ok" | "error"
+	Summary        string `json:"summary"`
+	TokensIn       int    `json:"tokens_in"`
+	TokensOut      int    `json:"tokens_out"`
+	ReservedTokens int    `json:"reserved_tokens"`
+	Error          string `json:"error"`
+	Transcript     string `json:"transcript_path"`
 }
 
 // ReportResult says whether this call was the one that settled the run.
@@ -82,9 +88,9 @@ func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, 
 	// discards any partial write. That is what makes exactly-once true on this
 	// function's own logic, rather than on the connection pool's serialisation.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE runs SET status=?, ended_at=?, input_tokens=?, output_tokens=?, error=?, transcript_path=?
+		`UPDATE runs SET status=?, ended_at=?, input_tokens=?, output_tokens=?, reserved_tokens=?, error=?, transcript_path=?
 		  WHERE id=? AND status IN ('claimed','running')`,
-		finalRun, clock.Now(), req.TokensIn, req.TokensOut,
+		finalRun, clock.Now(), req.TokensIn, req.TokensOut, req.ReservedTokens,
 		nullable(req.Error), nullable(req.Transcript), runID)
 	if err != nil {
 		return ReportResult{}, err

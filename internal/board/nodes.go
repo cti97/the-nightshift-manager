@@ -23,9 +23,17 @@ const nodeStaleAfter = 2 * leaseSeconds
 
 // ProtocolMin/Max are what this binary can speak. A node outside the range is
 // marked incompatible rather than left crash-looping (spec §20).
+//
+// Protocol 2 (M2 Task 12) is the claim payload that carries the chosen
+// endpoint's construction config and the model id: a node that speaks 2 can
+// build a real provider, and a board that speaks only 1 cannot give it one. Min
+// stays at 1 because the additions are JSON fields an older node ignores — an
+// old node on a new board still works, with its stubbed executor. Max is 2 so a
+// new node on an old board is marked incompatible and claims nothing, rather
+// than claiming work it cannot execute.
 const (
 	ProtocolMin = 1
-	ProtocolMax = 1
+	ProtocolMax = 2
 )
 
 // emptyJSONList is how an empty list is stored. json.Marshal(nil) would write

@@ -143,6 +143,14 @@ func claimedItem(runID, brief string, needs ...string) board.ClaimedItem {
 		Item:  board.WorkItem{ID: "item-1", Title: "a task", Needs: needs},
 		Brief: brief,
 		RunID: runID,
+		Endpoint: board.ClaimEndpoint{
+			ID:       "ep-1",
+			Name:     "test-endpoint",
+			Provider: "stub",
+			BaseURL:  "http://test-endpoint",
+			Reach:    "host",
+		},
+		Model: board.ClaimModel{ID: "m-1", ModelID: "test-model"},
 	}
 }
 
@@ -158,12 +166,23 @@ func lastMessageOfRole(req provider.Request, role string) (provider.Message, boo
 	return provider.Message{}, false
 }
 
+// newAgentic builds an executor whose provider is supplied directly. The
+// executor's production path constructs the adapter from the claim's endpoint
+// config; newProvider is the seam that lets a test script the model without a
+// registry entry, and claimedItem below supplies the claim fields the real
+// board sends.
 func newAgentic(t *testing.T, p provider.Provider) *AgenticExecutor {
 	t.Helper()
+	return newAgenticInRoot(t, p, t.TempDir())
+}
+
+func newAgenticInRoot(t *testing.T, p provider.Provider, root string) *AgenticExecutor {
+	t.Helper()
 	return &AgenticExecutor{
-		Provider:    p,
-		Model:       "test-model",
-		SandboxRoot: t.TempDir(),
+		SandboxRoot: root,
+		newProvider: func(provider.Config) (provider.Provider, error) {
+			return p, nil
+		},
 	}
 }
 
@@ -199,10 +218,11 @@ func TestAgenticExecutorSetsMaxTokensModelAndToolsOnEveryCall(t *testing.T) {
 		return finishResponse("call-finish", "done", finishUsage()), nil
 	}}
 	exec := newAgentic(t, p)
-	exec.Model = "model-7"
 	exec.MaxTokens = 77
+	item := claimedItem("run-1", "do it", "agentic")
+	item.Model.ModelID = "model-7"
 
-	if _, err := exec.Run(context.Background(), claimedItem("run-1", "do it", "agentic")); err != nil {
+	if _, err := exec.Run(context.Background(), item); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := p.callCount(); got != 2 {
@@ -501,6 +521,9 @@ func TestAgenticExecutorRoutesThroughTheProvidersErrorTaxonomy(t *testing.T) {
 		if !strings.Contains(msg, "acme") {
 			t.Fatalf("error %q does not name the provider", msg)
 		}
+		if !strings.Contains(msg, "test-endpoint") {
+			t.Fatalf("error %q does not name the endpoint whose key failed", msg)
+		}
 		if !strings.Contains(msg, "auth") {
 			t.Fatalf("error %q does not name the error class", msg)
 		}
@@ -740,7 +763,7 @@ func TestAgenticExecutorClosesTheSandboxOnEveryPath(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		root := t.TempDir()
 		stub := provider.NewStub([]provider.Response{finishResponse("call-finish", "done", finishUsage())})
-		exec := &AgenticExecutor{Provider: stub, Model: "m", SandboxRoot: root}
+		exec := newAgenticInRoot(t, stub, root)
 		if _, err := exec.Run(context.Background(), claimedItem("run-1", "do it", "agentic")); err != nil {
 			t.Fatalf("Run: %v", err)
 		}
@@ -752,7 +775,7 @@ func TestAgenticExecutorClosesTheSandboxOnEveryPath(t *testing.T) {
 		p := &testProvider{name: "acme", complete: func(int, provider.Request) (provider.Response, error) {
 			return provider.Response{}, provider.ErrAuth
 		}}
-		exec := &AgenticExecutor{Provider: p, Model: "m", SandboxRoot: root}
+		exec := newAgenticInRoot(t, p, root)
 		if _, err := exec.Run(context.Background(), claimedItem("run-1", "do it", "agentic")); err == nil {
 			t.Fatal("Run succeeded; the provider refused")
 		}
@@ -762,7 +785,8 @@ func TestAgenticExecutorClosesTheSandboxOnEveryPath(t *testing.T) {
 	t.Run("step cap", func(t *testing.T) {
 		root := t.TempDir()
 		stub := provider.NewStub([]provider.Response{listDirResponse("call-1")})
-		exec := &AgenticExecutor{Provider: stub, Model: "m", SandboxRoot: root, MaxSteps: 1}
+		exec := newAgenticInRoot(t, stub, root)
+		exec.MaxSteps = 1
 		if _, err := exec.Run(context.Background(), claimedItem("run-1", "loop", "agentic")); err == nil {
 			t.Fatal("Run succeeded; the step cap should have ended it")
 		}
@@ -861,6 +885,168 @@ func TestAgenticExecutorReturnsTheContextErrorWhenCancelledMidTool(t *testing.T)
 	}
 }
 
+// --- claim-driven provider construction ------------------------------------
+
+// TestAgenticExecutorBuildsTheProviderFromTheClaim is the wiring finding's unit
+// half: the endpoint the board chose reaches the registry as a Config, and the
+// credential is resolved by NAME from this node's environment.
+func TestAgenticExecutorBuildsTheProviderFromTheClaim(t *testing.T) {
+	p := &testProvider{name: "openai", complete: func(int, provider.Request) (provider.Response, error) {
+		return finishResponse("call-finish", "done", finishUsage()), nil
+	}}
+	var got provider.Config
+	var lookedUp []string
+	exec := &AgenticExecutor{
+		SandboxRoot: t.TempDir(),
+		lookupEnv: func(name string) string {
+			lookedUp = append(lookedUp, name)
+			return "sk-test"
+		},
+		newProvider: func(cfg provider.Config) (provider.Provider, error) {
+			got = cfg
+			return p, nil
+		},
+	}
+
+	item := claimedItem("run-1", "do it", "agentic")
+	item.Endpoint = board.ClaimEndpoint{
+		ID: "ep-1", Name: "laptop", Provider: "openai",
+		BaseURL: "http://127.0.0.1:8080", Reach: "lan", AuthRef: "NSM_PROVIDER_LAPTOP",
+	}
+	item.Model = board.ClaimModel{ID: "m-1", ModelID: "gpt-4o-mini"}
+
+	if _, err := exec.Run(context.Background(), item); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got.Provider != "openai" || got.BaseURL != "http://127.0.0.1:8080" || got.Reach != "lan" {
+		t.Fatalf("provider config = %+v, want the claim's endpoint", got)
+	}
+	if got.APIKey != "sk-test" {
+		t.Fatalf("APIKey = %q, want the value resolved from this node's environment", got.APIKey)
+	}
+	if len(lookedUp) != 1 || lookedUp[0] != "NSM_PROVIDER_LAPTOP" {
+		t.Fatalf("environment lookups = %v, want exactly NSM_PROVIDER_LAPTOP", lookedUp)
+	}
+	if req := p.request(0); req.Model != "gpt-4o-mini" {
+		t.Fatalf("request Model = %q, want the claim's wire model id", req.Model)
+	}
+}
+
+// TestAgenticExecutorRefusesAnAuthRefOutsideTheProviderNamespace pins the node's
+// half of the credential rule: a claim naming the admin token is refused before
+// any environment read, exactly as the board refuses the same name at write
+// time. The rule lives once, in provider.CheckAuthRef.
+func TestAgenticExecutorRefusesAnAuthRefOutsideTheProviderNamespace(t *testing.T) {
+	constructed := false
+	readEnv := false
+	exec := &AgenticExecutor{
+		SandboxRoot: t.TempDir(),
+		lookupEnv: func(string) string {
+			readEnv = true
+			return "leaked"
+		},
+		newProvider: func(provider.Config) (provider.Provider, error) {
+			constructed = true
+			return &testProvider{name: "acme"}, nil
+		},
+	}
+	item := claimedItem("run-1", "do it", "agentic")
+	item.Endpoint.AuthRef = "NSM_ADMIN_TOKEN"
+
+	_, err := exec.Run(context.Background(), item)
+	if err == nil {
+		t.Fatal("Run succeeded; an auth_ref outside the provider namespace must be refused")
+	}
+	if !strings.Contains(err.Error(), "auth_ref") || !strings.Contains(err.Error(), provider.AuthRefPrefix) {
+		t.Fatalf("error = %q, want it to name the auth_ref namespace rule", err)
+	}
+	if readEnv || constructed {
+		t.Fatalf("refused auth_ref still read the environment (read=%v) or constructed a provider (built=%v)", readEnv, constructed)
+	}
+}
+
+// TestAgenticExecutorNamesAMissingProviderKey pins the other credential failure:
+// a permitted name this node does not hold is a configuration error naming the
+// endpoint, not a request sent with an empty bearer token.
+func TestAgenticExecutorNamesAMissingProviderKey(t *testing.T) {
+	constructed := false
+	exec := &AgenticExecutor{
+		SandboxRoot: t.TempDir(),
+		lookupEnv:   func(string) string { return "" },
+		newProvider: func(provider.Config) (provider.Provider, error) {
+			constructed = true
+			return &testProvider{name: "acme"}, nil
+		},
+	}
+	item := claimedItem("run-1", "do it", "agentic")
+	item.Endpoint.AuthRef = "NSM_PROVIDER_MISSING"
+
+	_, err := exec.Run(context.Background(), item)
+	if err == nil {
+		t.Fatal("Run succeeded; a named key the node does not hold must fail")
+	}
+	if !strings.Contains(err.Error(), "test-endpoint") || !strings.Contains(err.Error(), "NSM_PROVIDER_MISSING") {
+		t.Fatalf("error = %q, want the endpoint and the missing key named", err)
+	}
+	if !strings.Contains(err.Error(), "not set in this node's environment") {
+		t.Fatalf("error = %q, want the node's own environment named", err)
+	}
+	if constructed {
+		t.Fatal("a missing key still constructed a provider")
+	}
+}
+
+// TestAgenticExecutorUsesTheRegistryWhenNoTestConstructorIsSet pins that the
+// production path is the registry, not a special case. An unscripted stub is
+// enough: construction succeeds and the run fails with the endpoint named.
+func TestAgenticExecutorUsesTheRegistryWhenNoTestConstructorIsSet(t *testing.T) {
+	exec := &AgenticExecutor{Registry: provider.NewRegistry(), SandboxRoot: t.TempDir()}
+	item := claimedItem("run-1", "do it", "agentic")
+	item.Endpoint.Name = "from-the-board"
+
+	_, err := exec.Run(context.Background(), item)
+	if err == nil {
+		t.Fatal("Run succeeded; an unscripted stub has no response to replay")
+	}
+	if !strings.Contains(err.Error(), "from-the-board") {
+		t.Fatalf("error = %q, want the endpoint named", err)
+	}
+}
+
+// TestAgenticExecutorFailsARunThatSettlesOverTheBudget is the token cap's
+// post-settle half: a response can report more than the estimate reserved, and
+// if it calls finish the run would otherwise end in success with a silent
+// breach. The last reply is discarded and the cap is named.
+func TestAgenticExecutorFailsARunThatSettlesOverTheBudget(t *testing.T) {
+	p := &testProvider{name: "acme", complete: func(int, provider.Request) (provider.Response, error) {
+		return finishResponse("call-finish", "done", provider.Usage{In: 900, Out: 200}), nil
+	}}
+	p.estimate = func(int, provider.Request) int { return 10 }
+	exec := newAgentic(t, p)
+	exec.TokenBudget = 1000
+	exec.MaxTokens = 10
+
+	res, err := exec.Run(context.Background(), claimedItem("run-1", "do it", "agentic"))
+	if err == nil {
+		t.Fatal("Run succeeded after settling over its token budget")
+	}
+	if !errors.Is(err, ErrTokenBudget) {
+		t.Fatalf("Run error = %v, want ErrTokenBudget", err)
+	}
+	if !strings.Contains(err.Error(), "after settling") || !strings.Contains(err.Error(), "1100") {
+		t.Fatalf("error = %q, want the settled spend and the cap named", err)
+	}
+	if res.Summary == "done" {
+		t.Fatalf("Summary = %q; a finish reply over budget must not be reported as success", res.Summary)
+	}
+	if !strings.Contains(res.Summary, "token budget") {
+		t.Fatalf("Summary = %q, want the cap named", res.Summary)
+	}
+	if got := p.callCount(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
 // --- M1's end-to-end test, re-run -----------------------------------------
 
 // TestAgentRunsAnAgenticExecutorToDone re-runs M1's queued → done story with
@@ -908,5 +1094,60 @@ func TestAgentRunsAnAgenticExecutorToDone(t *testing.T) {
 	}
 	if tokensIn != 12 || tokensOut != 7 {
 		t.Fatalf("run tokens = (%d, %d), want (12, 7)", tokensIn, tokensOut)
+	}
+
+	// The claim wrote the endpoint and model placement chose, and the node
+	// executed exactly that choice (newProvider above is reached through the
+	// claim's config; this pins the board's side of the same fact).
+	var endpointID, modelID string
+	if err := f.db.QueryRow(
+		`SELECT endpoint_id, model_id FROM runs WHERE work_item_id=? ORDER BY attempt DESC LIMIT 1`,
+		f.itemID).Scan(&endpointID, &modelID); err != nil {
+		t.Fatalf("read run target: %v", err)
+	}
+	if endpointID != "ep-local" || modelID != "m-local" {
+		t.Fatalf("run target = (%q, %q), want (ep-local, m-local)", endpointID, modelID)
+	}
+}
+
+// TestAgentReportsARetriedAttemptsReservedSpend is the accounting finding's
+// end-to-end half: a rate_limited failure followed by a successful finish must
+// reach the board as the retry's actuals PLUS the failed attempt's reservation,
+// or Task 13's ledger under-counts a run that was billed twice.
+func TestAgentReportsARetriedAttemptsReservedSpend(t *testing.T) {
+	f := newFixture(t)
+
+	p := &testProvider{name: "acme", complete: func(call int, _ provider.Request) (provider.Response, error) {
+		if call == 0 {
+			return provider.Response{}, provider.ErrRateLimited
+		}
+		return finishResponse("call-finish", "retried", provider.Usage{In: 12, Out: 7}), nil
+	}}
+	exec := newAgentic(t, p)
+	exec.sleep = func(ctx context.Context, d time.Duration) error { return nil }
+
+	a := New(f.config(exec))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errc := startAgent(a, ctx)
+
+	waitFor(t, "item done after the retry", func() bool { return f.itemStatus(t) == "done" })
+	cancel()
+	waitAgent(t, errc, context.Canceled)
+
+	var in, out, reserved int
+	if err := f.db.QueryRow(
+		`SELECT input_tokens, output_tokens, reserved_tokens FROM runs WHERE work_item_id=? ORDER BY attempt DESC LIMIT 1`,
+		f.itemID).Scan(&in, &out, &reserved); err != nil {
+		t.Fatalf("read run spend: %v", err)
+	}
+	if in != 12 || out != 7 {
+		t.Fatalf("run actuals = (%d, %d), want (12, 7) from the successful attempt", in, out)
+	}
+	if reserved <= 0 {
+		t.Fatalf("reserved_tokens = %d, want the failed attempt's reservation", reserved)
+	}
+	if got := p.callCount(); got != 2 {
+		t.Fatalf("provider calls = %d, want 2", got)
 	}
 }

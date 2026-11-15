@@ -510,3 +510,43 @@ func runOrdinals(t *testing.T, db *sql.DB, itemID string) []int {
 	}
 	return out
 }
+
+// TestClaimCarriesTheEndpointsConnectionConfig pins the payload a node needs to
+// construct a provider without any other route to the endpoint tables. The
+// values are the board's own row, not a re-derivation: the node executes the
+// endpoint and model placement chose.
+func TestClaimCarriesTheEndpointsConnectionConfig(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	// A provider key the board records by NAME. The value is resolved by the
+	// node from its own environment; it must never be in the claim payload.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE endpoints SET auth_ref='NSM_PROVIDER_LOCAL' WHERE id='ep-local'`); err != nil {
+		t.Fatalf("set auth_ref: %v", err)
+	}
+	if _, err := CreateItem(ctx, db, clock, CreateItemRequest{
+		Title: "t", Brief: "b", Needs: []string{"agentic"},
+	}); err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+
+	got, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Claim: got %d items, err %v", len(got), err)
+	}
+	item := got[0]
+	if item.Endpoint.ID != "ep-local" || item.Endpoint.Name != "local" {
+		t.Fatalf("endpoint = %+v, want ep-local/local", item.Endpoint)
+	}
+	if item.Endpoint.Provider != "stub" || item.Endpoint.BaseURL != "http://local" {
+		t.Fatalf("endpoint construction config = %+v, want stub @ http://local", item.Endpoint)
+	}
+	if item.Endpoint.Reach != "host" || item.Endpoint.AuthRef != "NSM_PROVIDER_LOCAL" {
+		t.Fatalf("endpoint reach/auth_ref = %q/%q, want host/NSM_PROVIDER_LOCAL", item.Endpoint.Reach, item.Endpoint.AuthRef)
+	}
+	if item.Model.ID != "m-local" || item.Model.ModelID != "local-model" {
+		t.Fatalf("model = %+v, want m-local/local-model", item.Model)
+	}
+}

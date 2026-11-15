@@ -165,12 +165,14 @@ func TestMigrateAppliesOnlyNewerMigrations(t *testing.T) {
 	}
 	db.Close()
 
-	// The shape migration 2's author will create: entry 0 stays pinned at
-	// version 1, the new script appends as version 2, and schemaVersion
-	// derives from the list's last entry.
+	// The shape the next migration's author will create: entry 0 stays pinned
+	// at version 1, the shipped migrations keep their versions, the new script
+	// appends as version schemaVersion+1, and schemaVersion derives from the
+	// list's last entry.
 	next := []migration{
 		{version: 1, script: schema},
-		{version: 2, script: `CREATE TABLE watches (
+		{version: 2, script: schema2},
+		{version: 3, script: `CREATE TABLE watches (
   id   TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE
 );
@@ -192,8 +194,8 @@ CREATE INDEX idx_watches_name ON watches(name);`},
 	if err := raw.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if v != 2 {
-		t.Fatalf("user_version = %d, want 2", v)
+	if v != 3 {
+		t.Fatalf("user_version = %d, want 3", v)
 	}
 	var nodes int
 	if err := raw.QueryRow(`SELECT count(*) FROM nodes`).Scan(&nodes); err != nil {
@@ -309,5 +311,53 @@ func TestSplitStatementsSplitsMigrationOne(t *testing.T) {
 	last := stmts[len(stmts)-1]
 	if last != "CREATE INDEX idx_events_entity ON events(entity, entity_id, id)" {
 		t.Fatalf("last statement = %q", last)
+	}
+}
+
+// TestOpenUpgradesAVersionOneDatabase is the migration that matters for an
+// existing board: M1 and the first eleven M2 tasks shipped schema version 1, so
+// a version-2 binary must add reserved_tokens in place without touching rows.
+func TestOpenUpgradesAVersionOneDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "board.db")
+
+	raw, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := migrate(context.Background(), raw, []migration{{version: 1, script: schema}}); err != nil {
+		t.Fatalf("migrate to version 1: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO nodes (id, name, token_hash, role, created_at)
+		VALUES ('n1','a','t','manager',0)`); err != nil {
+		t.Fatalf("seed a version-1 node: %v", err)
+	}
+	raw.Close()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open a version-1 database: %v", err)
+	}
+	defer db.Close()
+
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if v != schemaVersion {
+		t.Fatalf("user_version = %d after Open, want %d", v, schemaVersion)
+	}
+	var column int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('runs') WHERE name='reserved_tokens'`).Scan(&column); err != nil {
+		t.Fatalf("pragma_table_info: %v", err)
+	}
+	if column != 1 {
+		t.Fatal("runs has no reserved_tokens column after the upgrade")
+	}
+	var nodes int
+	if err := db.QueryRow(`SELECT count(*) FROM nodes`).Scan(&nodes); err != nil {
+		t.Fatalf("nodes: %v", err)
+	}
+	if nodes != 1 {
+		t.Fatalf("nodes rows = %d after the upgrade, want the existing 1", nodes)
 	}
 }

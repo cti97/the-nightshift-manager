@@ -45,11 +45,6 @@ type Config struct {
 	Protocol int // 0 means the protocol this binary speaks
 	Provides []string
 	Reaches  []string
-	// SandboxRoot is where each run gets its own disposable directory
-	// (spec §10's run_root). It is configuration, not a constant: the
-	// directory is the operator's choice, and the sandbox is built from it by
-	// whichever Executor runs the work.
-	SandboxRoot string
 	// Heartbeat and Poll default to 15s and 25s (spec §10).
 	Heartbeat time.Duration
 	Poll      time.Duration
@@ -271,10 +266,11 @@ func (a *Agent) execute(ctx context.Context, it board.ClaimedItem) {
 	}
 
 	req := board.ReportRequest{
-		Status:    "ok",
-		Summary:   res.Summary,
-		TokensIn:  res.TokensIn,
-		TokensOut: res.TokensOut,
+		Status:         "ok",
+		Summary:        res.Summary,
+		TokensIn:       res.TokensIn,
+		TokensOut:      res.TokensOut,
+		ReservedTokens: res.ReservedTokens,
 	}
 	if runErr != nil {
 		req.Status = "error"

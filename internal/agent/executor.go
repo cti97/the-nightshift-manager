@@ -8,10 +8,18 @@ import (
 
 // Result is what one execution produced. The token counts are recorded on the
 // run for the spend view; the board never interprets them.
+//
+// TokensIn and TokensOut are provider-reported actuals. ReservedTokens is the
+// budget charged for attempts that failed and reported no usage: a retried
+// Complete can be billed twice, and the final attempt's usage does not show the
+// earlier charge. It is reported separately rather than folded into the
+// measurements so the spend view can count both without pretending the failed
+// attempt produced output.
 type Result struct {
-	Summary   string
-	TokensIn  int
-	TokensOut int
+	Summary        string
+	TokensIn       int
+	TokensOut      int
+	ReservedTokens int
 }
 
 // Executor does the work. It receives the whole claim payload, so the brief —

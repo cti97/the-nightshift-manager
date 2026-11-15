@@ -52,9 +52,10 @@ import (
 //     NSM_ADMIN_TOKEN and pointing at any URL would receive the manager's admin
 //     token as a bearer header. auth_ref is therefore restricted to the
 //     NSM_PROVIDER_* namespace — enforced at endpoint-write time and again here
-//     before the lookup (checkAuthRef) — which makes the manager's own tokens
-//     unmatchable by construction rather than by review. The key is resolved
-//     locally from this process's environment and never transits the board.
+//     before the lookup (provider.CheckAuthRef) — which makes the manager's own
+//     tokens unmatchable by construction rather than by review. The key is
+//     resolved locally from this process's environment and never transits the
+//     board.
 //     A 401 with the row's key is auth_failed ("the endpoint rejected it"); a
 //     401 with no key named is also auth_failed, but the reason says the row
 //     names none, because "reachable and gated" is not the same fault as "the
@@ -279,7 +280,7 @@ func probeCredential(t probeTarget) (string, error) {
 	if t.authRef == "" {
 		return "", nil
 	}
-	if err := checkAuthRef(t.authRef); err != nil {
+	if err := provider.CheckAuthRef(t.authRef); err != nil {
 		return "", err
 	}
 	key := os.Getenv(t.authRef)

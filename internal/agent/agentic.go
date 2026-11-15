@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -32,12 +33,13 @@ import (
 //
 // # What the executor does not own
 //
-// It does not choose the endpoint or the model: the provider is constructed and
-// injected by the caller (`nsm agent run` wires this today; placement's chosen
-// endpoint row is the caller's fact). It does not report: Run returns, and the
-// agent loop's Client.Report retries the result. It does not read a clock:
-// every wait is a timer on the run's context, and there is nothing in this file
-// whose correctness depends on wall time.
+// It does not *choose* the endpoint or the model: placement did, and the claim
+// payload carries that choice (board.ClaimedItem.Endpoint/Model). Run builds the
+// adapter from it, resolving the credential by name from this node's own
+// environment — the value never transits the board. It does not report: Run
+// returns, and the agent loop's Client.Report retries the result. It does not
+// read a clock: every wait is a timer on the run's context, and there is
+// nothing in this file whose correctness depends on wall time.
 
 // The caps' defaults. maxSteps is design §10's "~40". The token budget has no
 // number in the design, so 200k is this implementation's conservative ceiling:
@@ -82,18 +84,17 @@ const noToolCallNudge = "You did not call a tool. Continue the task with one of 
 
 // AgenticExecutor is an Executor that runs a real model through the tool loop.
 //
-// The zero value is not usable: Provider, Model and SandboxRoot are required.
-// The caps have defaults (see the constants above) and a non-positive field
-// selects its default rather than disabling the cap — a safety number that can
-// be switched off by leaving a field zero is not a safety number.
+// The zero value is not usable: Registry (or the test constructor) and
+// SandboxRoot are required, and the endpoint/model arrive on each claim. The
+// caps have defaults (see the constants above) and a non-positive field selects
+// its default rather than disabling the cap — a safety number that can be
+// switched off by leaving a field zero is not a safety number.
 type AgenticExecutor struct {
-	// Provider is the constructed model adapter. Its Name is quoted in a
-	// failure so the operator knows which endpoint's credential or transport
-	// failed, and its EstimateTokens is what the budget reserves against before
-	// every attempt.
-	Provider provider.Provider
-	// Model is the model id sent on every request.
-	Model string
+	// Registry constructs the adapter for the endpoint the claim names. It is
+	// required in production; newProvider is the test seam. Construction is per
+	// run rather than per process because the endpoint is per claim, and
+	// placement may legitimately choose a different one for the next item.
+	Registry *provider.Registry
 	// System overrides the default system prompt. It is prose configuration,
 	// not a capability: the tool set is fixed by Tools().
 	System string
@@ -114,6 +115,14 @@ type AgenticExecutor struct {
 	// KeepArtifacts leaves the run directory in place on Close, for inspection.
 	KeepArtifacts bool
 
+	// newProvider is the provider-construction seam. It defaults to
+	// Registry.New; a test supplies a scripted adapter without teaching the
+	// registry about test doubles.
+	newProvider func(provider.Config) (provider.Provider, error)
+	// lookupEnv resolves an endpoint's auth_ref from this node's environment.
+	// It defaults to os.Getenv and exists as a field so a test can prove the
+	// name is resolved locally and that a refused name never reaches it.
+	lookupEnv func(string) string
 	// sleep is the retry policy's wait. It is a field rather than a call to
 	// time.Sleep so a test can drive a retry without waiting, and so the wait is
 	// always a timer on the run's context.
@@ -138,6 +147,10 @@ type AgenticExecutor struct {
 // a shutdown (Task 6's hand-off).
 func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Result, error) {
 	if err := e.check(item); err != nil {
+		return Result{}, err
+	}
+	p, model, err := e.providerFor(item)
+	if err != nil {
 		return Result{}, err
 	}
 	e.logKernelOnce()
@@ -185,7 +198,7 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 		}
 
 		req := provider.Request{
-			Model:        e.Model,
+			Model:        model,
 			System:       e.system(),
 			Messages:     messages,
 			Tools:        defs,
@@ -193,7 +206,7 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 			RequireLocal: needsLocal(item.Item.Needs),
 		}
 
-		resp, decision, err := e.complete(ctx, req, meter)
+		resp, decision, err := e.complete(ctx, req, meter, p)
 		if err != nil {
 			// The run was cancelled while a request or a backoff was in flight.
 			// Return the context's own error: the agent loop checks ctx.Err()
@@ -206,8 +219,8 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 				return meter.result(err.Error()), err
 			}
 
-			summary := fmt.Sprintf("run failed at step %d: provider %s returned a %s error; %s",
-				step+1, e.Provider.Name(), decision.Class, decision.Reason)
+			summary := fmt.Sprintf("run failed at step %d: endpoint %s (provider %s) returned a %s error; %s",
+				step+1, item.Endpoint.Name, p.Name(), decision.Class, decision.Reason)
 			e.logf("run %s: %s: %v", item.RunID, summary, err)
 
 			// decision.Reason is the operator-facing half of the decision, so it
@@ -219,8 +232,21 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 				bug = "; this is a placement bug, not a runtime condition"
 			}
 			return meter.result(summary), fmt.Errorf(
-				"agent: provider %s failed (%s)%s: %s: %w",
-				e.Provider.Name(), decision.Class, bug, decision.Reason, err)
+				"agent: endpoint %s (provider %s) failed (%s)%s: %s: %w",
+				item.Endpoint.Name, p.Name(), decision.Class, bug, decision.Reason, err)
+		}
+
+		// Reserve-then-settle can land over the cap when a response reports more
+		// tokens than the estimate reserved. The next reservation would catch
+		// it, but if this response calls finish the run would otherwise end in
+		// success with a silent breach — the token-side cousin of the truncated
+		// success the caps exist to prevent. The last reply is not used.
+		if meter.overBudget() {
+			summary := fmt.Sprintf("run stopped by the token budget after settling: %d tokens spent against a %d-token budget; the last reply was not used",
+				meter.spent, meter.limit)
+			return meter.result(summary), fmt.Errorf(
+				"%w after settling: %d tokens spent against the %d-token budget; the run fails rather than finishing over budget",
+				ErrTokenBudget, meter.spent, meter.limit)
 		}
 
 		// The assistant turn must carry the calls themselves, not just their
@@ -281,21 +307,77 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 	}
 }
 
+// providerFor builds the adapter for the endpoint the claim names and returns
+// the wire model id to send. The credential is resolved from THIS node's
+// environment by name, after provider.CheckAuthRef: the claim payload is an
+// input like any other, and a name outside the provider-key namespace is a
+// refusal, not a lookup. Both the manager's probe and this path apply the same
+// rule, which is why it lives in the provider package rather than here.
+//
+// A construction failure names the endpoint, not just the family: "provider
+// openai failed (auth)" cannot tell an operator whose key failed, while
+// "endpoint laptop (provider openai) failed" can.
+func (e *AgenticExecutor) providerFor(item board.ClaimedItem) (provider.Provider, string, error) {
+	ep := item.Endpoint
+	switch {
+	case strings.TrimSpace(ep.Provider) == "":
+		return nil, "", fmt.Errorf("agent: the claim for run %s carries no endpoint provider", item.RunID)
+	case strings.TrimSpace(ep.BaseURL) == "":
+		return nil, "", fmt.Errorf("agent: endpoint %q carries no base URL in the claim", ep.Name)
+	case strings.TrimSpace(item.Model.ModelID) == "":
+		return nil, "", fmt.Errorf("agent: the claim for run %s carries no model id", item.RunID)
+	}
+
+	cfg := provider.Config{Provider: ep.Provider, BaseURL: ep.BaseURL, Reach: ep.Reach}
+	if ep.AuthRef != "" {
+		if err := provider.CheckAuthRef(ep.AuthRef); err != nil {
+			return nil, "", fmt.Errorf("agent: endpoint %q: %w", ep.Name, err)
+		}
+		key := e.env(ep.AuthRef)
+		if key == "" {
+			return nil, "", fmt.Errorf(
+				"agent: endpoint %q: auth_ref %q names a provider key that is not set in this node's environment",
+				ep.Name, ep.AuthRef)
+		}
+		cfg.APIKey = key
+	}
+
+	ctor := e.newProvider
+	if ctor == nil {
+		ctor = e.Registry.New
+	}
+	p, err := ctor(cfg)
+	if err != nil {
+		return nil, "", fmt.Errorf("agent: endpoint %q: %w", ep.Name, err)
+	}
+	if p == nil {
+		return nil, "", fmt.Errorf("agent: endpoint %q: provider constructor returned no provider", ep.Name)
+	}
+	return p, item.Model.ModelID, nil
+}
+
+func (e *AgenticExecutor) env(name string) string {
+	if e.lookupEnv != nil {
+		return e.lookupEnv(name)
+	}
+	return os.Getenv(name)
+}
+
 // complete sends one request through the retry policy. The reservation and the
 // settlement are per attempt, not per run: a retried Complete can be billed
 // twice, so an attempt that fails keeps its reservation charged and the next
 // attempt must reserve again (Task 6's hand-off 5).
-func (e *AgenticExecutor) complete(ctx context.Context, req provider.Request, meter *tokenMeter) (provider.Response, provider.RetryDecision, error) {
+func (e *AgenticExecutor) complete(ctx context.Context, req provider.Request, meter *tokenMeter, p provider.Provider) (provider.Response, provider.RetryDecision, error) {
 	var resp provider.Response
 	decision, err := provider.Retry(ctx, e.wait, func(attemptCtx context.Context) error {
-		estimate := e.Provider.EstimateTokens(req)
+		estimate := p.EstimateTokens(req)
 		if estimate < 0 {
 			estimate = 0
 		}
 		if rerr := meter.reserve(estimate, req.MaxTokens); rerr != nil {
 			return rerr
 		}
-		r, cerr := e.Provider.Complete(attemptCtx, req)
+		r, cerr := p.Complete(attemptCtx, req)
 		if cerr != nil {
 			// A failed attempt reported no usage (the seam permits an empty
 			// Usage only on failure), so the conservative settlement is the
@@ -330,10 +412,8 @@ func (e *AgenticExecutor) wait(ctx context.Context, d time.Duration) error {
 
 func (e *AgenticExecutor) check(item board.ClaimedItem) error {
 	switch {
-	case e.Provider == nil:
-		return errors.New("agent: AgenticExecutor has no Provider")
-	case strings.TrimSpace(e.Model) == "":
-		return errors.New("agent: AgenticExecutor has no Model")
+	case e.Registry == nil && e.newProvider == nil:
+		return errors.New("agent: AgenticExecutor has neither a Registry nor a provider constructor")
 	case e.SandboxRoot == "":
 		return errors.New("agent: AgenticExecutor has no SandboxRoot")
 	case item.RunID == "":
@@ -401,6 +481,9 @@ type tokenMeter struct {
 	limit    int
 	spent    int
 	reserved int
+	// charged is the sum of failed attempts' reservations. It is reported
+	// separately from in/out because it is a budget charge, not a measurement.
+	charged int
 
 	// in and out are the provider-reported actuals. They are what the run
 	// reports to the board and are deliberately not inflated by a failed
@@ -441,11 +524,17 @@ func (m *tokenMeter) settleSuccess(usage provider.Usage) {
 
 func (m *tokenMeter) settleFailure() {
 	m.spent += m.reserved
+	m.charged += m.reserved
 	m.reserved = 0
 }
 
+// overBudget reports the one case a pre-request reservation cannot prevent: the
+// response settled above the limit because the estimate ran low. The caller
+// fails the run rather than using the reply.
+func (m *tokenMeter) overBudget() bool { return m.spent > m.limit }
+
 func (m *tokenMeter) result(summary string) Result {
-	return Result{Summary: summary, TokensIn: m.in, TokensOut: m.out}
+	return Result{Summary: summary, TokensIn: m.in, TokensOut: m.out, ReservedTokens: m.charged}
 }
 
 // nonNegative keeps a provider that reports a negative count from lowering the
