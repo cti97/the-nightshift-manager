@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -69,10 +70,12 @@ func TestRunAgentRunRequiresNodeToken(t *testing.T) {
 // config exactly as given rather than being defaulted or dropped.
 func TestParseAgentConfigCarriesLiveCapabilities(t *testing.T) {
 	t.Setenv("NSM_NODE_TOKEN", "secret")
+	sandboxRoot := t.TempDir()
 	var errOut bytes.Buffer
 	cfg, ok := parseAgentConfig([]string{
 		"--board", "http://127.0.0.1:9/", "--node", "n",
 		"--provides", "agentic, vision", "--reach", "host, lan",
+		"--sandbox-root", sandboxRoot,
 	}, &errOut)
 	if !ok {
 		t.Fatalf("parse failed: %s", errOut.String())
@@ -92,6 +95,9 @@ func TestParseAgentConfigCarriesLiveCapabilities(t *testing.T) {
 	if got := strings.Join(cfg.Reaches, ","); got != "host,lan" {
 		t.Fatalf("reaches = %q", got)
 	}
+	if cfg.SandboxRoot != sandboxRoot {
+		t.Fatalf("sandbox root = %q, want %q: the run root is configuration, not a constant", cfg.SandboxRoot, sandboxRoot)
+	}
 	if errOut.Len() != 0 {
 		t.Fatalf("unexpected warning: %s", errOut.String())
 	}
@@ -100,7 +106,7 @@ func TestParseAgentConfigCarriesLiveCapabilities(t *testing.T) {
 func TestParseAgentConfigWarnsOnEmptyProvides(t *testing.T) {
 	t.Setenv("NSM_NODE_TOKEN", "secret")
 	var errOut bytes.Buffer
-	cfg, ok := parseAgentConfig([]string{"--node", "n", "--reach", "host"}, &errOut)
+	cfg, ok := parseAgentConfig([]string{"--node", "n", "--reach", "host", "--sandbox-root", t.TempDir()}, &errOut)
 	if !ok {
 		t.Fatalf("parse failed: %s", errOut.String())
 	}
@@ -122,7 +128,7 @@ func TestParseAgentConfigWarnsOnEmptyProvides(t *testing.T) {
 func TestParseAgentConfigRequiresReach(t *testing.T) {
 	t.Setenv("NSM_NODE_TOKEN", "secret")
 	var errOut bytes.Buffer
-	if _, ok := parseAgentConfig([]string{"--node", "n", "--provides", "agentic"}, &errOut); ok {
+	if _, ok := parseAgentConfig([]string{"--node", "n", "--provides", "agentic", "--sandbox-root", t.TempDir()}, &errOut); ok {
 		t.Fatal("parse accepted a missing --reach")
 	}
 	if !strings.Contains(errOut.String(), "--reach") {
@@ -130,10 +136,47 @@ func TestParseAgentConfigRequiresReach(t *testing.T) {
 	}
 }
 
+// TestParseAgentConfigRequiresSandboxRoot pins that the run root is named, not
+// guessed. A default would put every node's runs somewhere no one chose.
+func TestParseAgentConfigRequiresSandboxRoot(t *testing.T) {
+	t.Setenv("NSM_NODE_TOKEN", "secret")
+	var errOut bytes.Buffer
+	if _, ok := parseAgentConfig([]string{"--node", "n", "--reach", "host"}, &errOut); ok {
+		t.Fatal("parse accepted a missing --sandbox-root")
+	}
+	if !strings.Contains(errOut.String(), "--sandbox-root") {
+		t.Fatalf("stderr = %q, want the missing --sandbox-root named", errOut.String())
+	}
+	if _, ok := parseAgentConfig([]string{"--node", "n", "--reach", "host", "--sandbox-root", "runs"}, &errOut); ok {
+		t.Fatal("parse accepted a relative --sandbox-root")
+	}
+	if !strings.Contains(errOut.String(), "absolute") {
+		t.Fatalf("stderr = %q, want the relative-root refusal named", errOut.String())
+	}
+}
+
+// TestParseAgentConfigForgetsTheNodeTokenInTheEnvironment pins the scrub: the
+// token reaches the config and is gone from the process environment, so a
+// sandboxed child cannot read it back with ps or /proc.
+func TestParseAgentConfigForgetsTheNodeTokenInTheEnvironment(t *testing.T) {
+	t.Setenv("NSM_NODE_TOKEN", "secret-token-value")
+	var errOut bytes.Buffer
+	cfg, ok := parseAgentConfig([]string{"--node", "n", "--reach", "host", "--sandbox-root", t.TempDir()}, &errOut)
+	if !ok {
+		t.Fatalf("parse failed: %s", errOut.String())
+	}
+	if cfg.Token != "secret-token-value" {
+		t.Fatalf("token = %q, want the value from the environment", cfg.Token)
+	}
+	if got := os.Getenv("NSM_NODE_TOKEN"); got != "" {
+		t.Fatalf("NSM_NODE_TOKEN is still in the environment as %q", got)
+	}
+}
+
 func TestParseAgentConfigRejectsEmptyCapabilityEntry(t *testing.T) {
 	t.Setenv("NSM_NODE_TOKEN", "secret")
 	var errOut bytes.Buffer
-	if _, ok := parseAgentConfig([]string{"--node", "n", "--reach", "host", "--provides", "agentic,,vision"}, &errOut); ok {
+	if _, ok := parseAgentConfig([]string{"--node", "n", "--reach", "host", "--provides", "agentic,,vision", "--sandbox-root", t.TempDir()}, &errOut); ok {
 		t.Fatal("parse accepted an empty capability entry")
 	}
 	if !strings.Contains(errOut.String(), "empty entry") {

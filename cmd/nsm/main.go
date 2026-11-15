@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -209,6 +210,7 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	nodeID := fs.String("node", "", "node id, as registered with the board")
 	provides := fs.String("provides", "", "comma-separated live capabilities (e.g. agentic,vision)")
 	reach := fs.String("reach", "", "comma-separated reach classes this node can actually use (host,lan,wan)")
+	sandboxRoot := fs.String("sandbox-root", "", "absolute path under which each run gets a disposable directory (required)")
 	if err := fs.Parse(args); err != nil {
 		return agent.Config{}, false
 	}
@@ -219,6 +221,14 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	token := os.Getenv("NSM_NODE_TOKEN")
 	if token == "" {
 		fmt.Fprintln(errOut, "NSM_NODE_TOKEN is required")
+		return agent.Config{}, false
+	}
+	if *sandboxRoot == "" {
+		fmt.Fprintln(errOut, "--sandbox-root is required: name the absolute directory under which each run gets its own disposable directory")
+		return agent.Config{}, false
+	}
+	if !filepath.IsAbs(*sandboxRoot) {
+		fmt.Fprintf(errOut, "--sandbox-root %q must be an absolute path\n", *sandboxRoot)
 		return agent.Config{}, false
 	}
 	providesLive, err := listFlag("provides", *provides)
@@ -246,16 +256,25 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 		fmt.Fprintln(errOut, "warning: --provides is empty; this node will claim nothing")
 	}
 
+	// The token is read once and then removed from the environment: a child
+	// process cannot read it back out of ps or /proc/<pid>/environ, while the
+	// config keeps it for the Authorization header. This is defense in depth,
+	// not the sandbox: a same-user process can still reach this process's
+	// memory. It happens only after parsing succeeds, so a rejected
+	// configuration does not consume the credential.
+	_ = os.Unsetenv("NSM_NODE_TOKEN")
+
 	return agent.Config{
 		BaseURL: *baseURL,
 		Token:   token,
 		NodeID:  *nodeID,
 		// M2 replaces the stub with the agentic executor. Until then the loop is
 		// real and the work is not.
-		Executor: agent.StubExecutor{},
-		Protocol: board.ProtocolMax,
-		Provides: providesLive,
-		Reaches:  reaches,
+		Executor:    agent.StubExecutor{},
+		Protocol:    board.ProtocolMax,
+		Provides:    providesLive,
+		Reaches:     reaches,
+		SandboxRoot: *sandboxRoot,
 	}, true
 }
 
