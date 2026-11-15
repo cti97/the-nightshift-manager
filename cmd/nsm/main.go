@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
+	"github.com/cti97/the-nightshift-manager/internal/agent"
 	"github.com/cti97/the-nightshift-manager/internal/board"
 	"github.com/cti97/the-nightshift-manager/internal/version"
 )
@@ -36,8 +41,11 @@ func run(args []string, out, errOut io.Writer) int {
 		}
 		return managerServe(args[2:], errOut)
 	case "agent":
-		fmt.Fprintf(errOut, "nsm %s: not implemented yet\n", args[0])
-		return 2
+		if len(args) < 2 || args[1] != "run" {
+			usage(errOut)
+			return 2
+		}
+		return agentRun(args[2:], errOut)
 	default:
 		usage(errOut)
 		return 2
@@ -81,4 +89,96 @@ func managerServe(args []string, errOut io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// agentRun is `nsm agent run`. The node token comes from the environment for
+// the same reason the admin token does: a credential on a command line is
+// visible in ps and in shell history.
+func agentRun(args []string, errOut io.Writer) int {
+	cfg, ok := parseAgentConfig(args, errOut)
+	if !ok {
+		return 2
+	}
+	a := agent.New(cfg)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Fprintf(errOut, "nsm agent %s: board %s\n", cfg.NodeID, cfg.BaseURL)
+	if err := a.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintf(errOut, "agent: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// parseAgentConfig turns flags and the environment into what the loop needs.
+// It is separate from agentRun so the flags can be tested without starting a
+// goroutine that talks to a board forever.
+func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
+	fs := flag.NewFlagSet("agent run", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	baseURL := fs.String("board", "http://127.0.0.1:8081", "board base URL")
+	nodeID := fs.String("node", "", "node id, as registered with the board")
+	provides := fs.String("provides", "", "comma-separated live capabilities (e.g. agentic,vision)")
+	reach := fs.String("reach", "host,lan,wan", "comma-separated reach classes")
+	if err := fs.Parse(args); err != nil {
+		return agent.Config{}, false
+	}
+	if *nodeID == "" {
+		fmt.Fprintln(errOut, "--node is required")
+		return agent.Config{}, false
+	}
+	token := os.Getenv("NSM_NODE_TOKEN")
+	if token == "" {
+		fmt.Fprintln(errOut, "NSM_NODE_TOKEN is required")
+		return agent.Config{}, false
+	}
+	providesLive, err := listFlag("provides", *provides)
+	if err != nil {
+		fmt.Fprintln(errOut, err)
+		return agent.Config{}, false
+	}
+	reaches, err := listFlag("reach", *reach)
+	if err != nil {
+		fmt.Fprintln(errOut, err)
+		return agent.Config{}, false
+	}
+	if len(providesLive) == 0 {
+		// Not defaulted: a node that provides nothing is a legitimate (if
+		// useless) configuration, and guessing a capability would let it claim
+		// work it cannot do. Say what it means instead.
+		fmt.Fprintln(errOut, "warning: --provides is empty; this node will claim nothing")
+	}
+
+	return agent.Config{
+		BaseURL: *baseURL,
+		Token:   token,
+		NodeID:  *nodeID,
+		// M2 replaces the stub with the agentic executor. Until then the loop is
+		// real and the work is not.
+		Executor: agent.StubExecutor{},
+		Protocol: board.ProtocolMax,
+		Provides: providesLive,
+		Reaches:  reaches,
+	}, true
+}
+
+// listFlag parses a comma-separated flag value. An empty value is an empty
+// list, but an empty entry inside a list ("a,,b") is a typo and fails rather
+// than being silently dropped.
+func listFlag(name, value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return nil, fmt.Errorf("--%s: empty entry in %q", name, value)
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
