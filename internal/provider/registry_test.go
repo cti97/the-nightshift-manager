@@ -72,7 +72,10 @@ func TestRegistryRejectsUnknownProvider(t *testing.T) {
 }
 
 func TestRegistryRejectsDuplicateRegistration(t *testing.T) {
-	r := NewRegistry()
+	// The zero-value registry, not NewRegistry: the name under test is the
+	// shipped "openai" adapter, so using the shipped registry would make this a
+	// test of which adapters ship rather than of duplicate registration.
+	r := &Registry{}
 	openai := ctorFor("openai")
 	r.Register("openai", openai)
 
@@ -129,7 +132,10 @@ func TestRegistryNamesAreSorted(t *testing.T) {
 	r.Register("alpha", stubCtor)
 
 	names := r.Names()
-	want := []string{"alpha", "stub", "zeta"}
+	// The shipped adapters are the stub and openai; alpha and zeta are this
+	// test's own registrations. openai being here is the one registry line a
+	// protocol task adds, and this assertion is what notices its loss.
+	want := []string{"alpha", "openai", "stub", "zeta"}
 	if len(names) != len(want) {
 		t.Fatalf("Names() = %v, want %v", names, want)
 	}
@@ -170,8 +176,9 @@ func TestRegistryIsSafeForConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 
-	if len(r.Names()) != 17 {
-		t.Fatalf("Names() = %v, want 17 entries", r.Names())
+	// 16 concurrent extras plus the two shipped adapters (stub, openai).
+	if len(r.Names()) != 18 {
+		t.Fatalf("Names() = %v, want 18 entries", r.Names())
 	}
 	// The registry is still usable after the stampede.
 	if _, err := r.New(Config{Provider: "stub"}); err != nil {
@@ -186,8 +193,9 @@ func TestRegistryNewRejectsConstructorWhoseNameDisagrees(t *testing.T) {
 	// The copy-paste mistake a real adapter makes: the file is registered as
 	// "openai" but its Name() method still says "stub". Nothing before the first
 	// construction can see it, and by then dispatch would be pointed at the
-	// wrong protocol.
-	r := NewRegistry()
+	// wrong protocol. A zero-value registry keeps this about the name assertion
+	// rather than about which adapters ship.
+	r := &Registry{}
 	r.Register("openai", stubCtor) // the stub reports "stub"
 
 	_, err := r.New(Config{Provider: "openai"})
