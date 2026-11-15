@@ -214,7 +214,7 @@ var (
 }`)
 
 	shellSchema = json.RawMessage(`{
-  "description": "Run a shell command with the run directory as its working directory. The command is executed by /bin/sh -c on Unix and cmd.exe on Windows, so pipes, redirects and globs work. It starts with a minimal environment: HOME is the run directory and no credentials are present. The command has a timeout; when it fires the shell is killed and the call fails. stdout and stderr are combined and truncated at 64 KiB.",
+  "description": "Run a shell command with the run directory as its working directory. The command is executed by /bin/sh -c on Unix and cmd.exe on Windows, so pipes, redirects and globs work. It starts with a scrubbed environment: HOME points into the run directory and no variable from the agent's own environment is passed to it. The command has a timeout; when it fires the shell is killed and the call fails. stdout and stderr are combined and truncated at 64 KiB.",
   "type": "object",
   "properties": {
     "command": {
@@ -409,8 +409,18 @@ func fileToolPath(arg string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if strings.HasSuffix(filepath.ToSlash(arg), "/") {
+	// A path ending in a separator, or whose final element is ".", names a
+	// directory. It must be refused here, because filepath.Clean turns both
+	// spellings into a legal *file* name: "notes/" and "notes/." both clean to
+	// "notes", and write_file would then create a file called notes. Refusing
+	// only the trailing-slash spelling fixes the example and not the rule, so
+	// every directory spelling is refused by the same two checks.
+	slashed := filepath.ToSlash(arg)
+	if strings.HasSuffix(slashed, "/") {
 		return "", fmt.Errorf("%w: %q ends in a separator; this tool takes a file, not a directory — use list_dir for a directory", ErrPathRefused, arg)
+	}
+	if parts := strings.Split(slashed, "/"); parts[len(parts)-1] == "." {
+		return "", fmt.Errorf("%w: %q ends in a \".\" element, which names a directory; this tool takes a file — use list_dir for a directory", ErrPathRefused, arg)
 	}
 	if clean == "." {
 		return "", fmt.Errorf("%w: %q names the run directory, not a file — use list_dir", ErrPathRefused, arg)
@@ -775,7 +785,7 @@ func runHTTPGet(ctx context.Context, sb *Sandbox, raw json.RawMessage) (string, 
 	// The capability gate is the only network enforcement on a node without
 	// kernel confinement, so it comes before the arguments are even parsed.
 	if !sb.Network() {
-		return "", fmt.Errorf("agent: http_get is refused: the item did not declare the %q capability, so this run may not make outbound requests", "network")
+		return "", fmt.Errorf("agent: http_get is refused: the item did not declare the %q capability, so http_get may not make an outbound request for this run", "network")
 	}
 	var args struct {
 		URL string `json:"url"`

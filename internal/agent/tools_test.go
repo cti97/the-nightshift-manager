@@ -102,6 +102,14 @@ func TestToolsAreTheSixAndHaveDescriptions(t *testing.T) {
 		if strings.TrimSpace(schema.Description) == "" {
 			t.Errorf("tool %q has no description; a model with no description will misuse it", tool.Name)
 		}
+		// The shell description is prompt text and the only thing the model
+		// reads about the tool. It may describe the environment this tool
+		// constructs; it may not claim the machine has no credentials, because
+		// it does, and the file header says a shell can read them by absolute
+		// path. A reassuring sentence here is a false one.
+		if tool.Name == ToolShell && strings.Contains(schema.Description, "no credentials") {
+			t.Errorf("shell description claims the machine has no credentials; scope the claim to the scrubbed environment")
+		}
 		if schema.Type != "object" {
 			t.Errorf("tool %q schema type = %q, want object", tool.Name, schema.Type)
 		}
@@ -296,6 +304,41 @@ func TestWriteFileTool(t *testing.T) {
 			}
 		})
 	}
+
+	// Every spelling of "a directory", not just the quoted example: filepath.Clean
+	// turns "notes/" and "notes/." into the same legal file name "notes", so a
+	// rule that refuses only the first is the "looks fixed but isn't" failure.
+	t.Run("refuses every directory spelling", func(t *testing.T) {
+		for _, path := range []string{"notes/", "notes/.", "notes/./", "notes//"} {
+			sb := newTestSandbox(t, SandboxConfig{})
+			_, err := callTool(t, context.Background(), sb, ToolWriteFile, map[string]string{"path": path, "content": "x"})
+			if err == nil {
+				t.Fatalf("write_file(%q) = nil error; want a refusal", path)
+			}
+			if !errors.Is(err, ErrPathRefused) {
+				t.Errorf("write_file(%q) = %v; want ErrPathRefused", path, err)
+			}
+			if !strings.Contains(err.Error(), "list_dir") {
+				t.Errorf("write_file(%q) error = %q; want it to point at list_dir", path, err)
+			}
+			if _, statErr := os.Stat(filepath.Join(sb.Dir(), "notes")); statErr == nil {
+				t.Errorf("write_file(%q) created a file named notes: the directory spelling was cleaned into a file name", path)
+			}
+		}
+	})
+
+	// The same rule is the shared helper's, so read_file gets it too.
+	t.Run("read_file refuses a directory spelling", func(t *testing.T) {
+		sb := newTestSandbox(t, SandboxConfig{})
+		mustWrite(t, sb, "notes/inner.txt", []byte("x"))
+		for _, path := range []string{"notes/", "notes/.", "notes/./"} {
+			if _, err := callTool(t, context.Background(), sb, ToolReadFile, map[string]string{"path": path}); err == nil {
+				t.Errorf("read_file(%q) = nil error; want a refusal", path)
+			} else if !strings.Contains(err.Error(), "list_dir") {
+				t.Errorf("read_file(%q) error = %q; want it to point at list_dir", path, err)
+			}
+		}
+	})
 
 	t.Run("over the 4 MiB cap", func(t *testing.T) {
 		sb := newTestSandbox(t, SandboxConfig{})
@@ -1007,7 +1050,19 @@ func TestToolsRefuseSpecialFilesThatWouldBlock(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("mkfifo is a Unix notion")
 	}
-	sb := newTestSandbox(t, SandboxConfig{})
+	// Deliberately not newTestSandbox: its cleanup calls Close, which takes the
+	// sandbox's write lock, while a regressed tool blocks inside open(2) holding
+	// the read lock. The cleanup would then wait forever and turn the ten-second
+	// watchdog below into a ten-minute package timeout — a regression test whose
+	// failure mode is "hangs" is a regression test that gets deleted as flaky.
+	// A failure here must be a failure. t.TempDir's own cleanup removes the
+	// directory without taking that lock; the blocked goroutine and its open
+	// descriptor die with the test process, which is the right trade.
+	root := t.TempDir()
+	sb, err := NewSandbox(SandboxConfig{Root: root, RunID: "run-1"})
+	if err != nil {
+		t.Fatalf("NewSandbox: %v", err)
+	}
 	pipe := filepath.Join(sb.Dir(), "pipe")
 	if out, err := exec.Command("mkfifo", pipe).CombinedOutput(); err != nil {
 		t.Skipf("mkfifo is unavailable (%v: %s); the guard is still in the code path", err, out)
@@ -1054,6 +1109,17 @@ func TestToolsRefuseSpecialFilesThatWouldBlock(t *testing.T) {
 	// The pipe is still a pipe: nothing was opened through it.
 	if info, err := os.Lstat(pipe); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
 		t.Fatalf("the fixture pipe was replaced (mode %v, err %v)", info, err)
+	}
+
+	// Close only when every subtest returned. On the regression path a subtest's
+	// goroutine is still blocked in open(2) holding the read lock, and Close
+	// would wait for it — the hang this structure exists to avoid. t.Failed()
+	// is true when any subtest failed, so the lock holder is left to the process
+	// exit instead.
+	if !t.Failed() {
+		if err := sb.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
 	}
 }
 
