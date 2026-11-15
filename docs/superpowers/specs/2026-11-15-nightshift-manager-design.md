@@ -717,6 +717,14 @@ worth adding.
 15. **The `ollama` provider wraps the `openai` shape**, so an upstream change to either can put
     them in disagreement while both individually pass conformance.
 
+16. **A permitted provider key can be sent to a row-chosen `base_url`.** The probe
+    resolves only names in the reserved `NSM_PROVIDER_*` namespace, which makes the manager's own
+    admin and enrollment tokens unmatchable — but a *provider* key is by definition sent to a
+    provider URL, and the probe cannot tell a legitimate `base_url` from a malicious one. Creating
+    an endpoint requires admin auth, so the residual needs admin access or a direct database write.
+    Any future task that adds endpoint import, templating, or a non-admin write path must revisit
+    this: the namespace defends the manager's tokens, not the provider's.
+
 ## 20. Distribution and release
 
 The project ships one static binary, six artifacts, and a self-hosted channel.
