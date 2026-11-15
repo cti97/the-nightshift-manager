@@ -41,6 +41,7 @@ type Registry struct {
 func NewRegistry() *Registry {
 	r := &Registry{}
 	r.Register("stub", newStubProvider)
+	r.Register("anthropic", newAnthropicProvider)
 	r.Register("openai", newOpenAIProvider)
 	r.Register("ollama", newOllamaProvider)
 	return r

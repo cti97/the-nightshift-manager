@@ -132,11 +132,11 @@ func TestRegistryNamesAreSorted(t *testing.T) {
 	r.Register("alpha", stubCtor)
 
 	names := r.Names()
-	// The shipped adapters are the stub, openai and ollama; alpha and zeta are
-	// this test's own registrations. Each shipped name being here is the one
+	// The shipped adapters are the stub, anthropic, openai and ollama; alpha
+	// and zeta are this test's own registrations. Each shipped name being here is the one
 	// registry line a protocol task adds, and this assertion is what notices its
 	// loss.
-	want := []string{"alpha", "ollama", "openai", "stub", "zeta"}
+	want := []string{"alpha", "anthropic", "ollama", "openai", "stub", "zeta"}
 	if len(names) != len(want) {
 		t.Fatalf("Names() = %v, want %v", names, want)
 	}
@@ -177,9 +177,10 @@ func TestRegistryIsSafeForConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 
-	// 16 concurrent extras plus the three shipped adapters (stub, openai, ollama).
-	if len(r.Names()) != 19 {
-		t.Fatalf("Names() = %v, want 19 entries", r.Names())
+	// 16 concurrent extras plus the four shipped adapters (stub, anthropic,
+	// openai, ollama).
+	if len(r.Names()) != 20 {
+		t.Fatalf("Names() = %v, want 20 entries", r.Names())
 	}
 	// The registry is still usable after the stampede.
 	if _, err := r.New(Config{Provider: "stub"}); err != nil {

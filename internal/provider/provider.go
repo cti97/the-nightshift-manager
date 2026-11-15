@@ -16,6 +16,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 )
 
 // Message is one turn of a conversation. Role is one of system, user,
@@ -223,4 +225,45 @@ func checkReach(req Request, endpointReach string) error {
 		return fmt.Errorf("%w: request reach is %q", ErrEgressRefused, req.Reach)
 	}
 	return nil
+}
+
+// normalizeAPIBaseURL validates an endpoint root and reduces it to the API root
+// that a family's paths (openAIChatPath, anthropicMessagesPath, …) are appended
+// to. It lives here, beside checkReach and checkToolMessages, because it is the
+// same plumbing for every HTTP adapter: two copies of "what a base URL is" is two
+// copies free to disagree about which spellings name the same endpoint.
+//
+// Trailing slashes and a trailing /v1 are dropped so "http://host:8080",
+// "http://host:8080/" and "http://host:8080/v1" are one endpoint rather than three
+// spellings that produce two wrong URLs. Only the URL's own shape is normalized; a
+// path prefix (a reverse proxy serving ".../openai/") is preserved.
+//
+// A query or fragment is refused: appending a path to a URL that already has one
+// would silently produce something that is neither, and no endpoint in this
+// project's families needs it. family names the protocol in the error, so a bad
+// endpoint row says which adapter refused it.
+func normalizeAPIBaseURL(raw, family string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("provider: %s: no base URL in config", family)
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("provider: %s: base URL %q: %w", family, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("provider: %s: base URL %q: scheme is %q, want http or https", family, raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("provider: %s: base URL %q: no host", family, raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("provider: %s: base URL %q: must not carry a query or fragment", family, raw)
+	}
+	path := strings.TrimRight(u.Path, "/")
+	path = strings.TrimSuffix(path, "/v1")
+	path = strings.TrimRight(path, "/")
+	u.Path = path
+	u.RawPath = ""
+	return u.String(), nil
 }

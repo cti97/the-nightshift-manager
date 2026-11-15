@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -87,7 +85,7 @@ type OpenAI struct {
 // forever. Config.Reach is carried for checkReach and is never defaulted: an
 // unset reach is fail-closed by design.
 func NewOpenAI(cfg Config) (*OpenAI, error) {
-	baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL)
+	baseURL, err := normalizeAPIBaseURL(cfg.BaseURL, openAIProviderName)
 	if err != nil {
 		return nil, err
 	}
@@ -106,42 +104,6 @@ func NewOpenAI(cfg Config) (*OpenAI, error) {
 		timeout: timeout,
 		reach:   cfg.Reach,
 	}, nil
-}
-
-// normalizeOpenAIBaseURL validates the endpoint and reduces it to the API root
-// that openAIChatPath and openAIModelsPath are appended to. Trailing slashes and
-// a trailing /v1 are dropped so "http://host:8080", "http://host:8080/" and
-// "http://host:8080/v1" are the same endpoint rather than three spellings that
-// produce two wrong URLs. Only the URL's own shape is normalized; a path prefix
-// (a reverse proxy serving ".../openai/") is preserved.
-//
-// A query or fragment is refused: appending a path to a URL that already has one
-// would silently produce something that is neither, and no OpenAI-compatible
-// endpoint needs it.
-func normalizeOpenAIBaseURL(raw string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return "", errors.New("provider: openai: no base URL in config")
-	}
-	u, err := url.Parse(trimmed)
-	if err != nil {
-		return "", fmt.Errorf("provider: openai: base URL %q: %w", raw, err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("provider: openai: base URL %q: scheme is %q, want http or https", raw, u.Scheme)
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("provider: openai: base URL %q: no host", raw)
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("provider: openai: base URL %q: must not carry a query or fragment", raw)
-	}
-	path := strings.TrimRight(u.Path, "/")
-	path = strings.TrimSuffix(path, "/v1")
-	path = strings.TrimRight(path, "/")
-	u.Path = path
-	u.RawPath = ""
-	return u.String(), nil
 }
 
 // The adapter is the interface, checked at compile time rather than discovered
@@ -237,7 +199,7 @@ func (o *OpenAI) Probe(ctx context.Context) (Health, error) {
 	}
 	switch {
 	case status >= http.StatusOK && status <= 299:
-		if !isOpenAIModelsList(body) {
+		if !isModelsList(body) {
 			return "", fmt.Errorf("%w: the models endpoint answered HTTP %d with something that is not an OpenAI models list", ErrServer, status)
 		}
 		return HealthOK, nil
@@ -680,10 +642,13 @@ func truncateForError(s string) string {
 	return s[:n] + "..."
 }
 
-// isOpenAIModelsList reports whether a 2xx body looks like GET /v1/models. A
-// probe that accepted any 200 would call a web page or a proxy's login page a
-// healthy endpoint; the data field is what the route promises.
-func isOpenAIModelsList(body []byte) bool {
+// isModelsList reports whether a 2xx body looks like a model-list route. The
+// OpenAI-compatible families and the Messages API both answer {"data":[...]} here
+// (Ollama's own route is shaped differently and has its own reader), so the rule
+// is shared rather than written twice: a probe that accepted any 200 would call a
+// web page or a proxy's login page a healthy endpoint, and the data field is what
+// the route promises.
+func isModelsList(body []byte) bool {
 	var list struct {
 		Object string            `json:"object"`
 		Data   []json.RawMessage `json:"data"`
