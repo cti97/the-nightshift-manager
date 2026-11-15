@@ -3103,6 +3103,12 @@ func TestAgentTakesAnItemFromQueuedToDone(t *testing.T) {
 		NodeID:   nodeID,
 		Executor: exec,
 		Protocol: 1,
+		// These must match what the node can do. The agent re-sends
+		// provides_live on every heartbeat, so an empty list here would
+		// overwrite the registration and make the node unqualified for
+		// its own item.
+		Provides: []string{"agentic"},
+		Reaches:  []string{"host", "lan", "wan"},
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -17,3 +17,6 @@ bin/
 # Editor
 .idea/
 .vscode/
+
+# SDD scratch workspace
+.superpowers/
