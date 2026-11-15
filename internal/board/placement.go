@@ -110,7 +110,10 @@ func Eligible(item WorkItem, c Candidate) (bool, string) {
 }
 
 // Place picks the cheapest eligible candidate. Ranking is cost, then node name
-// for determinism — never a model's opinion (spec D5).
+// for determinism — never a model's opinion (spec D5). The model id and
+// endpoint name keys make the order total: two candidates tying on cost and
+// node must not fall back to input order, because the store's query has no
+// ORDER BY.
 func Place(item WorkItem, cands []Candidate) Decision {
 	sorted := append([]Candidate{}, cands...)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -118,7 +121,13 @@ func Place(item WorkItem, cands []Candidate) Decision {
 		if ci != cj {
 			return ci < cj
 		}
-		return sorted[i].Node.Name < sorted[j].Node.Name
+		if sorted[i].Node.Name != sorted[j].Node.Name {
+			return sorted[i].Node.Name < sorted[j].Node.Name
+		}
+		if sorted[i].Model.ModelID != sorted[j].Model.ModelID {
+			return sorted[i].Model.ModelID < sorted[j].Model.ModelID
+		}
+		return sorted[i].Endpoint.Name < sorted[j].Endpoint.Name
 	})
 
 	var rejects []Reject

@@ -169,3 +169,67 @@ func TestPlaceTieBreaksOnNodeName(t *testing.T) {
 		t.Fatalf("tie chose node %q, want a (cost, then node name)", d.Chosen.Node.Name)
 	}
 }
+
+// Fix round: the model half of the capability union, the text of Rejects (the
+// only thing /why shows a human), and a total ranking order. Each pins
+// behaviour that could be deleted with the rest of the suite still green.
+
+func TestPlaceAcceptsCapabilityProvidedOnlyByTheModel(t *testing.T) {
+	// tokens: and vision are realistically provided by the model, not the
+	// node, so the union at the top of Eligible must include Model.Provides.
+	c := cand("laptop", "executor", nil, "vlm", "host", "ok", []string{"vision"}, 0)
+	c.Model.Provides = []string{"vision"}
+
+	d := Place(item("vision"), []Candidate{c})
+	if !d.OK {
+		t.Fatalf("model-only provides not honoured: %+v", d.Rejects)
+	}
+}
+
+func TestPlaceRejectNamesTheUnreachableReachClass(t *testing.T) {
+	c := cand("laptop", "executor", []string{"agentic"}, "cloud", "wan", "ok", []string{"tools"}, 0)
+	c.Node.ReachClasses = []string{"host"}
+
+	d := Place(item("agentic"), []Candidate{c})
+	if d.OK || len(d.Rejects) != 1 {
+		t.Fatalf("OK=%v rejects=%d, want one rejection", d.OK, len(d.Rejects))
+	}
+	if d.Rejects[0].NodeName != "laptop" {
+		t.Fatalf("reject names node %q, want laptop", d.Rejects[0].NodeName)
+	}
+	if d.Rejects[0].Why != "node cannot reach wan endpoints" {
+		t.Fatalf("reject why %q does not name the reach rule", d.Rejects[0].Why)
+	}
+}
+
+func TestPlaceRejectNamesTheMissingCapability(t *testing.T) {
+	pi := cand("pi", "steward", []string{"reflex"}, "local", "host", "ok", nil, 0)
+
+	d := Place(item("reflex", "gpu"), []Candidate{pi})
+	if d.OK || len(d.Rejects) != 1 {
+		t.Fatalf("OK=%v rejects=%d, want one rejection", d.OK, len(d.Rejects))
+	}
+	if d.Rejects[0].Why != "no provider for gpu" {
+		t.Fatalf("reject why %q does not name the missing capability", d.Rejects[0].Why)
+	}
+}
+
+func TestPlaceOrderIsTotalAcrossEqualCostModelsOnOneNode(t *testing.T) {
+	// Same node and same price: cost and node name both tie, so the model id
+	// must decide. The endpoint names are deliberately ordered opposite to the
+	// model ids, so losing the model-id key flips the winner.
+	b := cand("laptop", "executor", []string{"agentic"}, "a-endpoint", "wan", "ok", []string{"tools"}, 1)
+	b.Model.ModelID = "m-b"
+	a := cand("laptop", "executor", []string{"agentic"}, "z-endpoint", "wan", "ok", []string{"tools"}, 1)
+	a.Model.ModelID = "m-a"
+
+	for _, in := range [][]Candidate{{b, a}, {a, b}} {
+		d := Place(item("agentic"), in)
+		if !d.OK {
+			t.Fatalf("no placement: %+v", d.Rejects)
+		}
+		if d.Chosen.Model.ModelID != "m-a" {
+			t.Fatalf("chose model %q, want m-a regardless of input order", d.Chosen.Model.ModelID)
+		}
+	}
+}
