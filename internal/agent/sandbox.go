@@ -272,6 +272,31 @@ func (s *Sandbox) MkdirAll(name string, perm os.FileMode) error {
 	return nil
 }
 
+// Stat reports the metadata of one path inside the run directory.
+//
+// It exists for callers that must know what they are about to open. `ReadFile`
+// on a named pipe, and `ListDir` on one, block in open(2) until a writer appears
+// — and a tool whose read never returns hangs the run it belongs to, with no
+// timeout to rescue it. The tool layer checks the mode with this before opening.
+// Stat follows a symlink inside the run directory (as Root.Stat does) and
+// refuses one that leaves it.
+func (s *Sandbox) Stat(name string) (os.FileInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrSandboxClosed
+	}
+	clean, err := confinedPath(name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := s.root.Stat(clean)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox: stat %q: %w", name, err)
+	}
+	return info, nil
+}
+
 // ListDir lists one directory inside the run directory, sorted by name.
 func (s *Sandbox) ListDir(name string) ([]os.DirEntry, error) {
 	s.mu.RLock()
