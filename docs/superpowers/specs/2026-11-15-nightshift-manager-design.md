@@ -725,6 +725,16 @@ worth adding.
     Any future task that adds endpoint import, templating, or a non-admin write path must revisit
     this: the namespace defends the manager's tokens, not the provider's.
 
+17. **Kernel confinement has never run in the environment M2 was built in.** The development
+    shell is itself Seatbelt-sandboxed, so `sandbox_apply` is denied and
+    `sandbox-exec -p '(version 1)(allow default)' /usr/bin/true` fails with "Operation not
+    permitted". The acceptance test skips with that reason and `NSM_REQUIRE_KERNEL_SANDBOX=1`
+    turns the skip into a failure. What M2 actually delivers is **tool-layer confinement** —
+    `os.Root`, constructed environment, cwd, per-run directory. The generated profile is
+    syntax-checked but never applied here. Verify on an unconfined machine with
+    `NSM_REQUIRE_KERNEL_SANDBOX=1 go test ./internal/agent -run TestSandboxCannotReachTheHomeDirectory -v`
+    before relying on the kernel layer for anything.
+
 ## 20. Distribution and release
 
 The project ships one static binary, six artifacts, and a self-hosted channel.
