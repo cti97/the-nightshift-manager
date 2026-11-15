@@ -9,10 +9,12 @@ import (
 	"time"
 )
 
-// StartRun moves a run from claimed to running, and records the start time and
-// the audit event in the same transaction as the transition. This single
-// transition is what lets the reaper tell a claim that never started from a run
-// that died mid-flight, and therefore whether the attempt should be charged.
+// StartRun moves a run from claimed to running, and moves its work item to
+// running in the same transaction, so the item and its run can never disagree
+// about whether work has started. It also records the start time and the audit
+// event there. This single transition is what lets the reaper tell a claim that
+// never started from a run that died mid-flight, and therefore whether the
+// attempt should be charged.
 //
 // It is transactional for the same reason every other board write is: a report
 // can land immediately after a bare UPDATE, and a transition without an event
@@ -24,9 +26,10 @@ func StartRun(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 	}
 	defer func() { _ = tx.Rollback() }() // a commit makes this a no-op
 
-	// Read inside the transaction so the guard, the timestamp and the event all
-	// describe the same row. The run is the only evidence that a start happened,
-	// so a start that is not recorded here is a start the reaper cannot see.
+	// Read inside the transaction so the timestamp and the event describe the
+	// same rows the guards check. The run is the only evidence that a start
+	// happened, so a start that is not recorded here is a start the reaper
+	// cannot see.
 	var itemID string
 	if err := tx.QueryRowContext(ctx,
 		`SELECT work_item_id FROM runs WHERE id=? AND node_id=? AND status='claimed'`,
@@ -36,10 +39,11 @@ func StartRun(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 		}
 		return err
 	}
+	now := clock.Now()
 
 	res, err := tx.ExecContext(ctx,
 		`UPDATE runs SET status='running', started_at=? WHERE id=? AND status='claimed'`,
-		clock.Now(), runID)
+		now, runID)
 	if err != nil {
 		return err
 	}
@@ -50,6 +54,25 @@ func StartRun(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 	if n != 1 {
 		return fmt.Errorf("run %s is not a claimable run for node %s", runID, nodeID)
 	}
+
+	// The item moves with its run so the two can never disagree about whether
+	// work has started. The status guard is what refuses a late start on work
+	// that was cancelled or requeued while the claim was in flight — the rowcount
+	// check then rolls the whole transition back.
+	res, err = tx.ExecContext(ctx,
+		`UPDATE work_items SET status='running', updated_at=? WHERE id=? AND status='claimed'`,
+		now, itemID)
+	if err != nil {
+		return err
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("work item %s is no longer claimed; run %s cannot start", itemID, runID)
+	}
+
 	if err := AppendEvent(ctx, tx, clock, "node:"+nodeID, "work_item", itemID, "started",
 		map[string]any{"run": runID}); err != nil {
 		return err

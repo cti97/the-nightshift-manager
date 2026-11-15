@@ -532,11 +532,56 @@ func TestStartRunRefusesARunItDoesNotOwnOrAlreadyStarted(t *testing.T) {
 	if err := StartRun(ctx, db, clock, "no-such-run", node); err == nil {
 		t.Fatal("StartRun accepted an unknown run id")
 	}
+	// Rejections are atomic: a refused start must leave the item exactly as
+	// Claim left it, never half-moved to running.
+	var itemStatus string
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, got[0].Item.ID).Scan(&itemStatus); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if itemStatus != "claimed" {
+		t.Fatalf("item status = %q after rejected starts, want claimed", itemStatus)
+	}
 	if err := StartRun(ctx, db, clock, runID, node); err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
 	if err := StartRun(ctx, db, clock, runID, node); err == nil {
 		t.Fatal("StartRun started the same run twice")
+	}
+}
+
+// A start is only legitimate while the item is still claimed. Cancelled (or
+// requeued) work must not be resurrected by a late start, and the refusal must
+// leave the run exactly where it was — the item and its run still agree that
+// nothing started.
+func TestStartRunRefusesAnItemThatIsNoLongerClaimed(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	got, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Claim: %v", err)
+	}
+	// An operator cancels while the claim is still in flight: the run row has
+	// not been settled yet, so only the item records the cancellation.
+	if _, err := db.ExecContext(ctx, `UPDATE work_items SET status='cancelled' WHERE id=?`, id); err != nil {
+		t.Fatalf("cancel item: %v", err)
+	}
+
+	if err := StartRun(ctx, db, clock, got[0].RunID, node); err == nil {
+		t.Fatal("StartRun started a run for a cancelled item")
+	}
+
+	var itemStatus, runStatus string
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, id).Scan(&itemStatus); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if err := db.QueryRow(`SELECT status FROM runs WHERE id=?`, got[0].RunID).Scan(&runStatus); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if itemStatus != "cancelled" || runStatus != "claimed" {
+		t.Fatalf("item/run = %q/%q, want cancelled/claimed (a refused start changes nothing)", itemStatus, runStatus)
 	}
 }
 
@@ -571,6 +616,15 @@ func TestStartRunRecordsTheStartTimeAndAnEvent(t *testing.T) {
 	}
 	if startedAt != clock.Now() || startedAt == claimedAt {
 		t.Fatalf("started_at = %d, want the start time %d, not the claim time %d", startedAt, clock.Now(), claimedAt)
+	}
+
+	// The item and its run must never disagree about whether work has started.
+	var itemStatus string
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, got[0].Item.ID).Scan(&itemStatus); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if itemStatus != "running" {
+		t.Fatalf("item status = %q, want running (the item must follow its run)", itemStatus)
 	}
 
 	events, err := ListEvents(ctx, db, "work_item", got[0].Item.ID, 50)
