@@ -76,6 +76,15 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// workItemStatuses is every value schema.sql's CHECK constraint permits on
+// work_items.status, in the order the dashboard renders them. The board
+// handler zero-fills each one so the response shape does not depend on which
+// statuses happen to have rows. This is the single place a new schema status
+// must be added; TestWorkItemStatusesMatchSchema fails if it drifts.
+var workItemStatuses = []string{
+	"queued", "claimed", "running", "needs_approval", "done", "failed", "cancelled",
+}
+
 func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT status, COUNT(*) FROM work_items GROUP BY status`)
@@ -95,9 +104,15 @@ func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request) {
 		}
 		counts[status] = n
 	}
-	for _, s := range []string{"queued", "claimed", "running", "needs_approval", "done", "failed"} {
-		if _, ok := counts[s]; !ok {
-			counts[s] = 0
+	// Next returning false means "done" or "the driver failed midway"; without
+	// this the handler cannot tell, and would report a partial map as truth.
+	if err := rows.Err(); err != nil {
+		WriteError(w, http.StatusInternalServerError, "db", err.Error())
+		return
+	}
+	for _, status := range workItemStatuses {
+		if _, ok := counts[status]; !ok {
+			counts[status] = 0
 		}
 	}
 	WriteJSON(w, http.StatusOK, counts)
