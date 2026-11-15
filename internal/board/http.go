@@ -1,6 +1,7 @@
 package board
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -42,6 +43,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.Handle("GET /admin/board", s.adminAuth(http.HandlerFunc(s.handleBoard)))
+	mux.HandleFunc("POST /nodes/register", s.handleRegister)
+	mux.Handle("POST /nodes/heartbeat", s.nodeAuth(http.HandlerFunc(s.handleHeartbeat)))
 	return mux
 }
 
@@ -65,13 +68,71 @@ func bearer(r *http.Request) (string, bool) {
 	return h[len(p):], true
 }
 
+type ctxKey string
+
+const nodeIDKey ctxKey = "node_id"
+
+// nodeAuth resolves a bearer token to a node id. The token itself is never
+// stored, so this compares hashes and nothing else.
+func (s *Server) nodeAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := bearer(r)
+		if !ok {
+			WriteError(w, http.StatusUnauthorized, "unauthorized", "node token required")
+			return
+		}
+		var id string
+		err := s.db.QueryRowContext(r.Context(),
+			`SELECT id FROM nodes WHERE token_hash = ?`, HashToken(tok)).Scan(&id)
+		if err != nil {
+			WriteError(w, http.StatusUnauthorized, "unauthorized", "unknown node token")
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), nodeIDKey, id)))
+	})
+}
+
+func nodeIDFrom(r *http.Request) string {
+	id, _ := r.Context().Value(nodeIDKey).(string)
+	return id
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	id, token, err := RegisterNode(r.Context(), s.db, s.clock, req)
+	if err != nil {
+		WriteError(w, http.StatusConflict, "register", err.Error())
+		return
+	}
+	// The plaintext token is returned exactly once, here.
+	WriteJSON(w, http.StatusCreated, RegisterResponse{NodeID: id, Token: token})
+}
+
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var req HeartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	resp, err := Heartbeat(r.Context(), s.db, s.clock, nodeIDFrom(r), req)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "heartbeat", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, resp)
+}
+
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	v, c := version.Info()
 	WriteJSON(w, http.StatusOK, map[string]any{
 		"version":        v,
 		"commit":         c,
-		"protocol_min":   1,
-		"protocol_max":   1,
+		"protocol_min":   ProtocolMin,
+		"protocol_max":   ProtocolMax,
 		"schema_version": SchemaVersion(),
 	})
 }
