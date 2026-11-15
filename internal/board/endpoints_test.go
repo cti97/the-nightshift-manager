@@ -224,6 +224,60 @@ func TestCreateEndpointRejectsBlankFields(t *testing.T) {
 	}
 }
 
+// TestCreateEndpointValidatesBaseURL covers the one operator-typed field a
+// syntax check can refuse. It is also the field a typo would make PERMANENT:
+// there is no endpoint PATCH or DELETE, so a URL stored blind can only be
+// corrected with raw SQL. The rule is not restated here — it is the adapters'
+// own (provider.CheckBaseURL), shared with normalizeAPIBaseURL.
+func TestCreateEndpointValidatesBaseURL(t *testing.T) {
+	bad := []string{
+		"not a url",
+		"127.0.0.1:8080", // no scheme: parses as a path containing a colon
+		"pi.local:11434", // scheme "pi.local", which no adapter speaks
+		"ftp://example.com",
+		"http://", // no host
+		"http://example.com/p?x=1",
+		"http://example.com/p#frag",
+	}
+	for _, raw := range bad {
+		t.Run("refuse/"+raw, func(t *testing.T) {
+			db, clock := newTestDB(t)
+			_, err := CreateEndpoint(context.Background(), db, clock, testRegistry(), CreateEndpointRequest{
+				Name: "ep", Provider: "openai", BaseURL: raw, Reach: "lan",
+			})
+			if err == nil {
+				t.Fatalf("CreateEndpoint accepted base_url %q, which no adapter can construct", raw)
+			}
+			if !strings.Contains(err.Error(), "base URL") {
+				t.Fatalf("error = %q, want it to name the base URL", err)
+			}
+			if n := countRows(t, db, "endpoints"); n != 0 {
+				t.Fatalf("%d endpoint rows after a rejected base_url, want 0", n)
+			}
+			if n := countRows(t, db, "events"); n != 0 {
+				t.Fatalf("%d events after a rejected base_url, want 0", n)
+			}
+		})
+	}
+
+	good := map[string]string{
+		"http://127.0.0.1:8080":         "http://127.0.0.1:8080",
+		" https://api.example.com/v1 ":  "https://api.example.com/v1",
+		"https://proxy.example/openai/": "https://proxy.example/openai/",
+	}
+	for raw, want := range good {
+		t.Run("accept/"+raw, func(t *testing.T) {
+			db, clock := newTestDB(t)
+			ep := mustCreateEndpoint(t, db, clock, testRegistry(), CreateEndpointRequest{
+				Name: "ep", Provider: "openai", BaseURL: raw, Reach: "lan",
+			})
+			if ep.BaseURL != want {
+				t.Fatalf("stored base_url = %q, want %q (trimmed, not rewritten)", ep.BaseURL, want)
+			}
+		})
+	}
+}
+
 func TestCreateEndpointRejectsDuplicateName(t *testing.T) {
 	db, clock := newTestDB(t)
 	reg := testRegistry()
@@ -765,6 +819,66 @@ func TestListEndpointsReturnsModelsAndHealth(t *testing.T) {
 	}
 }
 
+// TestPatchModelRenameCollisionIsRefused: model_id is the value a provider is
+// called with, so it is editable — but (endpoint_id, model_id) is UNIQUE, and a
+// rename onto a taken name must be refused without moving the row.
+func TestPatchModelRenameCollisionIsRefused(t *testing.T) {
+	db, clock := newTestDB(t)
+	ep := endpointFixture(t, db, clock)
+	mustCreateModel(t, db, clock, CreateModelRequest{EndpointID: ep.ID, ModelID: "a"})
+	b := mustCreateModel(t, db, clock, CreateModelRequest{EndpointID: ep.ID, ModelID: "b"})
+	before := countRows(t, db, "events")
+
+	_, err := PatchModel(context.Background(), db, clock, b.ID, PatchModelRequest{ModelID: strPtr("a")})
+	if err == nil {
+		t.Fatal("PATCH renamed a model onto a name already taken on the same endpoint")
+	}
+	if !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("error = %v, want ErrAlreadyExists so the handler can answer 409", err)
+	}
+	var got string
+	if err := db.QueryRow(`SELECT model_id FROM models WHERE id=?`, b.ID).Scan(&got); err != nil {
+		t.Fatalf("read model_id: %v", err)
+	}
+	if got != "b" {
+		t.Fatalf("model_id = %q after a refused rename, want b", got)
+	}
+	if n := countRows(t, db, "events"); n != before {
+		t.Fatalf("%d events after a refused rename, want the original %d", n, before)
+	}
+}
+
+// TestPatchModelRollsBackWhenItsEventFails is PatchModel's half of the
+// same-transaction guarantee the create test proves: the UPDATE and the event are
+// one write, so a failed event leaves every column at its old value rather than
+// changing the row without an audit trail.
+func TestPatchModelRollsBackWhenItsEventFails(t *testing.T) {
+	db, clock := newTestDB(t)
+	ep := endpointFixture(t, db, clock)
+	m := mustCreateModel(t, db, clock, CreateModelRequest{
+		EndpointID: ep.ID, ModelID: "m1", CostInPerMtok: 1,
+	})
+
+	if _, err := db.Exec(`DROP TABLE events`); err != nil {
+		t.Fatalf("drop events: %v", err)
+	}
+	if _, err := PatchModel(context.Background(), db, clock, m.ID, PatchModelRequest{
+		CostInPerMtok: floatPtr(5), Enabled: boolPtr(false),
+	}); err == nil {
+		t.Fatal("the PATCH succeeded with no events table")
+	}
+
+	var cost float64
+	var enabled int
+	if err := db.QueryRow(`SELECT cost_in_per_mtok, enabled FROM models WHERE id=?`, m.ID).
+		Scan(&cost, &enabled); err != nil {
+		t.Fatalf("read model: %v", err)
+	}
+	if cost != 1 || enabled != 1 {
+		t.Fatalf("cost=%v enabled=%d after a failed event write, want 1 and 1: the UPDATE is not in the event's transaction", cost, enabled)
+	}
+}
+
 // --- HTTP surface -----------------------------------------------------------
 
 // doJSON (the body-carrying request helper) already exists in report_test.go;
@@ -874,6 +988,42 @@ func TestCreateEndpointHTTPRejectsATypoWithTheErrorEnvelope(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "openai") {
 		t.Fatalf("body = %s, want the registered names in the message", rec.Body.String())
 	}
+}
+
+// TestDuplicateWritesOverHTTPAre409 pins the status the store's ErrAlreadyExists
+// maps to. A duplicate is a well-formed value that is merely taken, and answering
+// 400 would send the operator looking for a typo that is not there.
+func TestDuplicateWritesOverHTTPAre409(t *testing.T) {
+	srv, _ := newServer(t)
+	h := srv.Handler()
+
+	endpointBody := map[string]any{
+		"name": "pi", "provider": "ollama", "base_url": "http://127.0.0.1:11434", "reach": "lan",
+	}
+	rec := doJSON(t, h, "POST", "/admin/endpoints", testAdminToken, endpointBody)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("first create = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+	}
+	var ep EndpointView
+	if err := json.Unmarshal(rec.Body.Bytes(), &ep); err != nil {
+		t.Fatalf("decode endpoint: %v", err)
+	}
+
+	rec = doJSON(t, h, "POST", "/admin/endpoints", testAdminToken, endpointBody)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate endpoint = %d, want 409 (body %s)", rec.Code, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "conflict")
+
+	modelBody := map[string]any{"endpoint_id": ep.ID, "model_id": "qwen2.5:3b"}
+	if rec := doJSON(t, h, "POST", "/admin/models", testAdminToken, modelBody); rec.Code != http.StatusCreated {
+		t.Fatalf("first model create = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, "POST", "/admin/models", testAdminToken, modelBody)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate model = %d, want 409 (body %s)", rec.Code, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "conflict")
 }
 
 func TestPatchUnknownModelOverHTTPIs404(t *testing.T) {

@@ -185,20 +185,27 @@ func CreateEndpoint(ctx context.Context, db *sql.DB, clock Clock, reg *provider.
 	if name == "" {
 		return EndpointView{}, errors.New("endpoint name is required")
 	}
-	// Not defaulted and not derived: an endpoint with no address is a row the
-	// provider cannot construct, and every adapter needs one. Adapter-specific
-	// URL rules are the adapter's to enforce (Task 9's probe is where an
-	// unreachable URL becomes a visible health state).
+	authRef := strings.TrimSpace(req.AuthRef)
+	// The provider is checked first: it decides whether there is a family at all,
+	// and it names the family in the base-URL error below.
+	if err := checkProviderRegistered(reg, req.Provider); err != nil {
+		return EndpointView{}, err
+	}
+	// The base URL is validated here rather than left to the adapter, because
+	// there is no endpoint update route: a URL typo'd through this API would be
+	// permanent short of raw SQL. provider.CheckBaseURL is the adapters' own rule
+	// (normalizeAPIBaseURL shares its parse), so this write path accepts exactly
+	// the spellings the runtime can construct — the one operator-typed field that
+	// would otherwise be stored blind.
 	baseURL := strings.TrimSpace(req.BaseURL)
 	if baseURL == "" {
 		return EndpointView{}, errors.New("endpoint base_url is required")
 	}
-	authRef := strings.TrimSpace(req.AuthRef)
-	reach, err := parseReach(req.Reach)
-	if err != nil {
+	if err := provider.CheckBaseURL(baseURL, req.Provider); err != nil {
 		return EndpointView{}, err
 	}
-	if err := checkProviderRegistered(reg, req.Provider); err != nil {
+	reach, err := parseReach(req.Reach)
+	if err != nil {
 		return EndpointView{}, err
 	}
 

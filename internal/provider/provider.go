@@ -229,6 +229,21 @@ func checkReach(req Request, endpointReach string) error {
 	return nil
 }
 
+// CheckBaseURL reports whether raw is a base URL the named family could use:
+// scheme http or https, a host, and no query or fragment. It exists for the
+// board's admin write path, which must refuse an endpoint row no adapter could
+// ever construct — endpoints have no update route, so a URL stored blind is
+// permanent short of raw SQL.
+//
+// It validates without normalising, and normalizeAPIBaseURL shares its parse, so
+// "what a base URL may be" has one implementation: the write path and the
+// adapters cannot drift apart, and a new family inherits the rule by using the
+// same helper.
+func CheckBaseURL(raw, family string) error {
+	_, err := parseAPIBaseURL(raw, family)
+	return err
+}
+
 // normalizeAPIBaseURL validates an endpoint root and reduces it to the API root
 // that a family's paths (openAIChatPath, anthropicMessagesPath, …) are appended
 // to. It lives here, beside checkReach and checkToolMessages, because it is the
@@ -245,22 +260,9 @@ func checkReach(req Request, endpointReach string) error {
 // project's families needs it. family names the protocol in the error, so a bad
 // endpoint row says which adapter refused it.
 func normalizeAPIBaseURL(raw, family string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return "", fmt.Errorf("provider: %s: no base URL in config", family)
-	}
-	u, err := url.Parse(trimmed)
+	u, err := parseAPIBaseURL(raw, family)
 	if err != nil {
-		return "", fmt.Errorf("provider: %s: base URL %q: %w", family, raw, err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("provider: %s: base URL %q: scheme is %q, want http or https", family, raw, u.Scheme)
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("provider: %s: base URL %q: no host", family, raw)
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("provider: %s: base URL %q: must not carry a query or fragment", family, raw)
+		return "", err
 	}
 	path := strings.TrimRight(u.Path, "/")
 	path = strings.TrimSuffix(path, "/v1")
@@ -268,4 +270,28 @@ func normalizeAPIBaseURL(raw, family string) (string, error) {
 	u.Path = path
 	u.RawPath = ""
 	return u.String(), nil
+}
+
+// parseAPIBaseURL is the rule both callers apply; they differ only in whether
+// they normalise the result (CheckBaseURL must not, because the board stores
+// what the operator typed).
+func parseAPIBaseURL(raw, family string) (*url.URL, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, fmt.Errorf("provider: %s: no base URL in config", family)
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("provider: %s: base URL %q: %w", family, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("provider: %s: base URL %q: scheme is %q, want http or https", family, raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("provider: %s: base URL %q: no host", family, raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("provider: %s: base URL %q: must not carry a query or fragment", family, raw)
+	}
+	return u, nil
 }
