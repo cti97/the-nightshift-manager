@@ -258,6 +258,9 @@ func TestProbeRecordsEachHealthState(t *testing.T) {
 			if err := json.Unmarshal([]byte(evs[0].Payload), &payload); err != nil {
 				t.Fatalf("decode probe event payload %q: %v", evs[0].Payload, err)
 			}
+			if evs[0].Actor != probeActor {
+				t.Fatalf("probe event actor = %q, want %q: a scheduled probe must not look human", evs[0].Actor, probeActor)
+			}
 			if payload.Health != tc.want {
 				t.Fatalf("event says health %q, row says %q", payload.Health, tc.want)
 			}
@@ -385,6 +388,10 @@ func TestProbeTransitionRule(t *testing.T) {
 	}{
 		{name: "never probed goes down", from: "unknown", to: "down", want: false},
 		{name: "down stays down", from: "down", to: "down", want: false},
+		// The regression the first version of this rule had: last_ok_at survives
+		// a failure, so an endpoint in a sustained outage still carries it. Alert
+		// on the transition, or one outage pages on every probe.
+		{name: "down stays down after an earlier ok", from: "down", lastOKAt: &okAt, to: "down", want: false},
 		{name: "warming without a prior ok goes down", from: "warming", to: "down", want: false},
 		{name: "auth failed without a prior ok goes down", from: "auth_failed", to: "down", want: false},
 		{name: "ok goes down", from: "ok", to: "down", want: true},
@@ -463,6 +470,30 @@ func TestProbeReportsAnAlertOnlyAfterAnOK(t *testing.T) {
 	if !payload.Alert {
 		t.Fatal("the alert did not reach the event, so a dashboard projecting from events cannot see it")
 	}
+
+	// Still broken on the next probe: not a transition, not another alert. One
+	// outage is one page.
+	if res, err = ProbeEndpoint(ctx, db, clock, testRegistry(), ep.ID); err != nil {
+		t.Fatalf("fifth probe: %v", err)
+	}
+	if res.Alert {
+		t.Fatal("a sustained down re-alerted; one outage must page once")
+	}
+	alerts := 0
+	for _, e := range probeEvents(t, db, ep.ID) {
+		var p struct {
+			Alert bool `json:"alert"`
+		}
+		if err := json.Unmarshal([]byte(e.Payload), &p); err != nil {
+			t.Fatalf("decode probe event %d: %v", e.ID, err)
+		}
+		if p.Alert {
+			alerts++
+		}
+	}
+	if alerts != 1 {
+		t.Fatalf("%d alerting probes across five observations, want exactly 1", alerts)
+	}
 }
 
 // TestProbeRecordsAConstructionFailureAsDown is decision 2: an adapter that
@@ -511,18 +542,76 @@ func TestProbeRecordsAConstructionFailureAsDown(t *testing.T) {
 	}
 }
 
-// TestProbeOfAMissingCredentialIsDown pins the auth_ref half of construction: a
-// row that names a secret this process does not hold cannot authenticate, and
-// saying so is more useful than spending a round trip to be told 401.
-func TestProbeOfAMissingCredentialIsDown(t *testing.T) {
-	const ref = "NSM_PROBE_TEST_KEY"
-	t.Setenv(ref, "") // set-but-empty, so the result cannot depend on the ambient environment
+// TestProbeSendsNoCredentialFromTheManagersEnvironment is the security pin for
+// the probe path. auth_ref is a value from a row; the manager's environment holds
+// the manager's own secrets, its admin token among them. If the probe resolved
+// the one from the other, a row naming NSM_ADMIN_TOKEN and pointing at any URL
+// would receive the admin token as a bearer credential — two individually
+// reasonable features composing into credential exfiltration.
+//
+// The fake answers 200 only to a request that carries a credential, so a leak
+// would not merely send the token, it would also make the probe look healthy.
+func TestProbeSendsNoCredentialFromTheManagersEnvironment(t *testing.T) {
+	t.Setenv("NSM_ADMIN_TOKEN", "the-managers-own-admin-token")
+
+	var seen atomic.Value
+	seen.Store("")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		seen.Store(auth)
+		if auth != "" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(probeListBody))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"missing api key"}}`))
+	}))
+	t.Cleanup(ts.Close)
 
 	db, clock := newTestDB(t)
-	fake := newProbeFake(t)
 	ep := mustCreateEndpoint(t, db, clock, testRegistry(), CreateEndpointRequest{
-		Name: "keyed", Provider: "openai", BaseURL: fake.ts.URL, Reach: "wan", AuthRef: ref,
+		Name: "keyed", Provider: "openai", BaseURL: ts.URL, Reach: "wan", AuthRef: "NSM_ADMIN_TOKEN",
 	})
+
+	res, err := ProbeEndpoint(context.Background(), db, clock, testRegistry(), ep.ID)
+	if err != nil {
+		t.Fatalf("ProbeEndpoint: %v", err)
+	}
+	if got := seen.Load().(string); got != "" {
+		t.Fatalf("the probe sent Authorization %q; a row's auth_ref must never become the manager's secret", got)
+	}
+	// Reachable, gated, and the probe has nothing to present: a state about the
+	// endpoint's authentication, not a broken endpoint.
+	if string(res.Health) != "auth_failed" {
+		t.Fatalf("health = %q, want auth_failed for a credential-free 401", res.Health)
+	}
+	if !strings.Contains(res.HealthReason, "credential") {
+		t.Fatalf("reason = %q, want it to say the probe sends no credential", res.HealthReason)
+	}
+	if s := readStoredHealth(t, db, ep.ID); s.health != "auth_failed" {
+		t.Fatalf("stored health = %q, want auth_failed", s.health)
+	}
+}
+
+// TestProbeOfAHangingEndpointIsDown pins the timeout half of the acceptance
+// criteria: an endpoint that never answers must produce a state and a recorded
+// reason, not an admin request that hangs. The probe timeout is shortened for
+// the duration of the test and restored, so the path exercised is the production
+// one without sitting out the production 20 seconds.
+func TestProbeOfAHangingEndpointIsDown(t *testing.T) {
+	restore := probeTimeout
+	probeTimeout = 75 * time.Millisecond
+	t.Cleanup(func() { probeTimeout = restore })
+
+	db, clock := newTestDB(t)
+	// The handler answers only when the probe gives up, so the only thing that
+	// can end this request is the timeout under test.
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(hang.Close)
+	ep := probeEndpoint(t, db, clock, "hanging", "openai", hang.URL, "lan")
 
 	res, err := ProbeEndpoint(context.Background(), db, clock, testRegistry(), ep.ID)
 	if err != nil {
@@ -531,11 +620,14 @@ func TestProbeOfAMissingCredentialIsDown(t *testing.T) {
 	if string(res.Health) != "down" {
 		t.Fatalf("health = %q, want down", res.Health)
 	}
-	if !strings.Contains(res.HealthReason, ref) {
-		t.Fatalf("reason = %q, want it to name the missing secret %q", res.HealthReason, ref)
+	if !strings.Contains(strings.ToLower(res.HealthReason), "deadline exceeded") {
+		t.Fatalf("reason = %q, want the deadline it hit", res.HealthReason)
 	}
-	if got := fake.hits.Load(); got != 0 {
-		t.Fatalf("%d requests reached the endpoint; a credential that is absent locally needs no round trip", got)
+	if s := readStoredHealth(t, db, ep.ID); s.health != "down" {
+		t.Fatalf("stored health = %q, want down", s.health)
+	}
+	if got := len(probeEvents(t, db, ep.ID)); got != 1 {
+		t.Fatalf("%d probe events, want 1", got)
 	}
 }
 

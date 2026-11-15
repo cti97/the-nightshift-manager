@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/cti97/the-nightshift-manager/internal/provider"
@@ -46,6 +45,24 @@ import (
 //     not belong on a production board (Task 8 already records that it is
 //     creatable); this probe adds no special case for one adapter, because the
 //     registry's promise is that a provider is a provider.
+//   - The probe is credential-free, whatever endpoints.auth_ref names. auth_ref
+//     is a value from a row, and the manager's environment holds the manager's
+//     own secrets — its admin token among them. Resolving one from the other
+//     lets a row name NSM_ADMIN_TOKEN and receive it as a bearer header at a URL
+//     the row also chooses: two individually reasonable features composing into
+//     a credential-exfiltration primitive. So nothing here reads the
+//     environment, and a 401 or 403 from a credential-free probe means the
+//     endpoint is reachable and its gate works — recorded as auth_failed, not
+//     down, because a missing credential is not a broken endpoint.
+//   - Reach is measured from the manager, not from the executor. A host or lan
+//     endpoint on another machine is probed from wherever the manager runs, so a
+//     healthy endpoint can be recorded down because the manager cannot see it,
+//     and placement then excludes it. That is a limitation of probing from the
+//     control plane rather than a fact about the endpoint, and it is deliberately
+//     not solved here: delegation (the executor's node probing its own reach, or
+//     reporting health back) belongs to Task 12, which owns the run path and the
+//     node that can actually answer the question. A sixth state invented in this
+//     file would only move the lie.
 //
 // Two boundaries hold the write. The probe holds no transaction while it is on
 // the wire — the pool is one connection, and a slow endpoint must not block the
@@ -55,18 +72,28 @@ import (
 // deleted between the read and the write therefore gets nothing written for it,
 // and two overlapping probes cannot both alert on the same regression.
 
-const (
-	// probeTimeout bounds one probe. It is the board's number, not the
-	// adapter's: the adapters default to 120s because their first request may
-	// load a model, but a probe asks for a model list and answers the operator's
-	// POST. A probe that hangs for two minutes is a worse answer than "down",
-	// and the failure it produces is a context deadline the operator can see.
-	probeTimeout = 20 * time.Second
+// probeTimeout bounds one probe. It is the board's number, not the adapter's:
+// the adapters default to 120s because their first request may load a model, but
+// a probe asks for a model list and answers the operator's POST. A probe that
+// hangs for two minutes is a worse answer than "down", and the failure it
+// produces is a context deadline the operator can see.
+//
+// It is a variable rather than a constant for one reason: the timeout path is
+// only testable by shortening it, and a test that sat out the real 20 seconds
+// would be the slowest thing in the suite. Nothing in production assigns it —
+// probe_test.go saves it, shortens it, and restores it.
+var probeTimeout = 20 * time.Second
 
+const (
 	// probeEventType is the event every completed probe appends. It records an
 	// observation, not a change: a probe that confirms `down` still bounds the
 	// outage, and a dashboard projecting health from events needs both.
 	probeEventType = "probed"
+
+	// probeActor is the event actor for a probe. Deliberately not "admin": the
+	// admin route is only the first caller, and a scheduled probe appending
+	// human-attributed events would make the audit spine lie about who acted.
+	probeActor = "probe"
 
 	// The three non-ok states carry no diagnostic text on the provider
 	// interface: Probe returns (Health, error), and for warming and auth_failed
@@ -78,7 +105,7 @@ const (
 	// is a `down`/`warming` with no reason at all, which the operator cannot act
 	// on.
 	healthReasonWarming    = "a model is loading"
-	healthReasonAuthFailed = "the credential was rejected"
+	healthReasonAuthFailed = "reachable, but it requires authentication and the probe sends no credential"
 	healthReasonDown       = "the endpoint answered with a failure status"
 )
 
@@ -104,31 +131,38 @@ type ProbeResult struct {
 // alerts only when the endpoint has been `ok` before; a `down` that has never
 // been `ok` is a first contact, not a regression.
 //
-// "Has been ok" is read from the previous health OR from last_ok_at, and the
-// second half matters: if the last probe before the failure saw `warming`, the
-// previous state is warming while the endpoint is known to have worked, and
-// keying on the previous state alone would swallow the alert for the one failure
-// an operator most needs. last_ok_at is the column that records exactly this
-// fact, so it is the evidence.
+// The `from != "down"` guard is not redundant with "has been ok": last_ok_at is
+// preserved across failures, because it is the evidence the rule needs, so a
+// sustained outage still carries a set last_ok_at. Without the guard every probe
+// of that outage would re-fire and one failure would page once per probe
+// interval. Alerting is about a transition, and a transition requires the state
+// to have moved.
+//
+// "Has been ok" is the previous health OR last_ok_at, and the second half
+// matters: if the last probe before the failure saw `warming`, the previous
+// state is warming while the endpoint is known to have worked, and keying on
+// the previous state alone would swallow the alert for the one failure an
+// operator most needs. It is the transition that bounds the alert; the history
+// only decides whether this transition is a regression.
 //
 // from is the health stored before the write and to is the health being written.
 // Both are the schema's vocabulary, not provider.Health, so a row a hand edit
 // left in an unexpected state still compares honestly.
 func ProbeAlert(from string, lastOKAt *int64, to string) bool {
-	if to != "down" {
+	if to != "down" || from == "down" {
 		return false
 	}
 	return from == "ok" || (lastOKAt != nil && *lastOKAt > 0)
 }
 
 // probeTarget is the endpoint row the probe needs before it can ask anything:
-// the adapter's connection, the credential's name, and the declared reach.
+// the adapter's connection and the declared reach. There is deliberately no
+// credential field: the probe sends none (see the header).
 type probeTarget struct {
 	id       string
 	name     string
 	provider string
 	baseURL  string
-	authRef  string
 	reach    string
 }
 
@@ -161,9 +195,9 @@ func ProbeEndpoint(ctx context.Context, db *sql.DB, clock Clock, reg *provider.R
 func loadProbeTarget(ctx context.Context, db *sql.DB, id string) (probeTarget, error) {
 	var t probeTarget
 	err := db.QueryRowContext(ctx,
-		`SELECT id, name, provider, base_url, COALESCE(auth_ref,''), reach
+		`SELECT id, name, provider, base_url, reach
 		   FROM endpoints WHERE id=?`, id).
-		Scan(&t.id, &t.name, &t.provider, &t.baseURL, &t.authRef, &t.reach)
+		Scan(&t.id, &t.name, &t.provider, &t.baseURL, &t.reach)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return probeTarget{}, fmt.Errorf("endpoint %s: %w", id, sql.ErrNoRows)
@@ -178,16 +212,14 @@ func loadProbeTarget(ctx context.Context, db *sql.DB, id string) (probeTarget, e
 // probe determined nothing about this endpoint": the caller went away, or a
 // provider returned a state the schema does not have. Everything the endpoint
 // itself did becomes a state (decisions 1 and 2).
+//
+// No credential is resolved anywhere in this path, on purpose: see the
+// credential-free note in this file's header. A 401 or 403 therefore arrives as
+// provider.HealthAuthFailed with a nil error — the endpoint answered, the gate
+// works, and the probe has nothing to show it — which is a state, not a
+// failure to determine one.
 func observe(ctx context.Context, clock Clock, reg *provider.Registry, t probeTarget) (provider.Health, string, *int64, error) {
-	apiKey, err := probeCredential(t)
-	if err != nil {
-		// A row naming a secret this process does not hold cannot authenticate.
-		// Saying so costs no round trip and is more actionable than the 401 it
-		// would earn; it is the same family as a construction failure (decision
-		// 2), so it is recorded the same way.
-		return provider.HealthDown, err.Error(), nil, nil
-	}
-	p, err := newProber(reg, t, apiKey)
+	p, err := newProber(reg, t)
 	if err != nil {
 		return provider.HealthDown, err.Error(), nil, nil
 	}
@@ -220,36 +252,23 @@ func observe(ctx context.Context, clock Clock, reg *provider.Registry, t probeTa
 	return health, reason, latency, nil
 }
 
-// probeCredential resolves endpoints.auth_ref, which is the *name* of a secret,
-// never the secret (spec §7). The probe runs in the manager, so the environment
-// it reads is the manager's; a manager started without the secret it needs says
-// so plainly rather than reporting every keyed endpoint as auth_failed.
-func probeCredential(t probeTarget) (string, error) {
-	if t.authRef == "" {
-		return "", nil
-	}
-	key := os.Getenv(t.authRef)
-	if key == "" {
-		return "", fmt.Errorf("auth_ref %q names a secret that is not set in the manager's environment", t.authRef)
-	}
-	return key, nil
-}
-
 // newProber builds the adapter for one endpoint row. Construction is where a
 // bad base URL, an unknown provider or a provider that rejects its own
 // configuration becomes visible, and it is deliberately not an error return: an
 // adapter that cannot be built cannot be probed, which is a thing the operator
 // needs to see on GET /admin/endpoints (decision 2).
-func newProber(reg *provider.Registry, t probeTarget, apiKey string) (provider.Provider, error) {
+func newProber(reg *provider.Registry, t probeTarget) (provider.Provider, error) {
 	if reg == nil {
 		// A server wired without a registry can build nothing. Failing closed
 		// mirrors checkProviderRegistered, which accepts no name without one.
 		return nil, errors.New("no provider registry is configured, so no adapter can be built")
 	}
+	// APIKey is deliberately unset. Every adapter sends no Authorization header
+	// when the key is empty (openai.go), which is the property this path depends
+	// on: the probe must not turn a row's auth_ref into the manager's own secret.
 	p, err := reg.New(provider.Config{
 		Provider: t.provider,
 		BaseURL:  t.baseURL,
-		APIKey:   apiKey,
 		Reach:    t.reach,
 		Timeout:  probeTimeout,
 	})
@@ -276,7 +295,9 @@ func reasonForHealth(h provider.Health) (string, bool) {
 	return "", false
 }
 
-// recordProbe writes the observation and its event in one transaction.
+// recordProbe writes the observation and its event in one transaction. The
+// event's actor is "probe", not "admin": the route is only the first caller, and
+// a scheduled probe must not append events that claim a human acted.
 //
 // The previous state is read inside the transaction rather than taken from the
 // read that built the adapter: the transition, and therefore the alert, must be
@@ -333,7 +354,7 @@ func recordProbe(ctx context.Context, db *sql.DB, clock Clock, t probeTarget, he
 		return ProbeResult{}, fmt.Errorf("record probe of endpoint %s: the update matched no row", t.id)
 	}
 
-	if err := AppendEvent(ctx, tx, clock, "admin", "endpoint", t.id, probeEventType, map[string]any{
+	if err := AppendEvent(ctx, tx, clock, probeActor, "endpoint", t.id, probeEventType, map[string]any{
 		"previous_health": previous,
 		"health":          string(health),
 		"health_reason":   reason,
