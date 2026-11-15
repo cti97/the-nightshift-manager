@@ -7,7 +7,7 @@ import "errors"
 // never parses a message; an adapter wraps them with its own context.
 //
 // The retry policy — which classes are worth retrying — is deliberately not
-// encoded here. It is Task 6's, and the whole point of keeping it separate is
+// encoded here: it is retry.go's, and the whole point of keeping it separate is
 // that context_overflow and auth must not be retried even though transport and
 // server_error must (design §10, §16).
 //
