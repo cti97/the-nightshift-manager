@@ -143,7 +143,7 @@ CREATE TABLE runs (
   model_id          TEXT REFERENCES models(id),
   started_at        INTEGER NOT NULL,
   ended_at          INTEGER,
-  status            TEXT NOT NULL,      -- running | ok | error | lost | escalated
+  status            TEXT NOT NULL,      -- claimed | running | ok | error | lost | abandoned | escalated
   input_tokens      INTEGER DEFAULT 0,
   output_tokens     INTEGER DEFAULT 0,
   cost_estimate     REAL DEFAULT 0,
@@ -327,9 +327,15 @@ degradation).
 arithmetic is server-side.
 
 **Reaper** (every 30s):
-- lease expired, no unfinished run → requeue, **attempt unchanged** (no tokens spent)
-- lease expired, unfinished run → run `lost`, requeue with `attempt+1`
+- lease expired, run still `claimed` → requeue, **attempt unchanged**, run `abandoned` (no tokens spent)
+- lease expired, run `running` → run `lost`, requeue with `attempt+1`
 - `attempt > max_attempts` → `failed`, event, dashboard card. Never auto-retried.
+
+That distinction is the reason `POST /runs/:id/start` exists. A node that claims work and dies
+before starting has spent nothing; a node that started and died has spent tokens and, more
+importantly, may have had side effects. Without a `claimed → running` transition the board
+cannot tell those apart, and either innocent claims burn attempts or dead runs get retried as if
+they were free.
 
 ## 9. Placement
 
@@ -544,6 +550,7 @@ synonym for `lost` and the board stops being believed.
 POST /nodes/register           {name, role, provides_declared, reach_classes, concurrency}
 POST /nodes/heartbeat          {status, provides_live, reach_classes, free_slots}
 POST /claim                    {node_id, free_slots} -> [items]
+POST /runs/:id/start           {} — the node has begun executing; claimed → running
 POST /runs/:id/report          {status, result_summary, tokens, artifacts, error}
 POST /runs/:id/checkpoint      {declared_progress, state, artifacts}
 POST /runs/:id/approval        {action, reason, options}
