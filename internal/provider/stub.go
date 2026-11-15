@@ -115,15 +115,9 @@ func conformanceFailure(model string) error {
 	return nil
 }
 
-// EstimateTokens is the package's default input-token heuristic: about four
-// bytes per token, plus a fixed overhead per chat turn and per tool definition.
-// It is additive by construction, so growing any field can never lower the
-// result — the property the budget channel relies on when it reserves at 1.2×
-// before sending. It counts input only: MaxTokens caps the reply and is not
-// sent input.
-//
-// Every adapter starts from this; a family with a real tokenizer may override
-// it (M2 Task 7 owns the documented contract).
+// EstimateTokens returns the package's documented default estimate (estimate.go).
+// The stub has no tokenizer to be more precise with, and a second heuristic here
+// would give the budget two numbers to disagree about.
 func (s *Stub) EstimateTokens(req Request) int { return estimateTokens(req) }
 
 // Probe reports ok while the context is live. There is no endpoint behind a
@@ -145,60 +139,4 @@ func newStubProvider(cfg Config) (Provider, error) {
 	s := NewStub(nil)
 	s.Reach = cfg.Reach
 	return s, nil
-}
-
-const (
-	// bytesPerToken is the default heuristic's ratio. English prose runs a
-	// little over four bytes per token for the families this project talks to;
-	// the ceiling division errs high, and the budget reserves above the result.
-	bytesPerToken = 4
-	// messageOverhead is the framing a chat template adds per turn: the role
-	// token and the separators around the content.
-	messageOverhead = 4
-	// toolOverhead is the framing around one tool definition, separate from the
-	// bytes of its name, description and schema.
-	toolOverhead = 8
-)
-
-// estimateTokens is the default heuristic every provider starts from. Each
-// field contributes a non-negative amount and the parts are summed, so making
-// any input longer cannot make the estimate smaller — there is no rounding
-// across fields that a longer request could tip the other way.
-func estimateTokens(req Request) int {
-	tokens := textTokens(req.System)
-	for _, m := range req.Messages {
-		tokens += messageOverhead
-		tokens += textTokens(m.Role)
-		tokens += textTokens(m.Name)
-		tokens += textTokens(m.CallID)
-		tokens += textTokens(m.Content)
-		// An assistant turn's calls are sent back on every later request in the
-		// conversation, so they are input like any other text: a large tool
-		// argument must raise the estimate or the budget under-reserves the
-		// step that replays it.
-		for _, c := range m.ToolCalls {
-			tokens += textTokens(c.ID)
-			tokens += textTokens(c.Name)
-			tokens += textTokens(string(c.Arguments))
-		}
-	}
-	for _, t := range req.Tools {
-		tokens += toolOverhead
-		tokens += textTokens(t.Name)
-		tokens += textTokens(t.Description)
-		tokens += textTokens(string(t.Schema))
-	}
-	if tokens == 0 && (req.System != "" || len(req.Messages) > 0 || len(req.Tools) > 0) {
-		// A non-empty request costs at least one token to put on the wire.
-		return 1
-	}
-	return tokens
-}
-
-// textTokens is a ceiling division: an 8-byte field is two tokens, not one.
-func textTokens(s string) int {
-	if s == "" {
-		return 0
-	}
-	return (len(s) + bytesPerToken - 1) / bytesPerToken
 }

@@ -121,6 +121,8 @@ const (
 // Provider is one model protocol. Complete returns the model's reply or an
 // error; EstimateTokens is the input-token estimate the budget reserves
 // against before sending, because most APIs report usage only afterwards.
+// estimate.go documents the default's contract, its biases and the invariants
+// an override must keep.
 //
 // Complete must call checkReach before it touches the network, and must refuse
 // a tool turn that cannot be attributed (an empty or unknown Message.CallID)

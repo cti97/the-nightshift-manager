@@ -155,10 +155,11 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (Response, error)
 }
 
 // EstimateTokens is the package's shared input-token heuristic: about four bytes
-// per token, plus a fixed overhead per chat turn and per tool definition. There
-// is no tokenizer in this package and no dependency is allowed, so inventing a
-// second heuristic for this family would buy nothing but a second number for the
-// budget to disagree with itself about.
+// per token, plus a fixed overhead per chat turn and per tool definition
+// (estimateTokens in estimate.go, where the contract and its biases are
+// documented). There is no tokenizer in this package and no dependency is
+// allowed, so inventing a second heuristic for this family would buy nothing but
+// a second number for the budget to disagree with itself about.
 func (a *Anthropic) EstimateTokens(req Request) int { return estimateTokens(req) }
 
 // Probe asks the endpoint for its model list. The four health states are the

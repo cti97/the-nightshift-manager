@@ -153,10 +153,10 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 
 // EstimateTokens is the package's shared input-token heuristic: about four
 // bytes per token, plus a fixed overhead per chat turn and per tool definition
-// (estimateTokens, which Task 7 moves into estimate.go).
-// There is no tokenizer in this package and no dependency is allowed, so
-// inventing a second heuristic for this family would buy nothing but a second
-// number for the budget to disagree with itself about.
+// (estimateTokens in estimate.go, where the contract and its biases are
+// documented). There is no tokenizer in this package and no dependency is
+// allowed, so inventing a second heuristic for this family would buy nothing
+// but a second number for the budget to disagree with itself about.
 //
 // It lands inside the conformance suite's ±40% band: the suite's oracle is 4/3
 // tokens per word of the prose it placed in the request, and this heuristic runs
