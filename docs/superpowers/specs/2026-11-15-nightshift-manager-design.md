@@ -207,7 +207,7 @@ CREATE TABLE messages (
 );
 
 CREATE TABLE config (
-  key               TEXT PRIMARY KEY,   -- 'daily_spend_ceiling', 'board_paused'
+  key               TEXT PRIMARY KEY,   -- 'daily_spend_ceiling', 'board_paused', 'spend_ceiling_paused'
   value             TEXT NOT NULL
 );
 
@@ -361,9 +361,12 @@ day the work was issued; `ended_at` is nullable). The ceiling is checked inside 
 transaction: at or above it, `Claim` issues nothing and the board records itself `paused` with a
 reason naming the ceiling, in the same transaction as the event. A ceiling of `0` is unlimited
 and is the default. Because the pause is a projection of the ledger, raising the ceiling above
-today's spend (or a new UTC day) resumes the board with no separate "clear" action; a
-`board_paused` value the ceiling did not write is an operator's pause and is never touched. A
-paused board keeps heartbeating, reaping and reporting — only issuance stops.
+today's spend (or a new UTC day) resumes the board with no separate "clear" action. The two
+pause owners get two keys: `board_paused` is the operator's (§5) and this code never writes,
+rewrites or clears it, while `spend_ceiling_paused` is the ceiling's own recorded projection.
+Ownership is a property of the key and never of the text, so an operator who edits the pause
+message the board displays cannot inadvertently hand their stop to the arithmetic. A paused
+board keeps heartbeating, reaping and reporting — only issuance stops.
 
 **Capabilities are dynamic.** A laptop that has driven to the office can no longer reach
 `lan:home-nas`, and its `provides_live` says so on the next heartbeat (15s). Placement uses

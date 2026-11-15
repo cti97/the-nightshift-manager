@@ -41,6 +41,11 @@ var migrations = []migration{
 	// Migration 3 (M2 Task 13): the runs(started_at) index the daily spend
 	// ledger reads through on every claim. M4 appends version 4 with the
 	// watches tables; the version below follows from the list.
+	//
+	// Upgrade note: this migration does not backfill runs.cost_estimate. Runs
+	// settled before a mid-day upgrade carry 0, so the day of the upgrade
+	// under-counts its spend until UTC midnight. That is the frozen-ledger rule
+	// working as designed — history is not recomputed — not a migration bug.
 	{version: 3, script: schema3},
 }
 

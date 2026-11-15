@@ -35,14 +35,24 @@ const (
 	// an un-configured board runs.
 	configDailySpendCeiling = "daily_spend_ceiling"
 
-	// configBoardPaused records the board's refusal to issue work. A value this
-	// package wrote is prefixed with pausePrefixSpendCeiling and is managed by
-	// the ceiling's own reconciliation; any other value is an operator's pause
-	// and is never rewritten or cleared here. Same key, different owners, and
-	// the prefix is what tells them apart (spec §5 lists board_paused in the
-	// config table's own comment as an operator-writable key).
-	configBoardPaused       = "board_paused"
-	pausePrefixSpendCeiling = "spend_ceiling: "
+	// configBoardPaused is the OPERATOR's pause: spec §5 lists it as an
+	// operator-writable key, and this package never writes it, rewrites it or
+	// deletes it. Any non-empty value stops issuance.
+	//
+	// Ownership is a property of the KEY, never of the text. An earlier draft
+	// of this file inferred ownership from a "spend_ceiling: " prefix inside
+	// this key, which meant an operator who edited the pause text the board
+	// itself displays — "spend_ceiling: hold for the deploy" — handed their
+	// pause to the arithmetic, and the next claim lifted it. A stop a person
+	// typed must not be clearable by a sum.
+	configBoardPaused = "board_paused"
+
+	// configCeilingPaused is the ceiling's own record, and only this package
+	// touches it. It is a materialised projection of the ledger (the ceiling
+	// reaches, so the board refuses work), kept on disk so the state is visible
+	// to `sqlite3` and survives a restart, and rewritten or deleted by
+	// reconcileCeiling whenever the projection changes.
+	configCeilingPaused = "spend_ceiling_paused"
 
 	// pauseBySpendCeiling / pauseByOperator say whose pause is in force, so the
 	// dashboard can tell "the ceiling stopped this" from "a human stopped it".
@@ -76,6 +86,9 @@ const (
 // ISSUED — because that is the decision the ceiling gates, and started_at is
 // never NULL while ended_at is. The consequence is stated where it matters: work
 // issued at 23:59 and settled at 00:01 counts against the earlier day.
+//
+// The day is a half-open interval, [start, start+86400): see sumSpend for why
+// the upper bound exists.
 func SpendDay(now int64) (start int64, label string) {
 	start = now - now%secondsPerDay
 	return start, time.Unix(start, 0).UTC().Format("2006-01-02")
@@ -264,39 +277,52 @@ func reconcileCeiling(ctx context.Context, q spendTx, clock Clock) (paused bool,
 	}
 	over := ceilingReached(ceiling, st.Spent)
 
-	raw, err := readBoardPause(ctx, q)
+	operator, err := readConfigValue(ctx, q, configBoardPaused)
 	if err != nil {
 		return false, "", err
 	}
-	paused, reason, _ = effectivePause(over, raw, ceiling, st.Spent, day)
+	mine, err := readConfigValue(ctx, q, configCeilingPaused)
+	if err != nil {
+		return false, "", err
+	}
+	paused, reason, _ = effectivePause(over, operator, ceiling, st.Spent, day)
 
+	// The two keys have independent lifecycles: the operator's is never in this
+	// switch at all, and the ceiling's is written or cleared by whether the
+	// ceiling reaches. Doing it this way means a board paused by a person can
+	// still record that the ceiling is *also* reached, and unpausing either one
+	// leaves the other's state intact.
 	switch {
-	case raw != "" && !isCeilingPause(raw):
-		// An operator's pause. It is the authority on stopping work, and this
-		// package neither rewrites nor clears it.
-	case over && raw == "":
-		value := pausePrefixSpendCeiling + pauseReason(ceiling, st.Spent, day)
+	case over && mine == "":
 		if _, err := q.ExecContext(ctx,
 			`INSERT INTO config (key,value) VALUES (?,?)
 			 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-			configBoardPaused, value); err != nil {
+			configCeilingPaused, pauseReason(ceiling, st.Spent, day)); err != nil {
 			return false, "", fmt.Errorf("record the spend pause: %w", err)
 		}
 		if err := AppendEvent(ctx, q, clock, "system", "board", "board", "paused",
-			map[string]any{"reason": reason, "spent": st.Spent, "ceiling": ceiling, "day": day}); err != nil {
+			map[string]any{"source": pauseBySpendCeiling, "reason": pauseReason(ceiling, st.Spent, day),
+				"spent": st.Spent, "ceiling": ceiling, "day": day}); err != nil {
 			return false, "", err
 		}
 	case over:
-		// Already paused by the ceiling. The stored reason records the report
-		// that tripped it, which is history; rewriting it every claim would
-		// make the record follow the total instead of the trip.
-	case raw != "":
+		// Already recorded. The stored reason is the report that tripped it,
+		// which is history; rewriting it every claim would make the record
+		// follow the total instead of the trip.
+	case mine != "":
 		if _, err := q.ExecContext(ctx,
-			`DELETE FROM config WHERE key=?`, configBoardPaused); err != nil {
+			`DELETE FROM config WHERE key=?`, configCeilingPaused); err != nil {
 			return false, "", fmt.Errorf("clear the spend pause: %w", err)
 		}
-		if err := AppendEvent(ctx, q, clock, "system", "board", "board", "resumed",
-			map[string]any{"spent": st.Spent, "ceiling": ceiling, "day": day, "was": raw}); err != nil {
+		payload := map[string]any{"source": pauseBySpendCeiling, "spent": st.Spent,
+			"ceiling": ceiling, "day": day, "was": mine}
+		if operator != "" {
+			// The ceiling's projection cleared, but the board is still refusing
+			// work because a person stopped it. Saying "resumed" without this
+			// would be the log lying about a state the view reports correctly.
+			payload["still_paused_by"] = pauseByOperator
+		}
+		if err := AppendEvent(ctx, q, clock, "system", "board", "board", "resumed", payload); err != nil {
 			return false, "", err
 		}
 	}
@@ -317,11 +343,11 @@ func pauseState(ctx context.Context, db *sql.DB, clock Clock) (paused bool, reas
 	if err != nil {
 		return false, "", "", err
 	}
-	raw, err := readBoardPause(ctx, db)
+	operator, err := readConfigValue(ctx, db, configBoardPaused)
 	if err != nil {
 		return false, "", "", err
 	}
-	paused, reason, by = effectivePause(ceilingReached(ceiling, st.Spent), raw, ceiling, st.Spent, day)
+	paused, reason, by = effectivePause(ceilingReached(ceiling, st.Spent), operator, ceiling, st.Spent, day)
 	return paused, reason, by, nil
 }
 
@@ -329,10 +355,14 @@ func pauseState(ctx context.Context, db *sql.DB, clock Clock) (paused bool, reas
 // an operator's pause always stops work; a ceiling's pause stops work only while
 // the ceiling is reached. Deriving the ceiling's half is what makes a corrected
 // ledger resume the board without anybody clearing a flag.
-func effectivePause(over bool, raw string, ceiling, spent float64, day string) (paused bool, reason, by string) {
+//
+// operatorReason comes from configBoardPaused, which only a human writes. Its
+// CONTENT is irrelevant: any non-empty value is a stop, so text an operator
+// copied from the board's own pause message is still an operator's stop.
+func effectivePause(over bool, operatorReason string, ceiling, spent float64, day string) (paused bool, reason, by string) {
 	switch {
-	case raw != "" && !isCeilingPause(raw):
-		return true, raw, pauseByOperator
+	case operatorReason != "":
+		return true, operatorReason, pauseByOperator
 	case over:
 		return true, pauseReason(ceiling, spent, day), pauseBySpendCeiling
 	default:
@@ -345,11 +375,6 @@ func effectivePause(over bool, raw string, ceiling, spent float64, day string) (
 // that was never configured, and an un-configured board must run.
 func ceilingReached(ceiling, spent float64) bool {
 	return ceiling > 0 && spent >= ceiling
-}
-
-// isCeilingPause says whether the stored pause value is one this package wrote.
-func isCeilingPause(raw string) bool {
-	return strings.HasPrefix(raw, pausePrefixSpendCeiling)
 }
 
 // pauseReason is the sentence an operator reads. It names the ceiling, the
@@ -367,7 +392,14 @@ func formatAmount(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
-// sumSpend is the ledger query: one pass over the runs issued since dayStart.
+// sumSpend is the ledger query: one pass over the runs issued during the day
+// that starts at dayStart.
+//
+// The window is half-open, [dayStart, dayStart+86400). The upper bound is not
+// decoration: `started_at >= dayStart` alone means "since midnight", so a clock
+// that stepped backwards across midnight would fold yesterday's rows into today
+// and trip the ceiling twice for one day's money. A half-open window makes the
+// calendar day the comment claims, whatever the clock does.
 //
 // Every run counts, whatever its status, because an in-flight run carries no
 // tokens and no cost yet and therefore contributes zero — filtering by status
@@ -388,7 +420,7 @@ func sumSpend(ctx context.Context, q spendReader, dayStart int64) (SpendStatus, 
 		                          AND input_tokens+output_tokens+reserved_tokens > 0
 		                         THEN 1 ELSE 0 END),0)
 		  FROM runs
-		 WHERE started_at >= ?`, dayStart).
+		 WHERE started_at >= ? AND started_at < ?`, dayStart, dayStart+secondsPerDay).
 		Scan(&runs, &in, &out, &reserved, &st.Spent, &unpriced)
 	if err != nil {
 		return SpendStatus{}, fmt.Errorf("sum today's runs: %w", err)
@@ -406,9 +438,9 @@ func spendByModel(ctx context.Context, db *sql.DB, dayStart int64) ([]ModelSpend
 		       COALESCE(SUM(r.cost_estimate),0)
 		  FROM runs r
 		  LEFT JOIN models m ON m.id = r.model_id
-		 WHERE r.started_at >= ?
+		 WHERE r.started_at >= ? AND r.started_at < ?
 		 GROUP BY r.model_id
-		 ORDER BY COALESCE(m.model_id,'')`, dayStart)
+		 ORDER BY COALESCE(m.model_id,'')`, dayStart, dayStart+secondsPerDay)
 	if err != nil {
 		return nil, fmt.Errorf("spend by model: %w", err)
 	}
@@ -436,14 +468,9 @@ func spendByModel(ctx context.Context, db *sql.DB, dayStart int64) ([]ModelSpend
 // package and by hand, so a broken value is a bug or a raw-SQL edit, and both
 // want to be seen.
 func readCeiling(ctx context.Context, q spendReader) (float64, error) {
-	var raw string
-	err := q.QueryRowContext(ctx,
-		`SELECT value FROM config WHERE key=?`, configDailySpendCeiling).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
+	raw, err := readConfigValue(ctx, q, configDailySpendCeiling)
 	if err != nil {
-		return 0, fmt.Errorf("read %s: %w", configDailySpendCeiling, err)
+		return 0, err
 	}
 	return parseAmount(configDailySpendCeiling, raw)
 }
@@ -463,15 +490,16 @@ func parseAmount(key, raw string) (float64, error) {
 	return v, nil
 }
 
-// readBoardPause reads the recorded pause, if any.
-func readBoardPause(ctx context.Context, q spendReader) (string, error) {
+// readConfigValue reads one config row. Absent is the empty string: every key
+// this file reads spells its "not configured" state that way.
+func readConfigValue(ctx context.Context, q spendReader, key string) (string, error) {
 	var raw string
-	err := q.QueryRowContext(ctx, `SELECT value FROM config WHERE key=?`, configBoardPaused).Scan(&raw)
+	err := q.QueryRowContext(ctx, `SELECT value FROM config WHERE key=?`, key).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", configBoardPaused, err)
+		return "", fmt.Errorf("read config %s: %w", key, err)
 	}
 	return raw, nil
 }

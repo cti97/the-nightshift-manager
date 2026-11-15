@@ -909,3 +909,151 @@ func TestWhySaysTheBoardIsPausedAndWhy(t *testing.T) {
 		t.Fatalf("blocked_reason = %q, want the ceiling named", ex.BlockedReason)
 	}
 }
+
+// TestAPauseTypedLikeTheCeilingsIsStillTheOperators pins the ownership rule
+// (review finding 1). Ownership is a property of the key, not of the text: the
+// most plausible operator pause is the board's own message edited to say what
+// they mean, and an earlier draft treated a "spend_ceiling: " prefix as proof
+// the ceiling owned the row — so an operator's stop was lifted by the next
+// arithmetic check.
+func TestAPauseTypedLikeTheCeilingsIsStillTheOperators(t *testing.T) {
+	db, clock := newTestDB(t)
+	node, _ := seedClaimableBoard(t, db, clock)
+	mustCreateItem(t, db, clock, "work during a hold")
+
+	_, day := SpendDay(clock.Now())
+	// Deliberately the exact text this package writes, with the reason edited.
+	typed := "spend_ceiling: daily spend ceiling 0.5 reached: hold for the deploy (UTC " + day + ")"
+	if _, err := db.Exec(`INSERT INTO config (key,value) VALUES ('board_paused',?)`, typed); err != nil {
+		t.Fatalf("write an operator pause: %v", err)
+	}
+
+	if got := mustClaim(t, db, clock, node, 1); len(got) != 0 {
+		t.Fatalf("claimed %d items during an operator's hold, want 0", len(got))
+	}
+	st := mustSpend(t, db, clock)
+	if !st.Paused || st.PausedBy != pauseByOperator || st.PauseReason != typed {
+		t.Fatalf("pause state = %+v, want the operator's hold reported verbatim", st)
+	}
+
+	// Raise the ceiling: this un-pauses a ceiling pause and must not touch this
+	// one. Without the two-key rule, the raise below would resume the board.
+	mustSetCeiling(t, db, clock, 1000)
+	if got := mustClaim(t, db, clock, node, 1); len(got) != 0 {
+		t.Fatalf("claimed %d items after raising the ceiling, want 0: the ceiling lifted an operator's pause", len(got))
+	}
+	if st := mustSpend(t, db, clock); !st.Paused || st.PausedBy != pauseByOperator {
+		t.Fatalf("pause state after raising the ceiling = %+v, want the operator's hold intact", st)
+	}
+	var value string
+	if err := db.QueryRow(`SELECT value FROM config WHERE key='board_paused'`).Scan(&value); err != nil {
+		t.Fatalf("read board_paused: %v", err)
+	}
+	if value != typed {
+		t.Fatalf("board_paused = %q, want the operator's value untouched", value)
+	}
+}
+
+// TestTheCeilingWritesItsOwnKeyNotTheOperatorsKey pins the other half of the
+// ownership rule: the ceiling's projection lives in its own config row, so a
+// human opening the config table (or a future operator-pause route) can tell
+// which stops came from arithmetic and which came from a person.
+func TestTheCeilingWritesItsOwnKeyNotTheOperatorsKey(t *testing.T) {
+	db, clock := newTestDB(t)
+	node, _ := seedClaimableBoard(t, db, clock)
+	spentItem := mustCreateItem(t, db, clock, "spent")
+	dayStart, _ := SpendDay(clock.Now())
+	mustSetCeiling(t, db, clock, 1)
+	seedRunForTest(t, db, node, spentItem, "run-spent", 1, dayStart, 1)
+	if got := mustClaim(t, db, clock, node, 1); len(got) != 0 {
+		t.Fatalf("claimed %d items at the ceiling, want 0", len(got))
+	}
+
+	var mine int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM config WHERE key='spend_ceiling_paused'`).Scan(&mine); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if mine != 1 {
+		t.Fatalf("spend_ceiling_paused rows = %d, want 1", mine)
+	}
+	var operators int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM config WHERE key='board_paused'`).Scan(&operators); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if operators != 0 {
+		t.Fatalf("board_paused rows = %d after a ceiling pause, want 0: the ceiling wrote the operator's key", operators)
+	}
+}
+
+// TestSpendDayWindowHasAnUpperBound pins review finding 2: "since midnight" is
+// not "today". A clock that steps backwards across midnight would otherwise fold
+// the new day's rows into the old one and spend the same money twice.
+func TestSpendDayWindowHasAnUpperBound(t *testing.T) {
+	db, clock := newTestDB(t)
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	dayStart, _ := SpendDay(clock.Now())
+	yesterdayItem := mustCreateItem(t, db, clock, "yesterday")
+	todayItem := mustCreateItem(t, db, clock, "today")
+	tomorrowItem := mustCreateItem(t, db, clock, "tomorrow")
+
+	seedRunForTest(t, db, node, yesterdayItem, "run-yesterday", 1, dayStart-1, 9)
+	seedRunForTest(t, db, node, todayItem, "run-today", 1, dayStart, 0.5)
+	seedRunForTest(t, db, node, tomorrowItem, "run-tomorrow", 1, dayStart+secondsPerDay, 7)
+
+	st := mustSpend(t, db, clock)
+	if st.Spent != 0.5 || st.RunCount != 1 {
+		t.Fatalf("spent/runs = %v/%d, want 0.5 and 1 (only the run inside today's half-open window)", st.Spent, st.RunCount)
+	}
+	if len(st.ByModel) != 1 || st.ByModel[0].Runs != 1 {
+		t.Fatalf("by_model = %+v, want one entry covering exactly today's run", st.ByModel)
+	}
+
+	// Now step the clock back to 23:59 of the previous day, which is the shape a
+	// backwards clock correction produces: the window is yesterday's, and today's
+	// row is in its FUTURE. Without the upper bound it would be counted again.
+	clock.Set(dayStart - 60)
+	st = mustSpend(t, db, clock)
+	if st.Spent != 9 || st.RunCount != 1 {
+		t.Fatalf("spent/runs with the clock one minute before midnight = %v/%d, want 9 and 1: today's row folded into yesterday", st.Spent, st.RunCount)
+	}
+}
+
+// TestWhyComposesAPauseWithAPlacementFailure pins review finding 3: an item can
+// be unplaceable AND on a paused board, and /why must report both. Overriding
+// the placement failure with the pause makes the second cause appear only after
+// the operator raises the ceiling — an explanation that changes as you act on it.
+func TestWhyComposesAPauseWithAPlacementFailure(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node, _ := seedClaimableBoard(t, db, clock) // provides agentic; nothing provides gpu
+	itemID, err := CreateItem(ctx, db, clock, CreateItemRequest{
+		Title: "needs a gpu", Brief: "b", Needs: []string{"agentic", "gpu"},
+	})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	spentItem := mustCreateItem(t, db, clock, "spent")
+	dayStart, _ := SpendDay(clock.Now())
+	mustSetCeiling(t, db, clock, 1)
+	seedRunForTest(t, db, node, spentItem, "run-spent", 1, dayStart, 1)
+	if got := mustClaim(t, db, clock, node, 1); len(got) != 0 {
+		t.Fatalf("claimed %d items at the ceiling, want 0", len(got))
+	}
+
+	ex, err := Explain(ctx, db, clock, itemID)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if !ex.Paused {
+		t.Fatal("explanation does not report the pause")
+	}
+	if ex.Placed {
+		t.Fatal("explanation says the gpu item is placeable")
+	}
+	if !strings.Contains(ex.BlockedReason, "no eligible candidate") || !strings.Contains(ex.BlockedReason, "gpu") {
+		t.Fatalf("blocked_reason = %q, want the placement failure named", ex.BlockedReason)
+	}
+	if !strings.Contains(ex.BlockedReason, "not issuing work") {
+		t.Fatalf("blocked_reason = %q, want the pause named as well", ex.BlockedReason)
+	}
+}

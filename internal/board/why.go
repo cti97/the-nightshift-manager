@@ -70,17 +70,27 @@ func Explain(ctx context.Context, db *sql.DB, clock Clock, itemID string) (Expla
 		ex.BlockedReason = d.Reason
 	}
 
-	// A pause outranks placement as the reason a queued item is not running:
-	// the placement verdict is still reported (Placed/Reason), but a queued
-	// item the board will not issue needs to say that, or the operator reads
-	// "placed: true" and goes looking for a bug in placement.
-	paused, pauseReason, _, err := pauseState(ctx, db, clock)
+	// The pause is the reason a queued item is not running, whether or not it
+	// is placeable: without this, /why answers "placed: true" for an item the
+	// board will never issue and the operator goes looking for a placement bug
+	// that does not exist.
+	paused, pauseWhy, _, err := pauseState(ctx, db, clock)
 	if err != nil {
 		return ex, err
 	}
-	ex.Paused, ex.PauseReason = paused, pauseReason
+	ex.Paused, ex.PauseReason = paused, pauseWhy
 	if paused && (ex.Status == "queued" || ex.Status == "needs_approval") {
-		ex.BlockedReason = "the board is not issuing work: " + pauseReason
+		// Compose, do not override: an item can be unplaceable AND on a paused
+		// board, and replacing the placement failure with the pause would make
+		// the second cause appear only after the operator raises the ceiling —
+		// the answer changing under the person asking is what a read-only
+		// explanation must not do.
+		const pauseText = "the board is not issuing work: "
+		if d.OK {
+			ex.BlockedReason = pauseText + pauseWhy
+		} else {
+			ex.BlockedReason = d.Reason + "; " + pauseText + pauseWhy
+		}
 	}
 	return ex, nil
 }
