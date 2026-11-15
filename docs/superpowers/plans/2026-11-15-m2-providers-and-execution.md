@@ -164,22 +164,54 @@ Six checks, each its own subtest:
 
 ---
 
-## Task 3–5: The three adapters
+## Task 3: OpenAI-compatible provider
 
-| Provider | Shape | Must handle |
-|---|---|---|
-| `openai` | `POST /v1/chat/completions` with `tools`, `tool_calls` in the response | `tool_choice`, assistant tool-call messages, tool results as `role:"tool"` |
-| `ollama` | the OpenAI shape plus `GET /api/tags` for `Probe` | a model loading on first request → `warming`, not `down` |
-| `anthropic` | `POST /v1/messages`, `system` as a top-level field, `tools` with `input_schema`, `tool_use`/`tool_result` content blocks | `anthropic-version` header, `max_tokens` required, `stop_reason:"tool_use"` |
+**Files:** `internal/provider/openai.go` + `openai_test.go`.
 
-**Acceptance for each:** passes `provider.Conformance` against an `httptest` server that speaks that shape, plus one adapter-specific test:
-- openai: a request with tools sends a `tools` array with `function` objects, and a response with `tool_calls` is decoded into `Call`s with arguments preserved byte-for-byte.
-- ollama: `Probe` on a server returning 503 for a load-in-progress model yields `warming`.
-- anthropic: `system` goes in a top-level field, never as a message; a `tool_result` block is sent as a user-role content block.
+`POST {base}/v1/chat/completions` with `tools`. Must handle `tool_choice`, assistant messages
+carrying `tool_calls`, and tool results sent as `role:"tool"` with the matching `tool_call_id`.
 
-**Do not** let an adapter special-case `llama.cpp` or `vLLM`. They are `openai` rows with a different `base_url`.
+Covers OpenAI, `llama-server`, vLLM, LM Studio, Groq and OpenRouter. **Do not** special-case any
+of them — they are `openai` rows with different `base_url`s.
 
----
+**Acceptance:**
+- passes `provider.Conformance` against an `httptest` server speaking this shape
+- `TestOpenAISendsToolsAsFunctionObjects` — the request body carries a `tools` array of
+  `{"type":"function","function":{...}}`, not the provider interface's own shape
+- `TestOpenAIDecodesToolCallsVerbatim` — `arguments` survives decode byte-for-byte, because the
+  tool layer will hand it back to `json.Unmarshal`
+- `TestOpenAIMapsAnErrorBodyToATaxonomySentinel` — a 429 body becomes `ErrRateLimited`
+
+## Task 4: Ollama provider
+
+**Files:** `internal/provider/ollama.go` + `ollama_test.go`.
+
+The OpenAI shape plus `GET /api/tags` for `Probe` and model listing.
+
+**Acceptance:**
+- passes `provider.Conformance`
+- `TestOllamaReportsWarmingWhileAModelLoads` — a 503 whose body indicates loading yields
+  `Health.warming`, **not** `down`. This is the distinction the design's health states exist for:
+  a llama.cpp or Ollama server that is loading a model is not broken, and marking it `down`
+  removes it from placement for the whole load.
+- `TestOllamaProbeListsModelsFromTags`
+
+## Task 5: Anthropic provider
+
+**Files:** `internal/provider/anthropic.go` + `anthropic_test.go`.
+
+`POST {base}/v1/messages`. `system` is a **top-level field**, never a message. Tools carry
+`input_schema`. Tool use arrives as `tool_use` content blocks and tool results go back as
+`tool_result` blocks inside a **user** message. Requires `anthropic-version` and `max_tokens`.
+
+**Acceptance:**
+- passes `provider.Conformance`
+- `TestAnthropicKeepsSystemOutOfTheMessages` — the request has a top-level `system` and no
+  `role:"system"` entry
+- `TestAnthropicSendsToolResultsAsUserBlocks` — a tool result is a `tool_result` block in a user
+  message, not an OpenAI-shaped `role:"tool"` message
+- `TestAnthropicDecodesToolUseBlocks` — a `tool_use` block becomes a `Call` with its `id` and
+  `input` preserved
 
 ## Task 6: Error taxonomy → retry policy
 
