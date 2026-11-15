@@ -21,6 +21,18 @@ const (
 // a time; the node's concurrency on the board is a separate, server-side fact.
 const freeSlots = 1
 
+// Report is the one call the loop retries. board.Report is idempotent by design
+// — the first report wins and later ones are answered with applied=false — so a
+// retry cannot settle a run twice, while a dropped report would discard a
+// completed run and let the reaper charge the item for it again. A few hundred
+// milliseconds of retries is the cheaper trade.
+//
+// reportAttempts counts total tries, not retries.
+const (
+	reportAttempts = 3
+	reportBackoff  = 100 * time.Millisecond
+)
+
 type Config struct {
 	BaseURL  string
 	Token    string
@@ -229,8 +241,34 @@ func (a *Agent) execute(ctx context.Context, it board.ClaimedItem) {
 		req.Status = "error"
 		req.Error = runErr.Error()
 	}
-	if _, err := a.c.Report(ctx, it.RunID, req); err != nil {
-		a.logf("report run %s: %v", it.RunID, err)
+	a.report(ctx, it.RunID, req)
+}
+
+// report sends the run's result, retrying a bounded number of times. Only a
+// failed report is retried; Claim and Start are not, because neither is
+// idempotent and a retry could double-claim or start a settled run.
+//
+// The wait is cancellable: if shutdown arrives mid-retry, the report is
+// abandoned like any other interrupted step and the reaper settles the run.
+func (a *Agent) report(ctx context.Context, runID string, req board.ReportRequest) {
+	for attempt := 1; ; attempt++ {
+		_, err := a.c.Report(ctx, runID, req)
+		if err == nil {
+			return
+		}
+		if ctx.Err() != nil { // shutdown, not a board failure
+			return
+		}
+		if attempt >= reportAttempts {
+			a.logf("report run %s: giving up after %d attempts: %v", runID, attempt, err)
+			return
+		}
+		a.logf("report run %s (attempt %d/%d): %v; retrying", runID, attempt, reportAttempts, err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reportBackoff * time.Duration(attempt)):
+		}
 	}
 }
 

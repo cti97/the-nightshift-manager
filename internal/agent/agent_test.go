@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -285,6 +286,89 @@ func TestAgentReportsExecutorFailure(t *testing.T) {
 	if !runErr.Valid || runErr.String != "model exploded" {
 		t.Fatalf("run error = %v, want %q", runErr, "model exploded")
 	}
+}
+
+// TestAgentRetriesATransientReportFailure pins the retry the board's
+// idempotency makes safe: a report lost in transit must not discard a run that
+// actually completed, or the reaper would requeue the item and charge the
+// attempt for work that succeeded.
+func TestAgentRetriesATransientReportFailure(t *testing.T) {
+	var reports atomic.Int32
+	const failFirst = 2
+	f := newFixture(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/report") && reports.Add(1) <= failFirst {
+				board.WriteError(w, http.StatusInternalServerError, "report", "transient blip")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	exec := StubExecutor{OnRun: func(item board.ClaimedItem) (Result, error) {
+		return Result{Summary: "made it"}, nil
+	}}
+	a := New(f.config(exec))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errc := startAgent(a, ctx)
+
+	waitFor(t, "item done after the retry", func() bool { return f.itemStatus(t) == "done" })
+	cancel()
+	waitAgent(t, errc, context.Canceled)
+
+	if got := reports.Load(); got != failFirst+1 {
+		t.Fatalf("report calls = %d, want %d (two failures, then success)", got, failFirst+1)
+	}
+	if got := f.runStatus(t); got != "ok" {
+		t.Fatalf("run status = %q, want ok", got)
+	}
+	var summary sql.NullString
+	if err := f.db.QueryRow(`SELECT result_summary FROM work_items WHERE id=?`, f.itemID).Scan(&summary); err != nil {
+		t.Fatalf("read item summary: %v", err)
+	}
+	if !summary.Valid || summary.String != "made it" {
+		t.Fatalf("result_summary = %v, want %q", summary, "made it")
+	}
+}
+
+// TestAgentGivesUpAfterBoundedReportRetries pins the other half: the retry is
+// bounded, so a board that refuses every report is not answered with a retry
+// loop. The run is left non-terminal for the reaper, which is the designed
+// outcome of a report that cannot be delivered.
+func TestAgentGivesUpAfterBoundedReportRetries(t *testing.T) {
+	var reports atomic.Int32
+	f := newFixture(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/report") {
+				reports.Add(1)
+				board.WriteError(w, http.StatusInternalServerError, "report", "still broken")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	exec := StubExecutor{OnRun: func(item board.ClaimedItem) (Result, error) {
+		return Result{Summary: "made it"}, nil
+	}}
+	a := New(f.config(exec))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errc := startAgent(a, ctx)
+
+	waitFor(t, "the bounded report attempts", func() bool { return reports.Load() >= reportAttempts })
+	// A further attempt would mean the retry is not bounded; the next backoff
+	// would expire well inside this window.
+	time.Sleep(500 * time.Millisecond)
+	if got := reports.Load(); got != reportAttempts {
+		t.Fatalf("report calls = %d, want %d (bounded)", got, reportAttempts)
+	}
+	if got := f.itemStatus(t); got != "running" {
+		t.Fatalf("item status = %q, want running (left for the reaper)", got)
+	}
+	cancel()
+	waitAgent(t, errc, context.Canceled)
 }
 
 // TestCancelledRunIsLeftForTheReaper pins the shutdown story: cancelling

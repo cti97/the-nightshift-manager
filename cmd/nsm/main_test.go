@@ -95,7 +95,7 @@ func TestParseAgentConfigCarriesLiveCapabilities(t *testing.T) {
 func TestParseAgentConfigWarnsOnEmptyProvides(t *testing.T) {
 	t.Setenv("NSM_NODE_TOKEN", "secret")
 	var errOut bytes.Buffer
-	cfg, ok := parseAgentConfig([]string{"--node", "n"}, &errOut)
+	cfg, ok := parseAgentConfig([]string{"--node", "n", "--reach", "host"}, &errOut)
 	if !ok {
 		t.Fatalf("parse failed: %s", errOut.String())
 	}
@@ -107,10 +107,28 @@ func TestParseAgentConfigWarnsOnEmptyProvides(t *testing.T) {
 	}
 }
 
+// TestParseAgentConfigRequiresReach pins that reach is not guessed. A default
+// of host,lan,wan claims every reach class including the ones the node may not
+// have, which lets placement hand it work it cannot actually reach.
+//
+// It goes through parseAgentConfig, not run: with the guard removed, run would
+// start the daemon and hang instead of failing, and a test that hangs is not a
+// regression test.
+func TestParseAgentConfigRequiresReach(t *testing.T) {
+	t.Setenv("NSM_NODE_TOKEN", "secret")
+	var errOut bytes.Buffer
+	if _, ok := parseAgentConfig([]string{"--node", "n", "--provides", "agentic"}, &errOut); ok {
+		t.Fatal("parse accepted a missing --reach")
+	}
+	if !strings.Contains(errOut.String(), "--reach") {
+		t.Fatalf("stderr = %q, want the missing --reach named", errOut.String())
+	}
+}
+
 func TestParseAgentConfigRejectsEmptyCapabilityEntry(t *testing.T) {
 	t.Setenv("NSM_NODE_TOKEN", "secret")
 	var errOut bytes.Buffer
-	if _, ok := parseAgentConfig([]string{"--node", "n", "--provides", "agentic,,vision"}, &errOut); ok {
+	if _, ok := parseAgentConfig([]string{"--node", "n", "--reach", "host", "--provides", "agentic,,vision"}, &errOut); ok {
 		t.Fatal("parse accepted an empty capability entry")
 	}
 	if !strings.Contains(errOut.String(), "empty entry") {

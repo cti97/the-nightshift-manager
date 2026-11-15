@@ -121,7 +121,7 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	baseURL := fs.String("board", "http://127.0.0.1:8081", "board base URL")
 	nodeID := fs.String("node", "", "node id, as registered with the board")
 	provides := fs.String("provides", "", "comma-separated live capabilities (e.g. agentic,vision)")
-	reach := fs.String("reach", "host,lan,wan", "comma-separated reach classes")
+	reach := fs.String("reach", "", "comma-separated reach classes this node can actually use (host,lan,wan)")
 	if err := fs.Parse(args); err != nil {
 		return agent.Config{}, false
 	}
@@ -142,6 +142,14 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	reaches, err := listFlag("reach", *reach)
 	if err != nil {
 		fmt.Fprintln(errOut, err)
+		return agent.Config{}, false
+	}
+	if len(reaches) == 0 {
+		// Not defaulted. Claiming a reach class the node does not have lets
+		// placement hand it work it cannot actually do; the failure then lands
+		// after the claim. Guessing capabilities is what --provides must not do
+		// either, and reach is the more dangerous of the two.
+		fmt.Fprintln(errOut, "--reach is required: name the reach classes this node can actually use (host,lan,wan)")
 		return agent.Config{}, false
 	}
 	if len(providesLive) == 0 {
