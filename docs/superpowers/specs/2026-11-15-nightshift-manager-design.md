@@ -752,6 +752,14 @@ worth adding.
     `NSM_REQUIRE_KERNEL_SANDBOX=1 go test ./internal/agent -run TestSandboxCannotReachTheHomeDirectory -v`
     before relying on the kernel layer for anything.
 
+18. **A node holds provider keys in-process while model-authored shell runs there.** The child
+    environment is scrubbed and macOS's Seatbelt profile denies process-info, so on macOS the
+    shell cannot read `/proc/<agent>/environ`. On Linux the run directory is a plain directory
+    (design §4), so a permitted shell can read that file if the kernel allows it. Closing this
+    needs real kernel confinement or not holding keys in the same process as the shell — both
+    larger than M2. The Linux node is therefore *not* a place to run untrusted model output with
+    production keys.
+
 ## 20. Distribution and release
 
 The project ships one static binary, six artifacts, and a self-hosted channel.
