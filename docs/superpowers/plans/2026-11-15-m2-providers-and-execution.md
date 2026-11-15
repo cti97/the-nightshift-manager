@@ -261,6 +261,17 @@ Routes: `POST /admin/endpoints`, `GET /admin/endpoints`, `POST /admin/models`, `
 
 ## Task 9: Health probing
 
+**Six decisions settled before the task starts**, because Tasks 4, 5 and 8 each handed one forward and they are one design conversation, not six:
+
+1. **A 2xx that is not a model list is `down`, not "hold previous health".** Task 4's rule already says a body that says nothing about health is not evidence of health; the loader's "previous good state" path contradicts it. A probe that cannot read its own answer has not probed.
+2. **A construction failure is a health state, not an error return.** If the endpoint's `base_url` or provider cannot build an adapter, the probe records `health=down` with the reason. The write path already accepts only syntactically valid URLs (Task 8), so this is the second net: a provider that exists but rejects the config at construction must be visible on `/admin/endpoints` rather than surfacing as a 500 during a probe.
+3. **`health_reason` reaches the operator through `/why`, not only through `GET /admin/endpoints`.** The candidate loader must select it. An operator asking "why is nothing running" needs "never probed" or "401 from /v1/models", not `down`.
+4. **Alerting does not key on `down` alone.** Task 4 established that an uninformative 503 is `down`, so alerting on every `down` transition false-alarms on every cold load. Rule: a transition to `down` from `ok` alerts; a `down` that has never been `ok` does not. That distinction is the whole reason the probe returns four states instead of a bool.
+5. **The probe is on demand first, scheduled second.** This task ships `POST /admin/endpoints/{id}/probe`. A schedule (every N minutes) is desirable but must not be added without decision 4's transition rule, or the board will alert on startup for every endpoint.
+6. **Created endpoints start `unknown` and are inert until probed.** Task 8 chose that deliberately. The probe endpoint is therefore not a convenience — it is the only thing that makes CRUD useful, and `POST /admin/endpoints` should tell the operator so in its response body.
+
+
+
 **Acceptance:**
 - `Probe` runs on a schedule and on demand (`POST /admin/endpoints/{id}/probe`).
 - A 503 while a model loads sets `warming` with a reason; a 401 sets `auth_failed`; a timeout sets `down`. Each is pinned by a test that would fail if the state were collapsed to `down`.
