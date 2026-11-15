@@ -80,7 +80,7 @@ CREATE TABLE endpoints (
   name              TEXT NOT NULL,
   provider          TEXT NOT NULL,      -- registry name: anthropic | openai | ollama | stub
   base_url          TEXT NOT NULL,
-  auth_ref          TEXT,               -- name of a secret in the caller's env; never the secret
+  auth_ref          TEXT,               -- NSM_PROVIDER_* provider-key name; never the secret
   reach             TEXT NOT NULL,      -- host | lan | wan
   health            TEXT NOT NULL,      -- ok | warming | down | auth_failed | unknown
   health_reason     TEXT,               -- e.g. 'model loading', '401 from /v1/models'
@@ -220,6 +220,13 @@ CREATE TABLE events (
   payload           TEXT
 );
 ```
+
+`endpoints.auth_ref` names a provider key; it never holds one. The name must sit in the
+reserved `NSM_PROVIDER_*` namespace — `NSM_PROVIDER_` followed by an uppercase name — checked
+when the endpoint is created and again by whichever process resolves it, so `NSM_ADMIN_TOKEN`
+and `NSM_ENROLL_TOKEN` are unmatchable by construction rather than by review. The key is read
+from the environment of the process that needs it (the manager, for a health probe) and never
+transits the board: a row carries the name, not the secret.
 
 Watches are evaluated by a scheduler **on the manager**, so `probe` runs on the VPS and not on
 a node. A watch that needs to check something that only exists on a laptop must instead emit

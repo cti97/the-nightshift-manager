@@ -164,6 +164,10 @@ func TestProbeRecordsEachHealthState(t *testing.T) {
 		want       string
 		wantInWhy  string
 		wantReason bool
+		// exact pins the whole sentence where two states share a name and differ
+		// only by cause — auth_failed is "no key declared" or "key rejected",
+		// and a substring cannot tell them apart.
+		exact string
 	}{
 		{
 			name: "ok", provider: "openai", status: http.StatusOK, body: probeListBody,
@@ -177,7 +181,8 @@ func TestProbeRecordsEachHealthState(t *testing.T) {
 		},
 		{
 			name: "auth_failed", provider: "openai", status: http.StatusUnauthorized,
-			body: `{"error":{"message":"invalid api key"}}`, want: "auth_failed", wantInWhy: "credential", wantReason: true,
+			body: `{"error":{"message":"invalid api key"}}`, want: "auth_failed", wantReason: true,
+			exact: healthReasonAuthNoKey,
 		},
 		{
 			name: "down from an uninformative 503", provider: "ollama",
@@ -219,6 +224,9 @@ func TestProbeRecordsEachHealthState(t *testing.T) {
 			}
 			if tc.wantInWhy != "" && !strings.Contains(strings.ToLower(res.HealthReason), strings.ToLower(tc.wantInWhy)) {
 				t.Fatalf("reason %q does not name %q", res.HealthReason, tc.wantInWhy)
+			}
+			if tc.exact != "" && res.HealthReason != tc.exact {
+				t.Fatalf("reason = %q, want exactly %q", res.HealthReason, tc.exact)
 			}
 
 			stored := readStoredHealth(t, db, ep.ID)
@@ -542,55 +550,145 @@ func TestProbeRecordsAConstructionFailureAsDown(t *testing.T) {
 	}
 }
 
-// TestProbeSendsNoCredentialFromTheManagersEnvironment is the security pin for
-// the probe path. auth_ref is a value from a row; the manager's environment holds
-// the manager's own secrets, its admin token among them. If the probe resolved
-// the one from the other, a row naming NSM_ADMIN_TOKEN and pointing at any URL
-// would receive the admin token as a bearer credential — two individually
-// reasonable features composing into credential exfiltration.
-//
-// The fake answers 200 only to a request that carries a credential, so a leak
-// would not merely send the token, it would also make the probe look healthy.
-func TestProbeSendsNoCredentialFromTheManagersEnvironment(t *testing.T) {
-	t.Setenv("NSM_ADMIN_TOKEN", "the-managers-own-admin-token")
+// TestProbeSendsTheProviderKeyItsRowNames proves the capability is genuinely
+// restored: an endpoint whose auth_ref names a provider key the manager holds
+// sends it, so an auth-gated endpoint can reach `ok` and become placeable. The
+// fake answers only to the exact bearer, so "sent something" is not enough.
+func TestProbeSendsTheProviderKeyItsRowNames(t *testing.T) {
+	t.Setenv("NSM_PROVIDER_FAKE", "sk-provider-fake")
 
 	var seen atomic.Value
 	seen.Store("")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		seen.Store(auth)
-		if auth != "" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(probeListBody))
+		if auth != "Bearer sk-provider-fake" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"bad key"}}`))
 			return
 		}
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":{"message":"missing api key"}}`))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(probeListBody))
 	}))
 	t.Cleanup(ts.Close)
 
 	db, clock := newTestDB(t)
 	ep := mustCreateEndpoint(t, db, clock, testRegistry(), CreateEndpointRequest{
-		Name: "keyed", Provider: "openai", BaseURL: ts.URL, Reach: "wan", AuthRef: "NSM_ADMIN_TOKEN",
+		Name: "keyed", Provider: "openai", BaseURL: ts.URL, Reach: "wan", AuthRef: "NSM_PROVIDER_FAKE",
 	})
 
 	res, err := ProbeEndpoint(context.Background(), db, clock, testRegistry(), ep.ID)
 	if err != nil {
 		t.Fatalf("ProbeEndpoint: %v", err)
 	}
-	if got := seen.Load().(string); got != "" {
-		t.Fatalf("the probe sent Authorization %q; a row's auth_ref must never become the manager's secret", got)
+	if got := seen.Load().(string); got != "Bearer sk-provider-fake" {
+		t.Fatalf("the probe sent Authorization %q, want the provider key its row names", got)
 	}
-	// Reachable, gated, and the probe has nothing to present: a state about the
-	// endpoint's authentication, not a broken endpoint.
+	if string(res.Health) != "ok" {
+		t.Fatalf("health = %q, want ok (reason %q)", res.Health, res.HealthReason)
+	}
+	if s := readStoredHealth(t, db, ep.ID); s.health != "ok" || !s.lastOKAt.Valid {
+		t.Fatalf("stored = %+v, want ok with a last_ok_at", s)
+	}
+}
+
+// TestProbeOfARejectedProviderKeySaysSo is the other half of the two auth
+// reasons: a key was sent and refused, which is a rotation problem, not a
+// "declare a key" problem. The reason must say which.
+func TestProbeOfARejectedProviderKeySaysSo(t *testing.T) {
+	t.Setenv("NSM_PROVIDER_WRONG", "sk-revoked")
+
+	fake := newProbeFake(t)
+	fake.answer(http.StatusUnauthorized, `{"error":{"message":"invalid api key"}}`)
+	db, clock := newTestDB(t)
+	ep := mustCreateEndpoint(t, db, clock, testRegistry(), CreateEndpointRequest{
+		Name: "revoked", Provider: "openai", BaseURL: fake.ts.URL, Reach: "wan", AuthRef: "NSM_PROVIDER_WRONG",
+	})
+
+	res, err := ProbeEndpoint(context.Background(), db, clock, testRegistry(), ep.ID)
+	if err != nil {
+		t.Fatalf("ProbeEndpoint: %v", err)
+	}
 	if string(res.Health) != "auth_failed" {
-		t.Fatalf("health = %q, want auth_failed for a credential-free 401", res.Health)
+		t.Fatalf("health = %q, want auth_failed", res.Health)
 	}
-	if !strings.Contains(res.HealthReason, "credential") {
-		t.Fatalf("reason = %q, want it to say the probe sends no credential", res.HealthReason)
+	if res.HealthReason != healthReasonAuthRejected {
+		t.Fatalf("reason = %q, want %q", res.HealthReason, healthReasonAuthRejected)
 	}
-	if s := readStoredHealth(t, db, ep.ID); s.health != "auth_failed" {
-		t.Fatalf("stored health = %q, want auth_failed", s.health)
+}
+
+// TestProbeWithAReservedAuthRefSendsNothingAndRecordsDown is the tripwire with
+// its polarity flipped. The probe may read its own environment only for a name
+// inside the provider-key namespace; a row that names NSM_ADMIN_TOKEN is refused
+// before the lookup, so the manager's admin token never reaches a URL the row
+// also chose. The fake answers 200 to anything it receives, so a leak would not
+// merely send the token, it would make the probe look healthy.
+func TestProbeWithAReservedAuthRefSendsNothingAndRecordsDown(t *testing.T) {
+	t.Setenv("NSM_ADMIN_TOKEN", "the-managers-own-admin-token")
+
+	var seen atomic.Value
+	seen.Store("")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(probeListBody))
+	}))
+	t.Cleanup(ts.Close)
+
+	db, clock := newTestDB(t)
+	rawEndpoint(t, db, clock, "ep-reserved", "reserved", "openai", ts.URL, "wan", healthUnknownOnCreate)
+	// Raw SQL, because the write path now refuses this: the probe's check is the
+	// one that has to catch a row the write path never saw.
+	if _, err := db.Exec(`UPDATE endpoints SET auth_ref='NSM_ADMIN_TOKEN' WHERE id='ep-reserved'`); err != nil {
+		t.Fatalf("set the reserved auth_ref: %v", err)
+	}
+
+	res, err := ProbeEndpoint(context.Background(), db, clock, testRegistry(), "ep-reserved")
+	if err != nil {
+		t.Fatalf("ProbeEndpoint: %v", err)
+	}
+	if got := seen.Load().(string); got != "" {
+		t.Fatalf("the probe sent Authorization %q; a name outside NSM_PROVIDER_* must resolve nothing", got)
+	}
+	if string(res.Health) != "down" {
+		t.Fatalf("health = %q, want down (the row cannot be resolved)", res.Health)
+	}
+	if !strings.Contains(res.HealthReason, "NSM_PROVIDER_") {
+		t.Fatalf("reason = %q, want it to name the provider-key namespace", res.HealthReason)
+	}
+	if res.LatencyMS != nil {
+		t.Fatalf("latency = %d, want none: no request was made", *res.LatencyMS)
+	}
+}
+
+// TestProbeOfAMissingProviderKeyIsDown: the row names a permitted key that this
+// process does not hold. That is a configuration failure the operator can fix,
+// and it is recorded without spending a round trip to be told 401.
+func TestProbeOfAMissingProviderKeyIsDown(t *testing.T) {
+	const ref = "NSM_PROVIDER_ABSENT"
+	t.Setenv(ref, "") // set-but-empty: a key with no value is no key
+
+	db, clock := newTestDB(t)
+	fake := newProbeFake(t)
+	ep := mustCreateEndpoint(t, db, clock, testRegistry(), CreateEndpointRequest{
+		Name: "keyless", Provider: "openai", BaseURL: fake.ts.URL, Reach: "wan", AuthRef: ref,
+	})
+
+	res, err := ProbeEndpoint(context.Background(), db, clock, testRegistry(), ep.ID)
+	if err != nil {
+		t.Fatalf("ProbeEndpoint: %v", err)
+	}
+	if string(res.Health) != "down" {
+		t.Fatalf("health = %q, want down", res.Health)
+	}
+	if !strings.Contains(res.HealthReason, ref) {
+		t.Fatalf("reason = %q, want it to name %q", res.HealthReason, ref)
+	}
+	if res.LatencyMS != nil {
+		t.Fatalf("latency = %d, want none: no request was made", *res.LatencyMS)
+	}
+	if got := fake.hits.Load(); got != 0 {
+		t.Fatalf("%d requests reached the endpoint; an absent key needs no round trip", got)
 	}
 }
 

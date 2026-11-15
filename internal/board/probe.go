@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/cti97/the-nightshift-manager/internal/provider"
@@ -37,23 +38,27 @@ import (
 //   - Latency is measured around p.Probe, and only around it: construction is
 //     local and instant, so including it would report the board's own work as
 //     the endpoint's. A probe that never reached the provider (a construction
-//     failure, a missing credential) records NULL, which says "there was nothing
-//     to measure" rather than an instant answer.
+//     failure, a provider key the manager does not hold) records NULL, which
+//     says "there was nothing to measure" rather than an instant answer.
 //   - A probe of a `stub` endpoint is `ok`. The stub has no HTTP base URL and no
 //     network to fail, so the honest answer is the provider's own: it is the
 //     reference implementation doing its job. That is also why a `stub` row does
 //     not belong on a production board (Task 8 already records that it is
 //     creatable); this probe adds no special case for one adapter, because the
 //     registry's promise is that a provider is a provider.
-//   - The probe is credential-free, whatever endpoints.auth_ref names. auth_ref
-//     is a value from a row, and the manager's environment holds the manager's
-//     own secrets — its admin token among them. Resolving one from the other
-//     lets a row name NSM_ADMIN_TOKEN and receive it as a bearer header at a URL
-//     the row also chooses: two individually reasonable features composing into
-//     a credential-exfiltration primitive. So nothing here reads the
-//     environment, and a 401 or 403 from a credential-free probe means the
-//     endpoint is reachable and its gate works — recorded as auth_failed, not
-//     down, because a missing credential is not a broken endpoint.
+//   - A probe sends the provider key its row names, and only ever a provider
+//     key. The danger was never that the manager reads its own environment: it
+//     was that a row could name an *arbitrary* secret in it, so a row saying
+//     NSM_ADMIN_TOKEN and pointing at any URL would receive the manager's admin
+//     token as a bearer header. auth_ref is therefore restricted to the
+//     NSM_PROVIDER_* namespace — enforced at endpoint-write time and again here
+//     before the lookup (checkAuthRef) — which makes the manager's own tokens
+//     unmatchable by construction rather than by review. The key is resolved
+//     locally from this process's environment and never transits the board.
+//     A 401 with the row's key is auth_failed ("the endpoint rejected it"); a
+//     401 with no key named is also auth_failed, but the reason says the row
+//     names none, because "reachable and gated" is not the same fault as "the
+//     credential is wrong".
 //   - Reach is measured from the manager, not from the executor. A host or lan
 //     endpoint on another machine is probed from wherever the manager runs, so a
 //     healthy endpoint can be recorded down because the manager cannot see it,
@@ -95,18 +100,21 @@ const (
 	// human-attributed events would make the audit spine lie about who acted.
 	probeActor = "probe"
 
-	// The three non-ok states carry no diagnostic text on the provider
-	// interface: Probe returns (Health, error), and for warming and auth_failed
-	// the error is nil, so the state is the whole message. These are the
-	// states' meanings, not a fabrication of a detail the adapter never
-	// supplied — warming is defined as "a model is loading" and auth_failed as
-	// "reachable, credential rejected" in provider.go. A probe detail string is
-	// the interface change that would replace them; until then, the alternative
-	// is a `down`/`warming` with no reason at all, which the operator cannot act
-	// on.
-	healthReasonWarming    = "a model is loading"
-	healthReasonAuthFailed = "reachable, but it requires authentication and the probe sends no credential"
-	healthReasonDown       = "the endpoint answered with a failure status"
+	// The non-ok states carry no diagnostic text on the provider interface:
+	// Probe returns (Health, error), and for warming and auth_failed the error
+	// is nil, so the state is the whole message. These are the states' meanings
+	// as provider.go defines them, not a fabrication of a detail the adapter
+	// never supplied. A probe detail string is the interface change that would
+	// replace them; until then the alternative is a `down`/`warming` with no
+	// reason at all, which the operator cannot act on.
+	//
+	// auth_failed has two causes the operator fixes differently, so it has two
+	// sentences: a row that names a provider key and is refused (rotate it), and
+	// a row that names none against a gated endpoint (declare one).
+	healthReasonWarming      = "a model is loading"
+	healthReasonAuthNoKey    = "reachable, but it requires authentication and this endpoint names no provider key"
+	healthReasonAuthRejected = "the endpoint rejected the provider key this endpoint names"
+	healthReasonDown         = "the endpoint answered with a failure status"
 )
 
 // ProbeResult is one probe: what it observed and what it recorded. It is the
@@ -156,13 +164,14 @@ func ProbeAlert(from string, lastOKAt *int64, to string) bool {
 }
 
 // probeTarget is the endpoint row the probe needs before it can ask anything:
-// the adapter's connection and the declared reach. There is deliberately no
-// credential field: the probe sends none (see the header).
+// the adapter's connection, the declared reach, and the *name* of the provider
+// key (authRef), never the key itself.
 type probeTarget struct {
 	id       string
 	name     string
 	provider string
 	baseURL  string
+	authRef  string
 	reach    string
 }
 
@@ -195,9 +204,9 @@ func ProbeEndpoint(ctx context.Context, db *sql.DB, clock Clock, reg *provider.R
 func loadProbeTarget(ctx context.Context, db *sql.DB, id string) (probeTarget, error) {
 	var t probeTarget
 	err := db.QueryRowContext(ctx,
-		`SELECT id, name, provider, base_url, reach
+		`SELECT id, name, provider, base_url, COALESCE(auth_ref,''), reach
 		   FROM endpoints WHERE id=?`, id).
-		Scan(&t.id, &t.name, &t.provider, &t.baseURL, &t.reach)
+		Scan(&t.id, &t.name, &t.provider, &t.baseURL, &t.authRef, &t.reach)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return probeTarget{}, fmt.Errorf("endpoint %s: %w", id, sql.ErrNoRows)
@@ -213,13 +222,19 @@ func loadProbeTarget(ctx context.Context, db *sql.DB, id string) (probeTarget, e
 // provider returned a state the schema does not have. Everything the endpoint
 // itself did becomes a state (decisions 1 and 2).
 //
-// No credential is resolved anywhere in this path, on purpose: see the
-// credential-free note in this file's header. A 401 or 403 therefore arrives as
-// provider.HealthAuthFailed with a nil error — the endpoint answered, the gate
-// works, and the probe has nothing to show it — which is a state, not a
-// failure to determine one.
+// The credential is resolved here and nowhere else: a name the write path already
+// accepted into the provider-key namespace, checked again before the lookup so a
+// row inserted by hand cannot reach outside it. A key that is absent, or a name
+// outside the namespace, is a configuration failure — recorded `down`, no request
+// sent. A 401/403 after a key was sent is auth_failed with "rejected"; a 401/403
+// with no key named is auth_failed with "names no provider key", because the two
+// are different problems to fix.
 func observe(ctx context.Context, clock Clock, reg *provider.Registry, t probeTarget) (provider.Health, string, *int64, error) {
-	p, err := newProber(reg, t)
+	apiKey, err := probeCredential(t)
+	if err != nil {
+		return provider.HealthDown, err.Error(), nil, nil
+	}
+	p, err := newProber(reg, t, apiKey)
 	if err != nil {
 		return provider.HealthDown, err.Error(), nil, nil
 	}
@@ -240,7 +255,7 @@ func observe(ctx context.Context, clock Clock, reg *provider.Registry, t probeTa
 		// observe. `down` is the state that says so.
 		return provider.HealthDown, probeErr.Error(), latency, nil
 	}
-	reason, ok := reasonForHealth(health)
+	reason, ok := reasonForHealth(health, apiKey != "")
 	if !ok {
 		// A fifth state is a provider bug. Writing it would fail the schema's
 		// CHECK on the next read and hide where it came from; inventing a
@@ -252,23 +267,46 @@ func observe(ctx context.Context, clock Clock, reg *provider.Registry, t probeTa
 	return health, reason, latency, nil
 }
 
+// probeCredential resolves the provider key endpoints.auth_ref names. The name is
+// checked against the namespace again here — not because the write path is
+// untrusted, but because rows exist that the write path never saw (fixtures, raw
+// SQL, a migration). A refused name sends no request and reads no environment.
+//
+// The returned error is the reason string for a `down`: a row that names a key
+// the manager does not hold cannot authenticate, and saying so is both cheaper
+// and more actionable than the 401 it would earn.
+func probeCredential(t probeTarget) (string, error) {
+	if t.authRef == "" {
+		return "", nil
+	}
+	if err := checkAuthRef(t.authRef); err != nil {
+		return "", err
+	}
+	key := os.Getenv(t.authRef)
+	if key == "" {
+		return "", fmt.Errorf("auth_ref %q names a provider key that is not set in the manager's environment", t.authRef)
+	}
+	return key, nil
+}
+
 // newProber builds the adapter for one endpoint row. Construction is where a
 // bad base URL, an unknown provider or a provider that rejects its own
 // configuration becomes visible, and it is deliberately not an error return: an
 // adapter that cannot be built cannot be probed, which is a thing the operator
 // needs to see on GET /admin/endpoints (decision 2).
-func newProber(reg *provider.Registry, t probeTarget) (provider.Provider, error) {
+func newProber(reg *provider.Registry, t probeTarget, apiKey string) (provider.Provider, error) {
 	if reg == nil {
 		// A server wired without a registry can build nothing. Failing closed
 		// mirrors checkProviderRegistered, which accepts no name without one.
 		return nil, errors.New("no provider registry is configured, so no adapter can be built")
 	}
-	// APIKey is deliberately unset. Every adapter sends no Authorization header
-	// when the key is empty (openai.go), which is the property this path depends
-	// on: the probe must not turn a row's auth_ref into the manager's own secret.
+	// The key is the one probeCredential resolved from the provider-key
+	// namespace, or empty. Every adapter sends no Authorization header when it is
+	// empty (openai.go), so "names no provider key" really means no header.
 	p, err := reg.New(provider.Config{
 		Provider: t.provider,
 		BaseURL:  t.baseURL,
+		APIKey:   apiKey,
 		Reach:    t.reach,
 		Timeout:  probeTimeout,
 	})
@@ -281,14 +319,17 @@ func newProber(reg *provider.Registry, t probeTarget) (provider.Provider, error)
 // reasonForHealth turns a state into the sentence the operator reads. ok clears
 // the reason: a stale explanation printed under a healthy state is a lie, and
 // "ok: 401 from /v1/models" is worse than no reason at all.
-func reasonForHealth(h provider.Health) (string, bool) {
+func reasonForHealth(h provider.Health, sentKey bool) (string, bool) {
 	switch h {
 	case provider.HealthOK:
 		return "", true
 	case provider.HealthWarming:
 		return healthReasonWarming, true
 	case provider.HealthAuthFailed:
-		return healthReasonAuthFailed, true
+		if sentKey {
+			return healthReasonAuthRejected, true
+		}
+		return healthReasonAuthNoKey, true
 	case provider.HealthDown:
 		return healthReasonDown, true
 	}

@@ -1076,3 +1076,70 @@ func strPtr(s string) *string     { return &s }
 func boolPtr(b bool) *bool        { return &b }
 func intPtr(n int) *int           { return &n }
 func floatPtr(f float64) *float64 { return &f }
+
+// TestCreateEndpointRefusesAnAuthRefOutsideTheProviderNamespace pins the write
+// half of the credential rule. auth_ref is the one column that makes the manager
+// read its own environment on a row's instruction, so a free-form name would let
+// a row name NSM_ADMIN_TOKEN and have the manager send its own admin token to a
+// URL the row chose. The refusal happens here, with the row still uncreated, so
+// the operator who typed the name is told; the probe re-checks for rows this
+// path never saw.
+func TestCreateEndpointRefusesAnAuthRefOutsideTheProviderNamespace(t *testing.T) {
+	cases := []struct {
+		name    string
+		authRef string
+		ok      bool
+		stored  string
+	}{
+		{name: "no key at all", authRef: "", ok: true, stored: ""},
+		{name: "a provider key", authRef: "NSM_PROVIDER_OPENAI", ok: true, stored: "NSM_PROVIDER_OPENAI"},
+		{name: "a second provider key", authRef: "NSM_PROVIDER_OLLAMA_KEY", ok: true, stored: "NSM_PROVIDER_OLLAMA_KEY"},
+		{name: "digits after the prefix", authRef: "NSM_PROVIDER_A9", ok: true, stored: "NSM_PROVIDER_A9"},
+		// Padded values are trimmed like every other string this path stores.
+		{name: "padded", authRef: " NSM_PROVIDER_PADDED ", ok: true, stored: "NSM_PROVIDER_PADDED"},
+		// The two names that made the rule necessary.
+		{name: "the manager admin token", authRef: "NSM_ADMIN_TOKEN", ok: false},
+		{name: "the enrollment token", authRef: "NSM_ENROLL_TOKEN", ok: false},
+		// Everything else outside the namespace.
+		{name: "a bare provider env name", authRef: "OPENAI_API_KEY", ok: false},
+		{name: "lowercase namespace", authRef: "nsm_provider_openai", ok: false},
+		{name: "prefix only", authRef: "NSM_PROVIDER_", ok: false},
+		{name: "lowercase name", authRef: "NSM_PROVIDER_openai", ok: false},
+		{name: "digit first", authRef: "NSM_PROVIDER_9KEY", ok: false},
+		{name: "a dash", authRef: "NSM_PROVIDER_OPEN-AI", ok: false},
+		{name: "a space inside", authRef: "NSM_PROVIDER_OPEN AI", ok: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, clock := newTestDB(t)
+			ep, err := CreateEndpoint(context.Background(), db, clock, testRegistry(), CreateEndpointRequest{
+				Name: "ep", Provider: "openai", BaseURL: "http://127.0.0.1:8080", Reach: "lan", AuthRef: tc.authRef,
+			})
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("CreateEndpoint(auth_ref=%q): %v", tc.authRef, err)
+				}
+				var stored string
+				if err := db.QueryRow(`SELECT COALESCE(auth_ref,'') FROM endpoints WHERE id=?`, ep.ID).Scan(&stored); err != nil {
+					t.Fatalf("read auth_ref: %v", err)
+				}
+				if stored != tc.stored {
+					t.Fatalf("stored auth_ref = %q, want %q", stored, tc.stored)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("CreateEndpoint(auth_ref=%q) = %+v, want an error", tc.authRef, ep)
+			}
+			if !strings.Contains(err.Error(), "auth_ref") {
+				t.Fatalf("error = %q, want it to name auth_ref", err)
+			}
+			if n := countRows(t, db, "endpoints"); n != 0 {
+				t.Fatalf("%d endpoint rows after a refused auth_ref, want 0", n)
+			}
+			if n := countRows(t, db, "events"); n != 0 {
+				t.Fatalf("%d event rows after a refused auth_ref, want 0", n)
+			}
+		})
+	}
+}
