@@ -229,3 +229,6 @@ func WriteError(w http.ResponseWriter, status int, code, msg string) {
 
 // Errorf keeps handler error construction uniform.
 func Errorf(format string, a ...any) string { return fmt.Sprintf(format, a...) }
+
+// logf is the background loops' only way to speak; handlers answer in JSON.
+func (s *Server) logf(format string, a ...any) { log.Printf(format, a...) }
