@@ -97,18 +97,30 @@ func TestStubRefusesWhenLocalRequiredButReachIsWAN(t *testing.T) {
 	// "wan" is the case spec §10 names. The rest are the same hole spelled
 	// differently: only an exact "host" or "lan" proves locality, so an unknown
 	// or differently-cased reach refuses too. Guessing here would be egress.
-	for _, reach := range []string{"wan", "", "WAN", " wan", "wan ", "remote", "host,lan"} {
+	// The endpoint is configured local so each refusal is attributable to the
+	// request's own declaration.
+	for _, reach := range []string{"wan", "WAN", " wan", "wan ", "remote", "host,lan"} {
 		s := NewStub(script)
+		s.Reach = "host"
 		resp, err := s.Complete(ctx, Request{Model: "m", RequireLocal: true, Reach: reach})
 		if err == nil {
-			t.Fatalf("reach %q: a local-only request was sent (content %q)", reach, resp.Content)
+			t.Fatalf("request reach %q: a local-only request was sent (content %q)", reach, resp.Content)
 		}
 		if !errors.Is(err, ErrEgressRefused) {
-			t.Fatalf("reach %q: err = %v, want ErrEgressRefused", reach, err)
+			t.Fatalf("request reach %q: err = %v, want ErrEgressRefused", reach, err)
 		}
 		if resp.Content != "" || len(resp.ToolCalls) != 0 || resp.Usage != (Usage{}) {
-			t.Fatalf("reach %q: the refusal returned a response: %+v", reach, resp)
+			t.Fatalf("request reach %q: the refusal returned a response: %+v", reach, resp)
 		}
+	}
+
+	// A request that says nothing is not a contradiction when the endpoint
+	// itself declares a local reach: the adapter's own declaration is the
+	// authoritative one, and the caller simply supplied none.
+	silent := NewStub(script)
+	silent.Reach = "lan"
+	if _, err := silent.Complete(ctx, Request{Model: "m", RequireLocal: true}); err != nil {
+		t.Fatalf("unstated request reach against a lan endpoint: %v", err)
 	}
 
 	// The endpoint's configured reach is checked too: Config.Reach is the
@@ -139,10 +151,21 @@ func TestStubRefusesWhenLocalRequiredButReachIsWAN(t *testing.T) {
 		t.Fatalf("request says wan, endpoint is host: err = %v, want ErrEgressRefused", err)
 	}
 
+	// Fail-closed: an adapter built without an endpoint reach cannot prove the
+	// endpoint is local, and a request that merely claims host is not evidence.
+	// This is the hole the conformance suite's check 6 exists to close.
+	for _, reach := range []string{"host", "lan", ""} {
+		s := NewStub(script)
+		if _, err := s.Complete(ctx, Request{Model: "m", RequireLocal: true, Reach: reach}); !errors.Is(err, ErrEgressRefused) {
+			t.Fatalf("unconfigured endpoint, request reach %q: err = %v, want ErrEgressRefused", reach, err)
+		}
+	}
+
 	// A refusal happens before the script is consumed, exactly as a real adapter
 	// refuses before writing the request: the stub's next local call still gets
 	// the first scripted response.
 	refused := NewStub(script)
+	refused.Reach = "host"
 	if _, err := refused.Complete(ctx, Request{Model: "m", RequireLocal: true, Reach: "wan"}); err == nil {
 		t.Fatal("reach wan: sent a local-only request")
 	}
@@ -154,9 +177,11 @@ func TestStubRefusesWhenLocalRequiredButReachIsWAN(t *testing.T) {
 		t.Fatalf("local call after a refused wan call returned %q, want the first scripted response", got.Content)
 	}
 
-	// host and lan are the two classes that satisfy no_egress.
+	// host and lan are the two classes that satisfy no_egress, when the provider
+	// was built with the matching endpoint reach.
 	for _, reach := range []string{"host", "lan"} {
 		s := NewStub(script)
+		s.Reach = reach
 		got, err := s.Complete(ctx, Request{Model: "m", RequireLocal: true, Reach: reach})
 		if err != nil {
 			t.Fatalf("reach %q: %v", reach, err)

@@ -67,13 +67,18 @@ func (s *Stub) Name() string { return "stub" }
 // Complete replays the next scripted response. The reach check runs first and
 // consumes nothing, exactly as a real adapter refuses before it writes the
 // request, and a cancelled context is refused before a scripted response is
-// spent.
+// spent. A conformance failure model is answered with its taxonomy sentinel,
+// also without spending a scripted response: the stub is the provider-side end
+// of the conformance suite's fixture contract (see conformanceFailure).
 func (s *Stub) Complete(ctx context.Context, req Request) (Response, error) {
 	if err := checkReach(req, s.Reach); err != nil {
 		return Response{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return Response{}, fmt.Errorf("provider: stub: %w", err)
+	}
+	if err := conformanceFailure(req.Model); err != nil {
+		return Response{}, err
 	}
 
 	s.mu.Lock()
@@ -84,6 +89,26 @@ func (s *Stub) Complete(ctx context.Context, req Request) (Response, error) {
 	resp := s.script[s.next]
 	s.next++
 	return resp, nil
+}
+
+// conformanceFailure maps the conformance suite's reserved failure models to the
+// taxonomy error a real endpoint would produce for them. The stub is the
+// provider-side end of the suite's fixture contract: an HTTP adapter's fake
+// server turns these models into 401/429/400/500 responses and the adapter maps
+// them, while the stub has no transport for a fake server to script, so the
+// failure is answered here.
+func conformanceFailure(model string) error {
+	switch model {
+	case ConformanceModelAuth:
+		return ErrAuth
+	case ConformanceModelRateLimited:
+		return ErrRateLimited
+	case ConformanceModelContextOverflow:
+		return ErrContextOverflow
+	case ConformanceModelServerError:
+		return ErrServer
+	}
+	return nil
 }
 
 // EstimateTokens is the package's default input-token heuristic: about four

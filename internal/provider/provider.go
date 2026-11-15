@@ -54,7 +54,8 @@ type Request struct {
 
 	// Reach is the endpoint's declared reach class: host, lan or wan. When
 	// RequireLocal is set, a provider refuses to send unless that class is
-	// local, which is spec §10's no_egress guarantee at the provider layer.
+	// local and its own configured reach is too, which is spec §10's no_egress
+	// guarantee at the provider layer.
 	RequireLocal bool
 	Reach        string
 }
@@ -117,27 +118,33 @@ var ErrEgressRefused = errors.New("provider: refusing to send to a non-local end
 //
 // Both declarations are checked: the request's (what the caller believes about
 // the endpoint) and the adapter's own configured Reach (what the endpoint row
-// said when it was built). Any non-local declaration refuses, and so does an
-// absence of declarations — a reach that cannot be verified is not local.
+// said when it was built). Any non-local declaration refuses. So does an
+// adapter built without a reach: a reach that cannot be verified is not local,
+// and a request that merely claims host is not evidence that the endpoint the
+// process would reach is local. That is deliberately fail-closed — an adapter
+// that forgot to carry Config.Reach fails no_egress work instead of trusting the
+// caller (M2 Task 2).
 func checkReach(req Request, endpointReach string) error {
 	if !req.RequireLocal {
 		return nil
 	}
-	declared := 0
-	for _, reach := range []string{req.Reach, endpointReach} {
-		if reach == "" {
-			continue
-		}
-		declared++
-		// Exact match, deliberately: "WAN", " wan" and "wan " are not local
-		// either, and guessing that a non-canonical value means host/lan is how
-		// a no_egress run leaves the machine.
-		if reach != "host" && reach != "lan" {
-			return fmt.Errorf("%w: endpoint reach is %q", ErrEgressRefused, reach)
-		}
+	// The adapter's own declaration is authoritative, and the endpoint's reach
+	// is a NOT NULL column, so an adapter without one is a wiring bug.
+	if endpointReach == "" {
+		return fmt.Errorf("%w: the provider was built without an endpoint reach", ErrEgressRefused)
 	}
-	if declared == 0 {
-		return fmt.Errorf("%w: endpoint reach is unstated", ErrEgressRefused)
+	// Exact match, deliberately: "WAN", " wan" and "wan " are not local either,
+	// and guessing that a non-canonical value means host/lan is how a no_egress
+	// run leaves the machine.
+	if endpointReach != "host" && endpointReach != "lan" {
+		return fmt.Errorf("%w: endpoint reach is %q", ErrEgressRefused, endpointReach)
+	}
+	// The request's declaration is checked too when the caller supplied one. A
+	// request that says wan is not overridden by a local endpoint row, because
+	// either record may be the stale one; a request that says nothing defers to
+	// the endpoint's declaration.
+	if req.Reach != "" && req.Reach != "host" && req.Reach != "lan" {
+		return fmt.Errorf("%w: request reach is %q", ErrEgressRefused, req.Reach)
 	}
 	return nil
 }
