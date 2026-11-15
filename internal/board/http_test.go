@@ -179,8 +179,8 @@ func TestVersionBodyCarriesNegotiationFields(t *testing.T) {
 			t.Fatalf("body = %v, missing %q", body, key)
 		}
 	}
-	if body["protocol_min"] != float64(1) || body["protocol_max"] != float64(2) {
-		t.Fatalf("protocol range = %v..%v, want 1..2", body["protocol_min"], body["protocol_max"])
+	if body["protocol_min"] != float64(2) || body["protocol_max"] != float64(2) {
+		t.Fatalf("protocol range = %v..%v, want 2..2", body["protocol_min"], body["protocol_max"])
 	}
 	if body["schema_version"] != float64(SchemaVersion()) {
 		t.Fatalf("schema_version = %v, want %d", body["schema_version"], SchemaVersion())

@@ -38,7 +38,7 @@ const (
 //     for each of Name, Description and Schema. A schema is what the model
 //     reads before it can call the tool; it is prompt input.
 //   - Model, MaxTokens and the transport/egress selectors (Reach,
-//     RequireLocal) are not counted. The model name selects an endpoint,
+//     RequireLocal, RequireHost) are not counted. The model name selects an endpoint,
 //     MaxTokens caps the reply, and the reach fields are a policy declaration;
 //     none is prompt text. A request carrying only those is not a sendable
 //     completion request and estimates 0.

@@ -304,7 +304,7 @@ func TestCreateItemThenClaimOverHTTP(t *testing.T) {
 		t.Fatalf("decode register response: %v", err)
 	}
 	if rec := postJSON(t, h, "/nodes/heartbeat", issued.Token, HeartbeatRequest{
-		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host", "lan", "wan"}, Protocol: 1,
+		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host", "lan", "wan"}, Protocol: ProtocolMax,
 	}); rec.Code != http.StatusOK {
 		t.Fatalf("heartbeat = %d: %s", rec.Code, rec.Body)
 	}

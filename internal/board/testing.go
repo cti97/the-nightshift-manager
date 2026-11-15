@@ -32,7 +32,7 @@ func SeedNodeForTest(t *testing.T, db *sql.DB, clock *FixedClock, name, role str
 		t.Fatalf("seed node %s: %v", name, err)
 	}
 	if _, err := Heartbeat(context.Background(), db, clock, id, HeartbeatRequest{
-		ProvidesLive: provides, ReachClasses: []string{"host", "lan", "wan"}, Protocol: 1,
+		ProvidesLive: provides, ReachClasses: []string{"host", "lan", "wan"}, Protocol: ProtocolMax,
 	}); err != nil {
 		t.Fatalf("heartbeat %s: %v", name, err)
 	}

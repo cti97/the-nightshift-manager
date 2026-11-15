@@ -49,6 +49,23 @@ func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, 
 	if req.Status != "ok" && req.Status != "error" {
 		return ReportResult{}, fmt.Errorf("report status %q is neither ok nor error", req.Status)
 	}
+	// Token counts are spend inputs, not display fields: a negative one would
+	// subtract from the daily ceiling and under-count what a run cost. The
+	// executor clamps provider-reported negatives, but the report boundary is
+	// where a hand-written or buggy node is stopped — the same fail-closed rule
+	// the status field follows.
+	for _, field := range []struct {
+		name  string
+		value int
+	}{
+		{"tokens_in", req.TokensIn},
+		{"tokens_out", req.TokensOut},
+		{"reserved_tokens", req.ReservedTokens},
+	} {
+		if field.value < 0 {
+			return ReportResult{}, fmt.Errorf("report %s %d is negative; token counts are spend inputs", field.name, field.value)
+		}
+	}
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {

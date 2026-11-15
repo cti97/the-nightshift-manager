@@ -3,6 +3,7 @@ package board
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -77,7 +78,7 @@ func TestHeartbeatUpdatesLiveCapabilitiesAndLease(t *testing.T) {
 		ReachClasses: []string{"host", "lan"},
 		FreeSlots:    1,
 		AgentVersion: "v0.1.0",
-		Protocol:     1,
+		Protocol:     ProtocolMax,
 	})
 	if err != nil {
 		t.Fatalf("Heartbeat: %v", err)
@@ -154,7 +155,7 @@ func TestHeartbeatOnlyExtendsThisNodesClaimedAndRunningLeases(t *testing.T) {
 		}
 	}
 
-	if _, err := Heartbeat(ctx, db, clock, a, HeartbeatRequest{Protocol: 1}); err != nil {
+	if _, err := Heartbeat(ctx, db, clock, a, HeartbeatRequest{Protocol: ProtocolMax}); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	for _, it := range items {
@@ -220,7 +221,7 @@ func TestIncompatibleHeartbeatPersistsStatusAndLeavesLeases(t *testing.T) {
 
 	// A node that later speaks a supported protocol comes back online.
 	resp, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{
-		ProvidesLive: []string{"agentic"}, Protocol: 1,
+		ProvidesLive: []string{"agentic"}, Protocol: ProtocolMax,
 	})
 	if err != nil {
 		t.Fatalf("recovery heartbeat: %v", err)
@@ -240,13 +241,13 @@ func TestHeartbeatRejectsUnknownCapabilityAndKeepsLastGoodState(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{
-		ProvidesLive: []string{"agentic"}, Protocol: 1,
+		ProvidesLive: []string{"agentic"}, Protocol: ProtocolMax,
 	}); err != nil {
 		t.Fatalf("good heartbeat: %v", err)
 	}
 
 	_, err = Heartbeat(ctx, db, clock, id, HeartbeatRequest{
-		ProvidesLive: []string{"lang:nas"}, Protocol: 1,
+		ProvidesLive: []string{"lang:nas"}, Protocol: ProtocolMax,
 	})
 	if err == nil {
 		t.Fatal("unknown capability accepted on heartbeat, want an error")
@@ -421,7 +422,7 @@ func TestIncompatibleHeartbeatClearsLiveCapabilities(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{
-		ProvidesLive: []string{"agentic", "lan:nas"}, Protocol: 1,
+		ProvidesLive: []string{"agentic", "lan:nas"}, Protocol: ProtocolMax,
 	}); err != nil {
 		t.Fatalf("good heartbeat: %v", err)
 	}
@@ -449,7 +450,7 @@ func TestHeartbeatPreservesOperatorPause(t *testing.T) {
 		t.Fatalf("pause node: %v", err)
 	}
 
-	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: 1}); err != nil {
+	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: ProtocolMax}); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	var status string
@@ -479,7 +480,7 @@ func TestHeartbeatReportsQueuedAndPendingApprovals(t *testing.T) {
 		}
 	}
 
-	resp, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: 1})
+	resp, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: ProtocolMax})
 	if err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
@@ -498,7 +499,7 @@ func TestHeartbeatRejectsUnknownNodeID(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	for _, protocol := range []int{1, 99} {
+	for _, protocol := range []int{ProtocolMax, 99} {
 		if _, err := Heartbeat(ctx, db, clock, "no-such-node", HeartbeatRequest{Protocol: protocol}); err == nil {
 			t.Fatalf("heartbeat for an unknown node (protocol %d) succeeded, want an error", protocol)
 		}
@@ -605,7 +606,7 @@ func TestPauseSurvivesIncompatibleThenGoodHeartbeat(t *testing.T) {
 		t.Fatalf("status = %q after an incompatible heartbeat, want the pause preserved", status)
 	}
 
-	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: 1}); err != nil {
+	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: ProtocolMax}); err != nil {
 		t.Fatalf("good heartbeat: %v", err)
 	}
 	if err := db.QueryRow(`SELECT status FROM nodes WHERE id=?`, id).Scan(&status); err != nil {
@@ -716,13 +717,13 @@ func TestReachClassesAreValidatedOnRegisterAndHeartbeat(t *testing.T) {
 	}
 
 	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{
-		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host"}, Protocol: 1,
+		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host"}, Protocol: ProtocolMax,
 	}); err != nil {
 		t.Fatalf("good heartbeat: %v", err)
 	}
 
 	_, err = Heartbeat(ctx, db, clock, id, HeartbeatRequest{
-		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"wan", "wfi"}, Protocol: 1,
+		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"wan", "wfi"}, Protocol: ProtocolMax,
 	})
 	if err == nil {
 		t.Fatalf("heartbeat accepted reach class %q", "wfi")
@@ -740,5 +741,81 @@ func TestReachClassesAreValidatedOnRegisterAndHeartbeat(t *testing.T) {
 	}
 	if status != "online" || live != `["agentic"]` || reach != `["host"]` {
 		t.Fatalf("node = (status %q, live %s, reach %s), want the last good heartbeat kept", status, live, reach)
+	}
+}
+
+// TestProtocolMismatchIsIncompatibleInBothDirections pins the symmetric cutover.
+// Protocol 2 is the claim payload that carries the endpoint's construction
+// config; a node that cannot build a provider must not claim work, in either
+// direction. The old-node-new-board leg uses the real Heartbeat; the
+// new-node-old-board leg uses heartbeatInRange with a protocol-1 board, which is
+// the same code path with the range a previous release spoke.
+func TestProtocolMismatchIsIncompatibleInBothDirections(t *testing.T) {
+	setup := func(t *testing.T) (*sql.DB, *FixedClock, string) {
+		t.Helper()
+		db, clock := newTestDB(t)
+		node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+		SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+		if _, err := CreateItem(context.Background(), db, clock, CreateItemRequest{
+			Title: "t", Brief: "b", Needs: []string{"agentic"},
+		}); err != nil {
+			t.Fatalf("CreateItem: %v", err)
+		}
+		return db, clock, node
+	}
+
+	t.Run("an old node on a new board", func(t *testing.T) {
+		db, clock, node := setup(t)
+		resp, err := Heartbeat(context.Background(), db, clock, node, HeartbeatRequest{
+			ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host"}, Protocol: 1,
+		})
+		if err != nil {
+			t.Fatalf("Heartbeat: %v", err)
+		}
+		if resp.Status != "incompatible" {
+			t.Fatalf("status = %q, want incompatible: a protocol-1 node cannot build a provider", resp.Status)
+		}
+		if resp.ProtocolMin != ProtocolMin || resp.ProtocolMax != ProtocolMax {
+			t.Fatalf("response range = %d..%d, want the board's %d..%d", resp.ProtocolMin, resp.ProtocolMax, ProtocolMin, ProtocolMax)
+		}
+		assertIncompatibleClaimsNothing(t, db, clock, node)
+	})
+
+	t.Run("a new node on an old board", func(t *testing.T) {
+		db, clock, node := setup(t)
+		// The range a protocol-1 board speaks. The node is not at fault for
+		// speaking a newer protocol; the board refuses it rather than handing it
+		// work it cannot execute.
+		resp, err := heartbeatInRange(context.Background(), db, clock, node, HeartbeatRequest{
+			ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host"}, Protocol: ProtocolMax,
+		}, 1, 1)
+		if err != nil {
+			t.Fatalf("heartbeatInRange: %v", err)
+		}
+		if resp.Status != "incompatible" {
+			t.Fatalf("status = %q, want incompatible", resp.Status)
+		}
+		if resp.ProtocolMin != 1 || resp.ProtocolMax != 1 {
+			t.Fatalf("response range = %d..%d, want the old board's 1..1", resp.ProtocolMin, resp.ProtocolMax)
+		}
+		assertIncompatibleClaimsNothing(t, db, clock, node)
+	})
+}
+
+func assertIncompatibleClaimsNothing(t *testing.T, db *sql.DB, clock *FixedClock, node string) {
+	t.Helper()
+	var status string
+	if err := db.QueryRow(`SELECT status FROM nodes WHERE id=?`, node).Scan(&status); err != nil {
+		t.Fatalf("read node status: %v", err)
+	}
+	if status != "incompatible" {
+		t.Fatalf("node status = %q, want incompatible", status)
+	}
+	got, err := Claim(context.Background(), db, clock, node, 1)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("an incompatible node claimed %d items, want 0", len(got))
 	}
 }

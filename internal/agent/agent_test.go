@@ -72,7 +72,7 @@ func (f *fixture) config(exec Executor) Config {
 		Token:    f.token,
 		NodeID:   f.nodeID,
 		Executor: exec,
-		Protocol: 1,
+		Protocol: board.ProtocolMax,
 		Provides: []string{"agentic"},
 		Reaches:  []string{"host", "lan", "wan"},
 	}
@@ -164,14 +164,14 @@ func TestClientHeartbeatSendsProtocolVersion(t *testing.T) {
 		ProvidesLive: []string{"agentic"},
 		ReachClasses: []string{"host"},
 		FreeSlots:    1,
-		Protocol:     1,
+		Protocol:     board.ProtocolMax,
 	}); err != nil {
 		t.Fatalf("heartbeat: %v", err)
 	}
 
 	body := <-bodies
-	if got, ok := body["protocol_version"]; !ok || got != float64(1) {
-		t.Fatalf("heartbeat body protocol_version = %v (present %v), want 1", got, ok)
+	if got, ok := body["protocol_version"]; !ok || got != float64(board.ProtocolMax) {
+		t.Fatalf("heartbeat body protocol_version = %v (present %v), want %d", got, ok, board.ProtocolMax)
 	}
 	if _, ok := body["protocol"]; ok {
 		t.Fatalf("heartbeat body carries a field named %q; the board reads protocol_version", "protocol")
@@ -254,8 +254,8 @@ func TestAgentTakesAnItemFromQueuedToDone(t *testing.T) {
 		Scan(&nodeStatus, &protocol); err != nil {
 		t.Fatalf("read node: %v", err)
 	}
-	if nodeStatus != "online" || protocol != 1 {
-		t.Fatalf("node = (%q, protocol %d), want (online, 1)", nodeStatus, protocol)
+	if nodeStatus != "online" || protocol != board.ProtocolMax {
+		t.Fatalf("node = (%q, protocol %d), want (online, %d)", nodeStatus, protocol, board.ProtocolMax)
 	}
 }
 
@@ -517,7 +517,7 @@ func TestRefusedClaimDoesNotSpin(t *testing.T) {
 		Token:    "token",
 		NodeID:   "node",
 		Executor: StubExecutor{},
-		Protocol: 1,
+		Protocol: board.ProtocolMax,
 		// Heartbeat far in the future so only Poll decides the next claim.
 		Heartbeat: time.Hour,
 		Poll:      time.Minute,
@@ -575,5 +575,30 @@ func TestReportRetryWindowIsAboutThirtySeconds(t *testing.T) {
 	}
 	if total < 20*time.Second || total > 35*time.Second {
 		t.Fatalf("total retry window = %s, want roughly 30s", total)
+	}
+}
+
+// TestIncompatibleMessageUsesTheBoardsRangeOnlyWhenSent pins the honesty of the
+// one line an operator reads when nothing will ever run. A protocol-1 board does
+// not report its range; substituting this binary's own range would say "board
+// speaks 2..2" precisely when the operator needs the truth.
+func TestIncompatibleMessageUsesTheBoardsRangeOnlyWhenSent(t *testing.T) {
+	oldBoard := incompatibleMessage(board.HeartbeatResponse{ProtocolMin: 1, ProtocolMax: 1}, 2)
+	if !strings.Contains(oldBoard, "board speaks 1..1") {
+		t.Fatalf("message = %q, want the board's reported range", oldBoard)
+	}
+	if !strings.Contains(oldBoard, "node speaks protocol 2") {
+		t.Fatalf("message = %q, want the node's protocol", oldBoard)
+	}
+
+	silentBoard := incompatibleMessage(board.HeartbeatResponse{}, 2)
+	if !strings.Contains(silentBoard, "did not report its supported range") {
+		t.Fatalf("message = %q, want it to say the range was not reported", silentBoard)
+	}
+	if strings.Contains(silentBoard, "board speaks") {
+		t.Fatalf("message = %q, want no fabricated range", silentBoard)
+	}
+	if strings.Contains(silentBoard, "2..2") {
+		t.Fatalf("message = %q, the node's own range was printed as the board's", silentBoard)
 	}
 }

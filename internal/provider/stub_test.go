@@ -408,3 +408,51 @@ func TestStubRefusesAnUnattributableToolResult(t *testing.T) {
 		t.Fatalf("Complete = %+v, %v; want the scripted response for an attributable tool result", got, err)
 	}
 }
+
+// TestStubRefusesStrictLocalOnANonHostEndpoint pins the narrower rule
+// strict_local needs. no_egress is double-guarded at placement and here; until
+// this test there was no node-side check for strict_local at all, so a bypassed
+// or stale placement record could send it to a lan endpoint. "lan" is local but
+// it is not this machine, and strict_local means this machine.
+func TestStubRefusesStrictLocalOnANonHostEndpoint(t *testing.T) {
+	ctx := context.Background()
+	script := []Response{{Content: "scripted reply", Usage: Usage{In: 8, Out: 2}}}
+
+	// The endpoint is the machine? Then it passes, with or without RequireLocal
+	// set alongside — RequireHost implies the locality half.
+	for i, req := range []Request{
+		{Model: "m", RequireHost: true},
+		{Model: "m", RequireHost: true, RequireLocal: true},
+		{Model: "m", RequireHost: true, Reach: "host"},
+	} {
+		s := NewStub(script)
+		s.Reach = "host"
+		if _, err := s.Complete(ctx, req); err != nil {
+			t.Fatalf("case %d: RequireHost against a host endpoint: %v", i, err)
+		}
+	}
+
+	// lan is the sharp case: it satisfies no_egress, but not strict_local.
+	lan := NewStub(script)
+	lan.Reach = "lan"
+	if _, err := lan.Complete(ctx, Request{Model: "m", RequireHost: true}); !errors.Is(err, ErrEgressRefused) {
+		t.Fatalf("RequireHost against a lan endpoint: err = %v, want ErrEgressRefused", err)
+	}
+
+	// The request's own declaration is checked too, for the same reason
+	// checkReach checks both halves of no_egress: either record may be stale.
+	contradiction := NewStub(script)
+	contradiction.Reach = "host"
+	if _, err := contradiction.Complete(ctx, Request{Model: "m", RequireHost: true, Reach: "lan"}); !errors.Is(err, ErrEgressRefused) {
+		t.Fatalf("RequireHost with a lan request reach: err = %v, want ErrEgressRefused", err)
+	}
+
+	// Fail-closed without an endpoint reach, exactly as RequireLocal is.
+	for _, reach := range []string{"", "wan"} {
+		s := NewStub(script)
+		s.Reach = reach
+		if _, err := s.Complete(ctx, Request{Model: "m", RequireHost: true, Reach: "host"}); !errors.Is(err, ErrEgressRefused) {
+			t.Fatalf("RequireHost with endpoint reach %q: err = %v, want ErrEgressRefused", reach, err)
+		}
+	}
+}

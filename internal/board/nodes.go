@@ -25,14 +25,15 @@ const nodeStaleAfter = 2 * leaseSeconds
 // marked incompatible rather than left crash-looping (spec §20).
 //
 // Protocol 2 (M2 Task 12) is the claim payload that carries the chosen
-// endpoint's construction config and the model id: a node that speaks 2 can
-// build a real provider, and a board that speaks only 1 cannot give it one. Min
-// stays at 1 because the additions are JSON fields an older node ignores — an
-// old node on a new board still works, with its stubbed executor. Max is 2 so a
-// new node on an old board is marked incompatible and claims nothing, rather
-// than claiming work it cannot execute.
+// endpoint's construction config and the model id. Both ends of the range are
+// 2, and the cutover is deliberately symmetric: a protocol-1 node cannot build
+// a provider, and leaving it claimable would let it report "stub did it" for
+// work it never executed — the exact failure the wiring exists to remove. So an
+// old node on a new board is marked incompatible rather than merely useless,
+// and a new node on an old board is marked incompatible by that board's own
+// range. Neither claims anything.
 const (
-	ProtocolMin = 1
+	ProtocolMin = 2
 	ProtocolMax = 2
 )
 
@@ -137,6 +138,14 @@ type HeartbeatResponse struct {
 	LeaseUntil int64  `json:"lease_until,omitempty"`
 	Queued     int    `json:"queued"`
 	Approvals  int    `json:"pending_approvals"`
+	// ProtocolMin/Max are the range THIS board speaks, sent on every response
+	// including an incompatible one. A node's mismatch message must not print
+	// its own range as if it were the board's: on an older board that would say
+	// "board speaks 1..2" precisely when the operator needs the truth. Zero
+	// means the board did not report a range (a protocol-1 board), and the node
+	// says so rather than inventing one.
+	ProtocolMin int `json:"protocol_min,omitempty"`
+	ProtocolMax int `json:"protocol_max,omitempty"`
 }
 
 func RegisterNode(ctx context.Context, db *sql.DB, clock Clock, req RegisterRequest) (string, string, error) {
@@ -195,7 +204,15 @@ func RegisterNode(ctx context.Context, db *sql.DB, clock Clock, req RegisterRequ
 }
 
 func Heartbeat(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req HeartbeatRequest) (HeartbeatResponse, error) {
-	if req.Protocol < ProtocolMin || req.Protocol > ProtocolMax {
+	return heartbeatInRange(ctx, db, clock, nodeID, req, ProtocolMin, ProtocolMax)
+}
+
+// heartbeatInRange is Heartbeat with the board's generation as an argument.
+// Production always passes this binary's range; the parameter exists so a test
+// can put a new node in front of an old (protocol-1) board and prove the cutover
+// in both directions without a second binary.
+func heartbeatInRange(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req HeartbeatRequest, protoMin, protoMax int) (HeartbeatResponse, error) {
+	if req.Protocol < protoMin || req.Protocol > protoMax {
 		res, err := db.ExecContext(ctx,
 			`UPDATE nodes SET status = CASE WHEN status='paused' THEN 'paused' ELSE 'incompatible' END,
 			 provides_live=?, last_seen_at=? WHERE id=?`,
@@ -206,7 +223,7 @@ func Heartbeat(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req 
 		if err := nodeWriteFound(res, nodeID); err != nil {
 			return HeartbeatResponse{}, err
 		}
-		return HeartbeatResponse{Status: "incompatible"}, nil
+		return HeartbeatResponse{Status: "incompatible", ProtocolMin: protoMin, ProtocolMax: protoMax}, nil
 	}
 
 	live, err := caps.Parse(req.ProvidesLive)
@@ -259,5 +276,8 @@ func Heartbeat(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req 
 		return HeartbeatResponse{}, err
 	}
 
-	return HeartbeatResponse{Status: "online", LeaseUntil: lease, Queued: queued, Approvals: approvals}, nil
+	return HeartbeatResponse{
+		Status: "online", LeaseUntil: lease, Queued: queued, Approvals: approvals,
+		ProtocolMin: protoMin, ProtocolMax: protoMax,
+	}, nil
 }

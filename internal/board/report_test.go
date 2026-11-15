@@ -674,7 +674,7 @@ func seedNodeTokenForTest(t *testing.T, db *sql.DB, clock *FixedClock, name, rol
 		t.Fatalf("register %s: %v", name, err)
 	}
 	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{
-		ProvidesLive: provides, ReachClasses: []string{"host", "lan", "wan"}, Protocol: 1,
+		ProvidesLive: provides, ReachClasses: []string{"host", "lan", "wan"}, Protocol: ProtocolMax,
 	}); err != nil {
 		t.Fatalf("heartbeat %s: %v", name, err)
 	}
@@ -747,5 +747,57 @@ func TestReportRecordsReservedTokens(t *testing.T) {
 	}
 	if in != 10 || out != 5 || reserved != 1234 {
 		t.Fatalf("run tokens = (in %d, out %d, reserved %d), want (10, 5, 1234)", in, out, reserved)
+	}
+}
+
+// TestReportRejectsNegativeTokenCounts pins the report boundary as a spend
+// boundary: a negative count would subtract from the daily ceiling, and
+// reserved_tokens is a budget input rather than a display field. The refusal
+// happens before any write, so the run stays claimed and no event is recorded.
+func TestReportRejectsNegativeTokenCounts(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		req   ReportRequest
+		field string
+	}{
+		{name: "tokens_in", req: ReportRequest{Status: "ok", TokensIn: -1}, field: "tokens_in"},
+		{name: "tokens_out", req: ReportRequest{Status: "ok", TokensOut: -1}, field: "tokens_out"},
+		{name: "reserved_tokens", req: ReportRequest{Status: "ok", ReservedTokens: -1}, field: "reserved_tokens"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, clock := newTestDB(t)
+			ctx := context.Background()
+			node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+			SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+			id, _ := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+			got, _ := Claim(ctx, db, clock, node, 1)
+			runID := got[0].RunID
+
+			_, err := Report(ctx, db, clock, runID, node, tc.req)
+			if err == nil {
+				t.Fatalf("Report accepted %s = -1", tc.field)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("error = %q, want it to name %s", err, tc.field)
+			}
+
+			var runStatus, itemStatus string
+			if err := db.QueryRow(`SELECT status FROM runs WHERE id=?`, runID).Scan(&runStatus); err != nil {
+				t.Fatalf("read run: %v", err)
+			}
+			if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, id).Scan(&itemStatus); err != nil {
+				t.Fatalf("read item: %v", err)
+			}
+			if runStatus != "claimed" || itemStatus != "claimed" {
+				t.Fatalf("after a refused report: run=%q item=%q, want both still claimed", runStatus, itemStatus)
+			}
+			var reported int
+			if err := db.QueryRow(`SELECT count(*) FROM events WHERE entity='work_item' AND entity_id=? AND type='reported'`, id).Scan(&reported); err != nil {
+				t.Fatalf("count reported events: %v", err)
+			}
+			if reported != 0 {
+				t.Fatalf("reported events = %d after a refused report, want 0", reported)
+			}
+		})
 	}
 }

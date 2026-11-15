@@ -335,9 +335,11 @@ policy and the `/why` endpoint will confidently explain the wrong thing.
 node has no other route to those tables: `GET /admin/endpoints` is admin-only and endpoints have
 no node-facing read. The endpoint's `auth_ref` travels as a **name**, never a value; the node
 resolves it from its own environment under the same `NSM_PROVIDER_*` rule the manager applies
-(§5), so a credential never transits the board. This is protocol 2: a node that speaks 2 needs
-the fields, and `ProtocolMax` is 2 so one talking to a protocol-1 board is marked incompatible
-and claims nothing rather than claiming work it cannot execute.
+(§5), so a credential never transits the board. This is protocol 2, and both ends of the
+supported range are 2: a protocol-1 node cannot build a provider, so leaving it claimable would
+let it report "stub did it" for work it never executed. The cutover is symmetric — a new node
+talking to a protocol-1 board is marked incompatible by that board's own range — and neither
+claims anything.
 
 **Reserved spend.** `runs.input_tokens`/`output_tokens` are provider-reported actuals.
 `runs.reserved_tokens` is the separate budget charge for attempts that failed and reported no

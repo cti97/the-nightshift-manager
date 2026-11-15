@@ -204,6 +204,7 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 			Tools:        defs,
 			MaxTokens:    e.maxTokens(),
 			RequireLocal: needsLocal(item.Item.Needs),
+			RequireHost:  slices.Contains(item.Item.Needs, "strict_local"),
 		}
 
 		resp, decision, err := e.complete(ctx, req, meter, p)

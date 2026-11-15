@@ -231,12 +231,28 @@ func (a *Agent) noteStatus(resp board.HeartbeatResponse) {
 	case "online":
 		a.logf("online: %d queued, %d awaiting approval", resp.Queued, resp.Approvals)
 	case "incompatible":
-		a.logf("board marked this node incompatible (protocol %d, board speaks %d..%d); it can claim nothing",
-			a.cfg.Protocol, board.ProtocolMin, board.ProtocolMax)
+		a.logf("%s", incompatibleMessage(resp, a.cfg.Protocol))
 	default:
 		a.logf("heartbeat status %q; it can claim nothing", resp.Status)
 	}
 	a.lastStatus = resp.Status
+}
+
+// incompatibleMessage says what is true about a mismatch. The board reports the
+// range it speaks on every heartbeat response; a protocol-1 board does not, and
+// then the only honest sentence is that the range was not reported. Printing
+// this binary's own ProtocolMin..Max as if it were the board's is the lie this
+// function exists to remove: a new node against an old board would otherwise
+// log "board speaks 1..2" at exactly the moment the operator needs the truth.
+func incompatibleMessage(resp board.HeartbeatResponse, nodeProtocol int) string {
+	if resp.ProtocolMin > 0 && resp.ProtocolMax >= resp.ProtocolMin {
+		return fmt.Sprintf(
+			"board marked this node incompatible (node speaks protocol %d, board speaks %d..%d); it can claim nothing",
+			nodeProtocol, resp.ProtocolMin, resp.ProtocolMax)
+	}
+	return fmt.Sprintf(
+		"board marked this node incompatible (node speaks protocol %d; the board did not report its supported range); it can claim nothing",
+		nodeProtocol)
 }
 
 // execute runs one claim: start the run, delegate, report. A refused start is

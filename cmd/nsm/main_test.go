@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -283,7 +284,7 @@ func TestNodeRegisterEnrollsAgainstARealBoard(t *testing.T) {
 
 	// The printed token is the node credential: it heartbeats.
 	req, err := http.NewRequest(http.MethodPost, srv.URL+"/nodes/heartbeat",
-		strings.NewReader(`{"protocol_version":1,"provides_live":["agentic"],"reach_classes":["host","lan"]}`))
+		strings.NewReader(fmt.Sprintf(`{"protocol_version":%d,"provides_live":["agentic"],"reach_classes":["host","lan"]}`, board.ProtocolMax)))
 	if err != nil {
 		t.Fatalf("build heartbeat: %v", err)
 	}

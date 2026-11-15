@@ -82,7 +82,15 @@ type Request struct {
 	// RequireLocal is set, a provider refuses to send unless that class is
 	// local and its own configured reach is too, which is spec §10's no_egress
 	// guarantee at the provider layer.
+	//
+	// RequireHost is the stricter declaration strict_local needs: local is not
+	// enough, the endpoint must be on this machine. It implies locality, so a
+	// caller that sets only RequireHost still gets the whole check, and the
+	// empty-reach refusal. The node sets it from the item's needs, because
+	// placement is not the last line: a bypassed or stale placement record must
+	// not be able to send a strict_local item to a lan endpoint.
 	RequireLocal bool
+	RequireHost  bool
 	Reach        string
 }
 
@@ -190,11 +198,13 @@ func checkToolMessages(req Request) error {
 	return nil
 }
 
-// checkReach is the provider layer's no_egress guarantee: the last place a
-// request can be stopped before it leaves the machine. Placement already refuses
-// wan for no_egress items, but placement is a decision made elsewhere — this is
-// the check that holds even if a code path skips it (spec §9: "it lives in the
-// adapter so it cannot be bypassed by a code path that skips placement").
+// checkReach is the provider layer's egress guarantee: the last place a request
+// can be stopped before it leaves the machine. Placement already refuses wan for
+// no_egress items and non-host for strict_local, but placement is a decision made
+// elsewhere — this is the check that holds even if a code path skips it (spec
+// §9: "it lives in the adapter so it cannot be bypassed by a code path that
+// skips placement"). RequireLocal enforces "host or lan"; RequireHost enforces
+// strict_local's "host and nothing else".
 //
 // Both declarations are checked: the request's (what the caller believes about
 // the endpoint) and the adapter's own configured Reach (what the endpoint row
@@ -205,7 +215,7 @@ func checkToolMessages(req Request) error {
 // that forgot to carry Config.Reach fails no_egress work instead of trusting the
 // caller (M2 Task 2).
 func checkReach(req Request, endpointReach string) error {
-	if !req.RequireLocal {
+	if !req.RequireLocal && !req.RequireHost {
 		return nil
 	}
 	// The adapter's own declaration is authoritative, and the endpoint's reach
@@ -225,6 +235,18 @@ func checkReach(req Request, endpointReach string) error {
 	// the endpoint's declaration.
 	if req.Reach != "" && req.Reach != "host" && req.Reach != "lan" {
 		return fmt.Errorf("%w: request reach is %q", ErrEgressRefused, req.Reach)
+	}
+	// strict_local is narrower than no_egress: "not wan" is not enough, the
+	// endpoint must be the machine itself. Both declarations are checked for the
+	// same reason as above — the endpoint row and the request may disagree, and
+	// either one saying lan is a refusal.
+	if req.RequireHost {
+		if endpointReach != "host" {
+			return fmt.Errorf("%w: the item demands strict_local and the endpoint reach is %q, not host", ErrEgressRefused, endpointReach)
+		}
+		if req.Reach != "" && req.Reach != "host" {
+			return fmt.Errorf("%w: the item demands strict_local and the request reach is %q, not host", ErrEgressRefused, req.Reach)
+		}
 	}
 	return nil
 }

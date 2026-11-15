@@ -731,12 +731,13 @@ func TestAgenticExecutorGatesHTTPGetOnTheItemsNeed(t *testing.T) {
 // the adapter's last-line check cannot run.
 func TestAgenticExecutorRequiresLocalForANoEgressItem(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		needs []string
-		want  bool
+		name     string
+		needs    []string
+		want     bool
+		wantHost bool
 	}{
 		{name: "no_egress", needs: []string{"agentic", "no_egress"}, want: true},
-		{name: "strict_local", needs: []string{"agentic", "strict_local"}, want: true},
+		{name: "strict_local", needs: []string{"agentic", "strict_local"}, want: true, wantHost: true},
 		{name: "ordinary item", needs: []string{"agentic"}, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -749,6 +750,9 @@ func TestAgenticExecutorRequiresLocalForANoEgressItem(t *testing.T) {
 			}
 			if got := p.request(0).RequireLocal; got != tc.want {
 				t.Fatalf("request RequireLocal = %v, want %v", got, tc.want)
+			}
+			if got := p.request(0).RequireHost; got != tc.wantHost {
+				t.Fatalf("request RequireHost = %v, want %v", got, tc.wantHost)
 			}
 		})
 	}
@@ -1150,4 +1154,53 @@ func TestAgentReportsARetriedAttemptsReservedSpend(t *testing.T) {
 	if got := p.callCount(); got != 2 {
 		t.Fatalf("provider calls = %d, want 2", got)
 	}
+}
+
+// TestAgenticExecutorRefusesStrictLocalOnANonHostEndpoint pins the node-side
+// half of strict_local. Placement already refuses a non-host endpoint, but the
+// adapter is the last line: the item's need must travel on the request as
+// RequireHost, or a stale or bypassed placement record can put it on a lan
+// endpoint.
+func TestAgenticExecutorRefusesStrictLocalOnANonHostEndpoint(t *testing.T) {
+	newStub := func(cfg provider.Config) (provider.Provider, error) {
+		s := provider.NewStub([]provider.Response{finishResponse("call-finish", "done", finishUsage())})
+		s.Reach = cfg.Reach
+		return s, nil
+	}
+
+	t.Run("a lan endpoint is refused", func(t *testing.T) {
+		exec := &AgenticExecutor{
+			SandboxRoot: t.TempDir(),
+			newProvider: func(cfg provider.Config) (provider.Provider, error) { return newStub(cfg) },
+		}
+		item := claimedItem("run-1", "do it", "agentic", "strict_local")
+		item.Endpoint.Reach = "lan"
+
+		_, err := exec.Run(context.Background(), item)
+		if err == nil {
+			t.Fatal("Run succeeded; strict_local on a lan endpoint must be refused")
+		}
+		if !errors.Is(err, provider.ErrEgressRefused) {
+			t.Fatalf("Run error = %v, want ErrEgressRefused", err)
+		}
+		if !strings.Contains(err.Error(), "test-endpoint") {
+			t.Fatalf("error = %q, want the endpoint named", err)
+		}
+	})
+
+	t.Run("a host endpoint is allowed", func(t *testing.T) {
+		exec := &AgenticExecutor{
+			SandboxRoot: t.TempDir(),
+			newProvider: func(cfg provider.Config) (provider.Provider, error) { return newStub(cfg) },
+		}
+		item := claimedItem("run-1", "do it", "agentic", "strict_local")
+		item.Endpoint.Reach = "host"
+		res, err := exec.Run(context.Background(), item)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Summary != "done" {
+			t.Fatalf("Summary = %q, want the finish summary", res.Summary)
+		}
+	})
 }
