@@ -601,7 +601,13 @@ reliable brake than any cap, because two agents that can always reply to each ot
 
 Third: `max_turns`. Fourth: a **global daily spend ceiling**. When it trips, the manager stops
 issuing work and marks itself `paused` (§8). Thread freezing is M3's to implement alongside the
-thread tables; M2's ceiling stops issuance, which is what bounds a runaway loop's cost.
+thread tables.
+
+**What a ceiling does and does not bound.** M2's ceiling bounds *issuance* — the work the manager
+hands out. A loop that runs away inside a single run is bounded by that node's own step and token
+caps, which the manager neither enforces nor observes. So the board's ceiling is a budget for work
+it dispatches, not a limit on what any one run can spend once it starts; setting a ceiling of 5
+does not make a runaway run cost 5, it makes the board stop handing out more.
 
 ## 14. Dashboard
 
