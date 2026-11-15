@@ -43,8 +43,10 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.Handle("GET /admin/board", s.adminAuth(http.HandlerFunc(s.handleBoard)))
+	mux.Handle("POST /admin/items", s.adminAuth(http.HandlerFunc(s.handleCreateItem)))
 	mux.HandleFunc("POST /nodes/register", s.handleRegister)
 	mux.Handle("POST /nodes/heartbeat", s.nodeAuth(http.HandlerFunc(s.handleHeartbeat)))
+	mux.Handle("POST /claim", s.nodeAuth(http.HandlerFunc(s.handleClaim)))
 	return mux
 }
 
@@ -124,6 +126,40 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, resp)
+}
+
+// handleClaim is how a node asks for work. The node id comes from the bearer
+// token, never from the body: a node cannot claim on another node's behalf.
+func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
+	var req ClaimRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	items, err := Claim(r.Context(), s.db, s.clock, nodeIDFrom(r), req.FreeSlots)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "claim", err.Error())
+		return
+	}
+	// An idle node gets [] rather than null; both decode, only one is a list.
+	if items == nil {
+		items = []ClaimedItem{}
+	}
+	WriteJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
+	var req CreateItemRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	id, err := CreateItem(r.Context(), s.db, s.clock, req)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "create_item", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
