@@ -22,3 +22,30 @@ bin/
 
 # SDD scratch workspace
 .superpowers/
+
+# iCloud conflict copies. This repo lives under ~/Documents, which macOS syncs to
+# iCloud; when a sync races a checkout, copies named "<name> 2.<ext>" appear. A .go
+# copy inside a package is COMPILED BY GO whether or not git tracks it, so it
+# redeclares live symbols and the build fails with errors that look like real
+# defects. It has happened twice here (34 files each time, byte-identical).
+#
+# What each layer buys, because they are not interchangeable:
+#   - these patterns stop `git add -A` from COMMITTING a half-merged duplicate,
+#     which would break CI for every clone and not just this machine;
+#   - scripts/check-tree.sh catches the duplicate PRESENT IN THE TREE, which git
+#     ignoring it does nothing about. `make test` runs the guard first.
+#
+# Every numeric suffix, not just " 2": b10coincom's history has a " 2"-only rule
+# that missed a " 3.go", which was then committed and failed staticcheck in CI.
+* [0-9]
+* [0-9].go
+* [0-9].md
+* [0-9].sh
+* [0-9].sql
+* [0-9].json
+* [0-9].txt
+* [0-9].yml
+* [0-9].yaml
+* [0-9].toml
+* [0-9].mod
+* [0-9].sum
