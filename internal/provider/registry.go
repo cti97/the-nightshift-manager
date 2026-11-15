@@ -42,6 +42,7 @@ func NewRegistry() *Registry {
 	r := &Registry{}
 	r.Register("stub", newStubProvider)
 	r.Register("openai", newOpenAIProvider)
+	r.Register("ollama", newOllamaProvider)
 	return r
 }
 
