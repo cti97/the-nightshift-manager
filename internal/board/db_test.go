@@ -2,6 +2,7 @@ package board
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -153,6 +154,7 @@ func TestForeignKeysAreOn(t *testing.T) {
 
 func TestMigrateAppliesOnlyNewerMigrations(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "board.db")
+
 	db, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -163,41 +165,73 @@ func TestMigrateAppliesOnlyNewerMigrations(t *testing.T) {
 	}
 	db.Close()
 
-	orig := migrations
-	defer func() { migrations = orig }()
-	migrations = append(orig, migration{
-		version: schemaVersion + 1,
-		script: `CREATE TABLE watches (
+	// The shape migration 2's author will create: entry 0 stays pinned at
+	// version 1, the new script appends as version 2, and schemaVersion
+	// derives from the list's last entry.
+	next := []migration{
+		{version: 1, script: schema},
+		{version: 2, script: `CREATE TABLE watches (
   id   TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE
 );
 
-CREATE INDEX idx_watches_name ON watches(name);`,
-	})
-
-	db, err = Open(path)
-	if err != nil {
-		t.Fatalf("re-Open at v1 with a v2 migration: %v", err)
+CREATE INDEX idx_watches_name ON watches(name);`},
 	}
-	defer db.Close()
+
+	raw, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+
+	if err := migrate(context.Background(), raw, next); err != nil {
+		t.Fatalf("migrate v1 -> v2: %v", err)
+	}
 
 	var v int
-	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+	if err := raw.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if v != schemaVersion+1 {
-		t.Fatalf("user_version = %d, want %d", v, schemaVersion+1)
+	if v != 2 {
+		t.Fatalf("user_version = %d, want 2", v)
 	}
 	var nodes int
-	if err := db.QueryRow(`SELECT count(*) FROM nodes`).Scan(&nodes); err != nil {
+	if err := raw.QueryRow(`SELECT count(*) FROM nodes`).Scan(&nodes); err != nil {
 		t.Fatalf("nodes: %v", err)
 	}
 	if nodes != 1 {
 		t.Fatalf("nodes rows = %d, want 1 (migration 1 re-applied?)", nodes)
 	}
 	var watches int
-	if err := db.QueryRow(`SELECT count(*) FROM watches`).Scan(&watches); err != nil {
+	if err := raw.QueryRow(`SELECT count(*) FROM watches`).Scan(&watches); err != nil {
 		t.Fatalf("watches: %v", err)
+	}
+}
+
+func TestMigrateRejectsGappedVersions(t *testing.T) {
+	raw, err := sql.Open("sqlite", dsn(filepath.Join(t.TempDir(), "board.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+
+	// A typo'd gap (1, 3) must fail before anything is applied to the db.
+	err = migrate(context.Background(), raw, []migration{
+		{version: 1, script: schema},
+		{version: 3, script: "CREATE TABLE watches (id TEXT PRIMARY KEY);"},
+	})
+	if err == nil {
+		t.Fatal("migrate with gapped versions returned nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "not contiguous") {
+		t.Fatalf("err = %q, want a not-contiguous error", err)
+	}
+	var v int
+	if err := raw.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if v != 0 {
+		t.Fatalf("user_version = %d on a gapped list, want 0 (nothing applied)", v)
 	}
 }
 

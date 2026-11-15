@@ -16,25 +16,31 @@ import (
 //go:embed schema.sql
 var schema string
 
-const schemaVersion = 1
-
-// SchemaVersion is exported for tests and for the migrate command.
-func SchemaVersion() int { return schemaVersion }
-
 // A migration upgrades a database one version, to Version.
 type migration struct {
 	version int
 	script  string
 }
 
-// migrations lists every schema migration in ascending order. Entry i
-// upgrades a database whose user_version is i to version i+1, so entry 0
-// creates the schema in an empty database. Adding a migration means
-// appending an entry (script + version) and bumping schemaVersion — not
-// touching migrate.
+// migrations lists every schema migration in ascending order. Entry 0 is
+// pinned to version 1 and creates the schema; entry i upgrades a database
+// whose user_version is i to version i+1. Adding a migration means
+// appending one entry with the next version — schemaVersion derives from
+// the list below, so there is nothing else to keep in sync.
 var migrations = []migration{
-	{version: schemaVersion, script: schema},
+	{version: 1, script: schema},
+	// Migration 2 (M4): append {version: 2, script: schema2} here, with a
+	// //go:embed for schema2 above; the version below follows.
 }
+
+// schemaVersion is the schema version this binary implements: the version
+// the last migration upgrades to. Deriving it from migrations is what makes
+// the append-only procedure above work — a const beside the list would
+// break it.
+var schemaVersion = migrations[len(migrations)-1].version
+
+// SchemaVersion is exported for tests and for the migrate command.
+func SchemaVersion() int { return schemaVersion }
 
 // Open opens (creating if needed) the board database, applies pending
 // migrations, and returns a pool capped at ONE connection.
@@ -52,7 +58,7 @@ func Open(path string) (*sql.DB, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	if err := migrate(ctx, db); err != nil {
+	if err := migrate(ctx, db, migrations); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
@@ -76,7 +82,10 @@ func dsn(path string) string {
 	return u.String()
 }
 
-func migrate(ctx context.Context, db *sql.DB) error {
+// migrate brings the database up to date by applying, in order, every
+// migration in ms newer than its user_version, each in its own transaction.
+// Open passes the production migrations; tests inject their own list.
+func migrate(ctx context.Context, db *sql.DB, ms []migration) error {
 	var v int
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
 		return fmt.Errorf("read user_version: %w", err)
@@ -84,10 +93,12 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	if v > schemaVersion {
 		return fmt.Errorf("database schema v%d is newer than this binary (v%d)", v, schemaVersion)
 	}
-	for i, m := range migrations {
+	for i, m := range ms {
 		if m.version != i+1 {
 			return fmt.Errorf("migrations are not contiguous: entry %d declares version %d, want %d", i+1, m.version, i+1)
 		}
+	}
+	for _, m := range ms {
 		if v >= m.version {
 			continue
 		}
@@ -130,7 +141,7 @@ var (
 
 // splitStatements splits a migration script into its statements, skipping
 // the blank padding between them. A ';' terminates a statement only outside
-// '--' line comments: comments may contain ';' (the schema header does), and
+// '--' line comments: comments may contain ';', and
 // a ';' inside a quoted literal is rejected, because scripts are applied
 // verbatim and a mangled split must fail loudly instead of executing half a
 // statement. Trigger bodies (BEGIN ... END with ';' inside) cannot be
