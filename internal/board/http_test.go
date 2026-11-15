@@ -12,10 +12,18 @@ import (
 	"testing"
 )
 
+// The two credentials are deliberately different values here, because the
+// board's whole enrollment story is that they are different credentials: the
+// admin token drives the admin API, the enroll token can only register a node.
+const (
+	testAdminToken  = "admin-secret"
+	testEnrollToken = "enroll-secret"
+)
+
 func newServer(t *testing.T) (*Server, *FixedClock) {
 	t.Helper()
 	db, clock := newTestDB(t)
-	srv := NewServer(db, clock, HashToken("admin-secret"))
+	srv := NewServer(db, clock, HashToken(testAdminToken), HashToken(testEnrollToken))
 	return srv, clock
 }
 

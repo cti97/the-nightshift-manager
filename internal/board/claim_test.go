@@ -6,14 +6,33 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 )
 
+// The exactly-once claim is the invariant the whole design leans on, so this
+// test has to create the contention it claims to test.
+//
+// Two goroutines against one *sql.DB would not: Open caps the pool at ONE
+// connection, so the two calls serialize inside database/sql and the guards
+// (claimed_by IS NULL, the rowcount) could both be deleted with the test still
+// green. Two separate handles on the same file give two real connections and
+// two real writers, which is what the board actually faces when two nodes ask
+// at once.
 func TestClaimIsExactlyOnceUnderConcurrency(t *testing.T) {
-	db, clock := newTestDB(t)
+	path := filepath.Join(t.TempDir(), "board.db")
+	db, clock := OpenForTest(t, path)
+
+	// A second pool, two real connections, same file. Closed by the test.
+	other, err := Open(path)
+	if err != nil {
+		t.Fatalf("open a second handle on %s: %v", path, err)
+	}
+	t.Cleanup(func() { other.Close() })
+
 	ctx := context.Background()
 	nodeA := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
 	nodeB := SeedNodeForTest(t, db, clock, "b", "executor", "agentic")
@@ -27,12 +46,15 @@ func TestClaimIsExactlyOnceUnderConcurrency(t *testing.T) {
 
 	var wg sync.WaitGroup
 	results := make([][]ClaimedItem, 2)
+	handles := []*sql.DB{db, other}
 	nodes := []string{nodeA, nodeB}
+	start := make(chan struct{})
 	for i := range nodes {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			got, err := Claim(ctx, db, clock, nodes[i], 1)
+			<-start // both claims begin together, on different connections
+			got, err := Claim(ctx, handles[i], clock, nodes[i], 1)
 			if err != nil {
 				t.Errorf("Claim(%d): %v", i, err)
 				return
@@ -40,6 +62,7 @@ func TestClaimIsExactlyOnceUnderConcurrency(t *testing.T) {
 			results[i] = got
 		}(i)
 	}
+	close(start)
 	wg.Wait()
 
 	total := len(results[0]) + len(results[1])
@@ -240,7 +263,7 @@ func TestClaimAndCreateEndpointsRequireTheirOwnToken(t *testing.T) {
 	srv, _ := newServer(t)
 	h := srv.Handler()
 
-	reg := postJSON(t, h, "/nodes/register", "", RegisterRequest{Name: "a", Role: "executor"})
+	reg := postJSON(t, h, "/nodes/register", testEnrollToken, RegisterRequest{Name: "a", Role: "executor"})
 	if reg.Code != http.StatusCreated {
 		t.Fatalf("register = %d: %s", reg.Code, reg.Body)
 	}
@@ -269,7 +292,7 @@ func TestCreateItemThenClaimOverHTTP(t *testing.T) {
 	srv, clock := newServer(t)
 	h := srv.Handler()
 
-	reg := postJSON(t, h, "/nodes/register", "", RegisterRequest{
+	reg := postJSON(t, h, "/nodes/register", testEnrollToken, RegisterRequest{
 		Name: "a", Role: "executor", ProvidesDeclared: []string{"agentic"},
 		ReachClasses: []string{"host", "lan", "wan"}, Concurrency: 1,
 	})
@@ -360,7 +383,7 @@ func TestCreateItemAndClaimRejectMalformedJSON(t *testing.T) {
 		t.Fatalf("create error does not name the bad capability: %s", rec.Body)
 	}
 
-	reg := postJSON(t, h, "/nodes/register", "", RegisterRequest{Name: "a", Role: "executor"})
+	reg := postJSON(t, h, "/nodes/register", testEnrollToken, RegisterRequest{Name: "a", Role: "executor"})
 	var issued RegisterResponse
 	if err := json.Unmarshal(reg.Body.Bytes(), &issued); err != nil {
 		t.Fatalf("decode register response: %v", err)

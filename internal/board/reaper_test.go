@@ -663,3 +663,102 @@ func TestRunReaperStopsWhenTheContextIsCancelled(t *testing.T) {
 		t.Fatal("RunReaper did not return after its context was cancelled")
 	}
 }
+
+// C1: nothing used to take a node offline after registration. A laptop that
+// closed its lid stayed 'online' forever, so placement kept choosing it and
+// /why answered "placed: true" with a happy reason for work nothing would ever
+// claim — which inverts both the endpoint and the product.
+//
+// The sweep lives in the reaper, so this drives it through Reap and then asks
+// the operator's own question through Explain.
+func TestReapTakesASilentNodeOfflineAndWhySaysSo(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "laptop", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	itemID, err := CreateItem(ctx, db, clock, CreateItemRequest{
+		Title: "t", Brief: "b", Needs: []string{"agentic"},
+	})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+
+	// An operator pause is a decision, not silence: the sweep must never
+	// overwrite it, or pausing a node would last only until the next tick.
+	paused := SeedNodeForTest(t, db, clock, "pi", "steward", "reflex")
+	if _, err := db.ExecContext(ctx, `UPDATE nodes SET status='paused' WHERE id=?`, paused); err != nil {
+		t.Fatalf("pause node: %v", err)
+	}
+
+	// While the laptop is beating, the work is placeable — the answer the
+	// operator gets for a healthy board.
+	ex, err := Explain(ctx, db, clock, itemID)
+	if err != nil {
+		t.Fatalf("Explain while online: %v", err)
+	}
+	if !ex.Placed {
+		t.Fatalf("why says not placed while the node is online: %s %+v", ex.Reason, ex.Rejects)
+	}
+
+	// Exactly one window of silence is not yet stale: the rule is "older than".
+	clock.Advance(nodeStaleAfter * time.Second)
+	if res, err := Reap(ctx, db, clock); err != nil {
+		t.Fatalf("Reap at the boundary: %v", err)
+	} else if res.NodesOffline != 0 {
+		t.Fatalf("reap at exactly one window took %d nodes offline, want 0", res.NodesOffline)
+	}
+
+	// A second past the window, the node is taken offline.
+	clock.Advance(1 * time.Second)
+	res, err := Reap(ctx, db, clock)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if res.NodesOffline != 1 {
+		t.Fatalf("NodesOffline = %d, want 1 (the silent laptop; the paused node is not silence)", res.NodesOffline)
+	}
+
+	var status string
+	if err := db.QueryRow(`SELECT status FROM nodes WHERE id=?`, node).Scan(&status); err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if status != "offline" {
+		t.Fatalf("node status = %q, want offline after a silent window", status)
+	}
+	if err := db.QueryRow(`SELECT status FROM nodes WHERE id=?`, paused).Scan(&status); err != nil {
+		t.Fatalf("read paused node: %v", err)
+	}
+	if status != "paused" {
+		t.Fatalf("paused node status = %q, want the operator pause preserved", status)
+	}
+
+	// The sweep is idempotent: the next pass has nothing left to change, so a
+	// slow heartbeat cannot be counted twice.
+	if res, err := Reap(ctx, db, clock); err != nil {
+		t.Fatalf("second Reap: %v", err)
+	} else if res.NodesOffline != 0 {
+		t.Fatalf("second reap took %d nodes offline, want 0", res.NodesOffline)
+	}
+
+	// /why, asked again, must now name the reason instead of pretending the
+	// work is placeable.
+	ex, err = Explain(ctx, db, clock, itemID)
+	if err != nil {
+		t.Fatalf("Explain after the sweep: %v", err)
+	}
+	if ex.Placed {
+		t.Fatalf("why still says placed after the node went offline; reason %q", ex.Reason)
+	}
+	var named bool
+	for _, r := range ex.Rejects {
+		if r.NodeName == "laptop" && strings.Contains(r.Why, "offline") {
+			named = true
+		}
+	}
+	if !named {
+		t.Fatalf("why rejects %+v do not name the silent node as offline", ex.Rejects)
+	}
+	if ex.BlockedReason == "" {
+		t.Fatal("why has no blocked_reason after the node went offline")
+	}
+}

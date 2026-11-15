@@ -82,11 +82,14 @@ func StartRun(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 
 // ReapResult counts what one pass changed. Abandoned and Lost are run
 // outcomes and are mutually exclusive; Failed is an item outcome, so a lost
-// run whose item also exhausted its budget increments both.
+// run whose item also exhausted its budget increments both. NodesOffline counts
+// nodes this pass took offline for silence, which is a different failure from a
+// lease expiring.
 type ReapResult struct {
-	Abandoned int `json:"abandoned"`
-	Lost      int `json:"lost"`
-	Failed    int `json:"failed"`
+	Abandoned    int `json:"abandoned"`
+	Lost         int `json:"lost"`
+	Failed       int `json:"failed"`
+	NodesOffline int `json:"nodes_offline"`
 }
 
 // reapOutcome is what settling one item did. A skipped item was settled or its
@@ -132,7 +135,46 @@ func Reap(ctx context.Context, db *sql.DB, clock Clock) (ReapResult, error) {
 			res.Failed++
 		}
 	}
+
+	// Node liveness is swept in the same pass as leases, because it is the
+	// same question asked about the other side: a node whose lease looks live
+	// but whose heartbeats stopped is exactly the failure the board must not
+	// hide. A sweep failure is reported alongside the item errors rather than
+	// replacing them.
+	nodesOffline, err := offlineStaleNodes(ctx, db, now)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	res.NodesOffline = nodesOffline
 	return res, errors.Join(errs...)
+}
+
+// offlineStaleNodes takes every node that has not heartbeated within
+// nodeStaleAfter offline, in one guarded UPDATE.
+//
+// Without this, `status` is written 'offline' only at registration and a node
+// that closes its lid stays 'online' forever: placement would keep choosing it
+// and /why would answer "placed: true" with a happy reason for work nothing
+// will ever claim. That inverts both the endpoint and the product.
+//
+// 'paused' is never touched — that is an operator decision, not silence — and
+// a node that has never heartbeated has last_seen_at NULL and is already
+// offline. The write is idempotent: a second pass over the same silence
+// changes nothing and counts zero, so a slow heartbeat cannot be counted twice.
+func offlineStaleNodes(ctx context.Context, db *sql.DB, now int64) (int, error) {
+	res, err := db.ExecContext(ctx,
+		`UPDATE nodes SET status='offline'
+		  WHERE status NOT IN ('offline','paused')
+		    AND last_seen_at IS NOT NULL AND last_seen_at < ?`,
+		now-nodeStaleAfter)
+	if err != nil {
+		return 0, fmt.Errorf("sweep stale nodes: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
 }
 
 // expiredItemIDs is the scan. It selects ids only: every column that decides an

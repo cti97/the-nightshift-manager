@@ -118,3 +118,16 @@ func (c *Client) Report(ctx context.Context, runID string, req board.ReportReque
 	err := c.post(ctx, runPath(runID, "report"), req, &out)
 	return out, err
 }
+
+// Enroll registers this node with the board and returns the node id and the
+// token it must use from then on. It is the one call a node makes before it has
+// a node token, so it carries the enrollment credential instead — a secret the
+// manager can use to register nodes and nothing else (never the admin token).
+func Enroll(ctx context.Context, baseURL, enrollToken string, req board.RegisterRequest) (board.RegisterResponse, error) {
+	var out board.RegisterResponse
+	c := NewClient(baseURL, enrollToken)
+	if err := c.post(ctx, "/nodes/register", req, &out); err != nil {
+		return out, err
+	}
+	return out, nil
+}

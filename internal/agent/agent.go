@@ -24,13 +24,17 @@ const freeSlots = 1
 // Report is the one call the loop retries. board.Report is idempotent by design
 // — the first report wins and later ones are answered with applied=false — so a
 // retry cannot settle a run twice, while a dropped report would discard a
-// completed run and let the reaper charge the item for it again. A few hundred
-// milliseconds of retries is the cheaper trade.
+// completed run: the lease then expires, the reaper requeues the item, the work
+// executes a second time and its tokens are never recorded. That asymmetry is
+// why the window is generous rather than tight: five tries over roughly thirty
+// seconds rides out a network blip, and the idempotency is what makes waiting
+// safe.
 //
 // reportAttempts counts total tries, not retries.
 const (
-	reportAttempts = 3
-	reportBackoff  = 100 * time.Millisecond
+	reportAttempts    = 5
+	reportBackoffBase = 2 * time.Second
+	reportBackoffCap  = 15 * time.Second
 )
 
 type Config struct {
@@ -49,6 +53,14 @@ type Config struct {
 type Agent struct {
 	cfg Config
 	c   *Client
+
+	// Report retry policy. It is per-Agent rather than read from the package
+	// constants at call time so a test can shrink the window without sleeping
+	// for the real thirty seconds, and so two agents cannot share mutable
+	// policy. New fills it from the constants above.
+	reportTries        int
+	reportBackoff      time.Duration // first wait; doubles per retry
+	reportBackoffLimit time.Duration // cap on any single wait
 
 	// lastStatus is the last heartbeat status already logged. Only the
 	// heartbeat goroutine writes it after Run's initial synchronous call, so it
@@ -69,7 +81,31 @@ func New(cfg Config) *Agent {
 		// protocol version is not a zero value.
 		cfg.Protocol = board.ProtocolMax
 	}
-	return &Agent{cfg: cfg, c: NewClient(cfg.BaseURL, cfg.Token)}
+	return &Agent{
+		cfg:                cfg,
+		c:                  NewClient(cfg.BaseURL, cfg.Token),
+		reportTries:        reportAttempts,
+		reportBackoff:      reportBackoffBase,
+		reportBackoffLimit: reportBackoffCap,
+	}
+}
+
+// reportWait is the backoff before retry n (1-based): the base doubled each
+// time and capped. The cap keeps any single wait from outgrowing the window the
+// retry budget is meant to fit in; with the defaults the schedule is 2s, 4s,
+// 8s, 15s — five tries over roughly half a minute.
+func (a *Agent) reportWait(retry int) time.Duration {
+	wait := a.reportBackoff
+	for i := 1; i < retry; i++ {
+		if wait >= a.reportBackoffLimit {
+			return a.reportBackoffLimit
+		}
+		wait *= 2
+	}
+	if wait > a.reportBackoffLimit {
+		wait = a.reportBackoffLimit
+	}
+	return wait
 }
 
 // Run is the loop from spec §10: heartbeat, claim, start, execute, report. It
@@ -203,11 +239,9 @@ func (a *Agent) noteStatus(resp board.HeartbeatResponse) {
 	a.lastStatus = resp.Status
 }
 
-// execute runs one claim: start the run, delegate, report. Each step is
-// one-way. A refused start is not retried (the run is gone or not ours) and a
-// failed report is not retried either — the first report wins, and a retry
-// after an ambiguous failure would be answered idempotently by the board
-// anyway.
+// execute runs one claim: start the run, delegate, report. A refused start is
+// not retried — the run is gone or not ours, and Start is not idempotent — but
+// a failed report is, because Report is idempotent by design: see report.
 func (a *Agent) execute(ctx context.Context, it board.ClaimedItem) {
 	if it.RunID == "" {
 		a.logf("claim for item %s carries no run id; skipping", it.Item.ID)
@@ -259,15 +293,16 @@ func (a *Agent) report(ctx context.Context, runID string, req board.ReportReques
 		if ctx.Err() != nil { // shutdown, not a board failure
 			return
 		}
-		if attempt >= reportAttempts {
+		if attempt >= a.reportTries {
 			a.logf("report run %s: giving up after %d attempts: %v", runID, attempt, err)
 			return
 		}
-		a.logf("report run %s (attempt %d/%d): %v; retrying", runID, attempt, reportAttempts, err)
+		wait := a.reportWait(attempt)
+		a.logf("report run %s (attempt %d/%d): %v; retrying in %s", runID, attempt, a.reportTries, err, wait)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(reportBackoff * time.Duration(attempt)):
+		case <-time.After(wait):
 		}
 	}
 }

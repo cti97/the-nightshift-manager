@@ -6,11 +6,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/cti97/the-nightshift-manager/internal/caps"
 )
 
 const leaseSeconds = 300
+
+// nodeStaleAfter is how long a node may go without a heartbeat before the
+// reaper takes it offline: two leases, so one missed beat is not enough. A
+// node that has not been heard from inside this window cannot be handed work —
+// a laptop that closed its lid would otherwise stay 'online' forever and /why
+// would answer "placed: true" for work nothing will ever claim.
+const nodeStaleAfter = 2 * leaseSeconds
 
 // ProtocolMin/Max are what this binary can speak. A node outside the range is
 // marked incompatible rather than left crash-looping (spec §20).
@@ -33,6 +42,38 @@ func marshalList(v []string) string {
 	}
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// reachClassVocabulary is the closed set of reach classes a node may declare.
+// Placement matches these by exact string equality, so a node that stores
+// anything else — "Host", "wifi", "" — is eligible for nothing: it heartbeats
+// happily and claims nothing forever. Rejecting at write time is the same rule
+// the capability vocabulary follows (caps.Parse), and it makes the typo surface
+// in the call that caused it.
+var reachClassVocabulary = map[string]struct{}{
+	"host": {}, "lan": {}, "wan": {},
+}
+
+// parseReachClasses validates and canonicalises a declared reach set: trimmed,
+// de-duplicated and sorted so the stored bytes depend only on the set. An empty
+// list is legitimate (a node that can reach nothing), but an entry outside the
+// vocabulary is an error naming the offending value.
+func parseReachClasses(raw []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, c := range raw {
+		c = strings.TrimSpace(c)
+		if _, ok := reachClassVocabulary[c]; !ok {
+			return nil, fmt.Errorf("unknown reach class %q (want host, lan or wan)", c)
+		}
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // nodeWriteFound checks that a heartbeat UPDATE matched a node. database/sql
@@ -89,6 +130,10 @@ func RegisterNode(ctx context.Context, db *sql.DB, clock Clock, req RegisterRequ
 	if err != nil {
 		return "", "", err
 	}
+	reach, err := parseReachClasses(req.ReachClasses)
+	if err != nil {
+		return "", "", err
+	}
 	token, err := NewToken()
 	if err != nil {
 		return "", "", err
@@ -99,7 +144,7 @@ func RegisterNode(ctx context.Context, db *sql.DB, clock Clock, req RegisterRequ
 	}
 
 	declaredJSON := marshalList(declared)
-	reachJSON := marshalList(req.ReachClasses)
+	reachJSON := marshalList(reach)
 	conc := req.Concurrency
 	if conc < 1 {
 		conc = 1
@@ -147,8 +192,14 @@ func Heartbeat(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req 
 	if err != nil {
 		return HeartbeatResponse{}, err
 	}
+	// Validated before any write, so a heartbeat carrying a typo changes
+	// nothing: the node keeps its last good live set and status.
+	reach, err := parseReachClasses(req.ReachClasses)
+	if err != nil {
+		return HeartbeatResponse{}, err
+	}
 	liveJSON := marshalList(live)
-	reachJSON := marshalList(req.ReachClasses)
+	reachJSON := marshalList(reach)
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {

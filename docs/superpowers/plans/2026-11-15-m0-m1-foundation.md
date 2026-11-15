@@ -1593,7 +1593,7 @@ Add imports `flag`, `net/http`, and the board package.
 
 ```bash
 go build -o /tmp/nsm ./cmd/nsm
-NSM_ADMIN_TOKEN=dev /tmp/nsm manager serve --addr 127.0.0.1:8099 --db /tmp/nsm-smoke.db &
+NSM_ADMIN_TOKEN=dev NSM_ENROLL_TOKEN=enroll /tmp/nsm manager serve --addr 127.0.0.1:8099 --db /tmp/nsm-smoke.db &
 sleep 1
 curl -s http://127.0.0.1:8099/version
 curl -s -H 'Authorization: Bearer dev' http://127.0.0.1:8099/admin/board
@@ -3609,9 +3609,18 @@ go test ./... -count=1          # green
 go test ./... -race -count=1    # green, no races
 go vet ./...                    # clean
 make release && ls dist/        # 6 artifacts + SHA256SUMS + BUILD-INFO
-NSM_ADMIN_TOKEN=dev ./bin/nsm manager serve --db /tmp/nsm.db &
+
+# The manager needs two credentials, and they must differ: the admin token drives
+# the admin API, the enrollment token can only register a node.
+NSM_ADMIN_TOKEN=dev NSM_ENROLL_TOKEN=enroll ./bin/nsm manager serve --db /tmp/nsm.db &
 curl -s localhost:8081/version   # version JSON, no token required
+
+# Enrollment is authenticated: the node gets its own token, shown once.
+NSM_ENROLL_TOKEN=enroll ./bin/nsm node register \
+    --name laptop --role executor --provides agentic --reach host,lan
+NSM_NODE_TOKEN=<printed token> ./bin/nsm agent run \
+    --node <printed node id> --provides agentic --reach host,lan
 ```
 
-And one manual proof that the design claim holds: register two nodes, create one item, start
-one agent on each, and confirm exactly one `run` row exists for the item.
+And one manual proof that the design claim holds: register two nodes with the enrollment token,
+create one item, start one agent on each, and confirm exactly one `run` row exists for the item.

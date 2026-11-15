@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -133,5 +137,161 @@ func TestParseAgentConfigRejectsEmptyCapabilityEntry(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "empty entry") {
 		t.Fatalf("stderr = %q, want the empty-entry error", errOut.String())
+	}
+}
+
+// managerTokens is the one place both credentials enter the process. They must
+// be distinct: the enrollment secret exists so an enrolling node never carries
+// the admin credential, and setting both to one value would quietly hand every
+// node the keys to the board.
+func TestManagerTokensRequiresTwoDistinctCredentials(t *testing.T) {
+	t.Setenv("NSM_ADMIN_TOKEN", "")
+	var errOut bytes.Buffer
+	if _, _, ok := managerTokens(&errOut); ok {
+		t.Fatal("managerTokens accepted a missing admin token")
+	}
+	if !strings.Contains(errOut.String(), "NSM_ADMIN_TOKEN") {
+		t.Fatalf("stderr = %q, want NSM_ADMIN_TOKEN named", errOut.String())
+	}
+
+	t.Setenv("NSM_ADMIN_TOKEN", "admin")
+	for _, tc := range []struct{ enroll, want string }{
+		{"", "NSM_ENROLL_TOKEN is required"},
+		{"admin", "must differ"},
+	} {
+		t.Setenv("NSM_ENROLL_TOKEN", tc.enroll)
+		var buf bytes.Buffer
+		if _, _, ok := managerTokens(&buf); ok {
+			t.Fatalf("managerTokens accepted enroll=%q alongside admin", tc.enroll)
+		}
+		if !strings.Contains(buf.String(), tc.want) {
+			t.Fatalf("stderr = %q, want it to contain %q", buf.String(), tc.want)
+		}
+	}
+
+	t.Setenv("NSM_ENROLL_TOKEN", "enroll")
+	var noise bytes.Buffer
+	admin, enroll, valid := managerTokens(&noise)
+	if !valid || admin != "admin" || enroll != "enroll" {
+		t.Fatalf("managerTokens = (%q, %q, %v), want admin/enroll/true", admin, enroll, valid)
+	}
+	if noise.Len() != 0 {
+		t.Fatalf("unexpected output: %q", noise.String())
+	}
+}
+
+// field reads a "key: value" line from the register command's stdout.
+func field(t *testing.T, stdout, key string) string {
+	t.Helper()
+	for _, line := range strings.Split(stdout, "\n") {
+		if rest, found := strings.CutPrefix(line, key+": "); found {
+			return rest
+		}
+	}
+	return ""
+}
+
+// The enrollment path end to end: the CLI sends the enrollment credential, the
+// real board accepts it, and the token it prints is one the node can actually
+// authenticate with. A node that cannot register cannot exist, so this is the
+// smoke path for C2.
+func TestNodeRegisterEnrollsAgainstARealBoard(t *testing.T) {
+	db, clock := board.OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	srv := httptest.NewServer(board.NewServer(db, clock,
+		board.HashToken("admin-token"), board.HashToken("enroll-token")).Handler())
+	defer srv.Close()
+
+	t.Setenv("NSM_ENROLL_TOKEN", "enroll-token")
+	var out, errOut bytes.Buffer
+	code := run([]string{"node", "register",
+		"--board", srv.URL, "--name", "laptop",
+		"--provides", "agentic", "--reach", "host,lan", "--concurrency", "2",
+	}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, errOut.String())
+	}
+
+	nodeID := field(t, out.String(), "node_id")
+	nodeToken := field(t, out.String(), "token")
+	if nodeID == "" || nodeToken == "" {
+		t.Fatalf("stdout = %q, want a node_id and a token", out.String())
+	}
+	if !strings.Contains(errOut.String(), "NSM_NODE_TOKEN") {
+		t.Fatalf("stderr = %q, want it to tell the operator where the token goes", errOut.String())
+	}
+
+	var status, reach string
+	if err := db.QueryRow(`SELECT status, reach_classes FROM nodes WHERE id=?`, nodeID).Scan(&status, &reach); err != nil {
+		t.Fatalf("read the registered node: %v", err)
+	}
+	if status != "offline" {
+		t.Fatalf("node status = %q, want offline until the first heartbeat", status)
+	}
+	if reach != `["host","lan"]` {
+		t.Fatalf("reach_classes = %s, want the declared set", reach)
+	}
+
+	// The printed token is the node credential: it heartbeats.
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/nodes/heartbeat",
+		strings.NewReader(`{"protocol_version":1,"provides_live":["agentic"],"reach_classes":["host","lan"]}`))
+	if err != nil {
+		t.Fatalf("build heartbeat: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+nodeToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("heartbeat with the issued token = %d, want 200", resp.StatusCode)
+	}
+	var beat board.HeartbeatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&beat); err != nil {
+		t.Fatalf("decode heartbeat: %v", err)
+	}
+	if beat.Status != "online" {
+		t.Fatalf("heartbeat status = %q, want online", beat.Status)
+	}
+}
+
+// A wrong enrollment credential is a board refusal, not a crash: the command
+// exits 1 and says what the board said.
+func TestNodeRegisterReportsAnEnrollmentRefusal(t *testing.T) {
+	db, clock := board.OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	srv := httptest.NewServer(board.NewServer(db, clock,
+		board.HashToken("admin-token"), board.HashToken("enroll-token")).Handler())
+	defer srv.Close()
+
+	t.Setenv("NSM_ENROLL_TOKEN", "wrong")
+	var out, errOut bytes.Buffer
+	if code := run([]string{"node", "register", "--board", srv.URL, "--name", "laptop"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit = %d, want 1 (stderr: %s)", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "401") {
+		t.Fatalf("stderr = %q, want the board's refusal", errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout = %q, want nothing on a refusal", out.String())
+	}
+
+	var nodes int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&nodes); err != nil {
+		t.Fatalf("count nodes: %v", err)
+	}
+	if nodes != 0 {
+		t.Fatalf("nodes = %d after a refused enrollment, want 0", nodes)
+	}
+}
+
+func TestNodeRegisterRequiresEnrollToken(t *testing.T) {
+	t.Setenv("NSM_ENROLL_TOKEN", "")
+	var out, errOut bytes.Buffer
+	if code := run([]string{"node", "register", "--name", "laptop"}, &out, &errOut); code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
+	}
+	if !strings.Contains(errOut.String(), "NSM_ENROLL_TOKEN") {
+		t.Fatalf("stderr = %q, want NSM_ENROLL_TOKEN named", errOut.String())
 	}
 }

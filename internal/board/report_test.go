@@ -680,3 +680,40 @@ func seedNodeTokenForTest(t *testing.T, db *sql.DB, clock *FixedClock, name, rol
 	}
 	return id, token
 }
+
+// An item that exists but cannot be explained is a 500 that names the column.
+// Answering 404 would tell the operator to stop looking for a row that is right
+// there — at the moment they most need the explainer. A genuinely missing item
+// stays a 404.
+func TestWhyRouteDistinguishesACorruptRowFromAMissingItem(t *testing.T) {
+	srv, clock := newServer(t)
+	ctx := context.Background()
+	SeedNodeForTest(t, srv.db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, srv.db, clock, "local", "host", 0, "tools")
+	itemID, err := CreateItem(ctx, srv.db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	h := srv.Handler()
+
+	rec := do(t, h, "GET", "/admin/why/no-such-item", testAdminToken)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("why for a missing item = %d, want 404 (body %s)", rec.Code, rec.Body)
+	}
+	assertErrorCode(t, rec, "not_found")
+
+	if _, err := srv.db.ExecContext(ctx, `UPDATE work_items SET needs='not-json' WHERE id=?`, itemID); err != nil {
+		t.Fatalf("corrupt the needs column: %v", err)
+	}
+	rec = do(t, h, "GET", "/admin/why/"+itemID, testAdminToken)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("why on a corrupt row = %d, want 500 (body %s)", rec.Code, rec.Body)
+	}
+	assertErrorCode(t, rec, "why")
+	if !strings.Contains(rec.Body.String(), "needs") {
+		t.Fatalf("why error %s does not name the offending column", rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), itemID) {
+		t.Fatalf("why error %s does not name the item that exists", rec.Body)
+	}
+}

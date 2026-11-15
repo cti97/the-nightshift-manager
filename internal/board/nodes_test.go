@@ -327,7 +327,7 @@ func TestNodeAuthAcceptsIssuedTokenAndRejectsRotatedOrUnknown(t *testing.T) {
 	srv, _ := newServer(t)
 	h := srv.Handler()
 
-	rec := postJSON(t, h, "/nodes/register", "", RegisterRequest{
+	rec := postJSON(t, h, "/nodes/register", testEnrollToken, RegisterRequest{
 		Name: "home-laptop", Role: "executor",
 		ProvidesDeclared: []string{"agentic"}, ReachClasses: []string{"host"}, Concurrency: 1,
 	})
@@ -534,10 +534,10 @@ func TestRegisterHandlerReturnsConflictForDuplicateName(t *testing.T) {
 	h := srv.Handler()
 	body := RegisterRequest{Name: "pi", Role: "steward", ProvidesDeclared: []string{"reflex"}}
 
-	if rec := postJSON(t, h, "/nodes/register", "", body); rec.Code != http.StatusCreated {
+	if rec := postJSON(t, h, "/nodes/register", testEnrollToken, body); rec.Code != http.StatusCreated {
 		t.Fatalf("first register = %d, want 201: %s", rec.Code, rec.Body)
 	}
-	rec := postJSON(t, h, "/nodes/register", "", body)
+	rec := postJSON(t, h, "/nodes/register", testEnrollToken, body)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("duplicate register = %d, want 409: %s", rec.Code, rec.Body)
 	}
@@ -553,7 +553,7 @@ func TestHandlersRejectMalformedJSON(t *testing.T) {
 	srv, _ := newServer(t)
 	h := srv.Handler()
 
-	rec := postRaw(t, h, "/nodes/register", "", "{")
+	rec := postRaw(t, h, "/nodes/register", testEnrollToken, "{")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("malformed register = %d, want 400: %s", rec.Code, rec.Body)
 	}
@@ -561,7 +561,7 @@ func TestHandlersRejectMalformedJSON(t *testing.T) {
 		t.Fatalf("register error code = %q, want bad_json", code)
 	}
 
-	reg := postJSON(t, h, "/nodes/register", "", RegisterRequest{Name: "pi", Role: "steward"})
+	reg := postJSON(t, h, "/nodes/register", testEnrollToken, RegisterRequest{Name: "pi", Role: "steward"})
 	if reg.Code != http.StatusCreated {
 		t.Fatalf("register = %d, want 201: %s", reg.Code, reg.Body)
 	}
@@ -611,5 +611,132 @@ func TestPauseSurvivesIncompatibleThenGoodHeartbeat(t *testing.T) {
 	}
 	if status != "paused" {
 		t.Fatalf("status = %q after a good heartbeat, want the pause preserved", status)
+	}
+}
+
+// Registration mints a credential that can claim work — and a claim carries the
+// operator's brief — so it must require a credential of its own, and that
+// credential must not be the admin token (spec §15 read register as a
+// node-token endpoint, which cannot bootstrap itself; the enrollment secret can
+// register and nothing else).
+func TestRegisterRequiresTheEnrollTokenAndTheAdminTokenCannotEnroll(t *testing.T) {
+	srv, _ := newServer(t)
+	h := srv.Handler()
+	body := RegisterRequest{Name: "home-laptop", Role: "executor", ReachClasses: []string{"host"}}
+
+	for _, tc := range []struct{ bearer, why string }{
+		{"", "no token"},
+		{testAdminToken, "the admin token is not an enrollment credential"},
+		{testEnrollToken + "x", "a wrong enrollment token"},
+	} {
+		rec := postJSON(t, h, "/nodes/register", tc.bearer, body)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("register with %s = %d, want 401 (body %s)", tc.why, rec.Code, rec.Body)
+		}
+		if strings.Contains(rec.Body.String(), `"token":`) {
+			t.Fatalf("a refused registration leaked a node token: %s", rec.Body)
+		}
+	}
+
+	rec := postJSON(t, h, "/nodes/register", testEnrollToken, body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("register with the enrollment token = %d, want 201 (body %s)", rec.Code, rec.Body)
+	}
+	var issued RegisterResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &issued); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+	if issued.NodeID == "" || issued.Token == "" {
+		t.Fatalf("register response = %+v, want an id and a token", issued)
+	}
+
+	// The two credentials are not interchangeable in either direction: the
+	// enrollment secret can do exactly one thing.
+	if rec := do(t, h, "GET", "/admin/board", testEnrollToken); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/admin/board with the enrollment token = %d, want 401", rec.Code)
+	}
+	if rec := do(t, h, "GET", "/admin/board", testAdminToken); rec.Code != http.StatusOK {
+		t.Fatalf("/admin/board with the admin token = %d, want 200", rec.Code)
+	}
+}
+
+// A server configured without an enrollment secret must refuse to mint tokens.
+// Failing open would undo the credential entirely.
+func TestRegisterFailsClosedWithoutAnEnrollSecret(t *testing.T) {
+	db, clock := newTestDB(t)
+	h := NewServer(db, clock, HashToken(testAdminToken), "").Handler()
+
+	for _, bearer := range []string{"", testAdminToken, testEnrollToken} {
+		rec := postJSON(t, h, "/nodes/register", bearer, RegisterRequest{Name: "a", Role: "executor"})
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("register with %q on an enroll-less server = %d, want 401", bearer, rec.Code)
+		}
+	}
+}
+
+// reach_classes is compared by exact string equality in placement, so a node
+// that stores "Host" heartbeats happily and claims nothing forever. Both
+// writers reject the value by name, and the heartbeat writes nothing at all.
+func TestReachClassesAreValidatedOnRegisterAndHeartbeat(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+
+	_, _, err := RegisterNode(ctx, db, clock, RegisterRequest{
+		Name: "typo", Role: "executor", ReachClasses: []string{"host", "Host"},
+	})
+	if err == nil {
+		t.Fatalf("registration accepted reach class %q", "Host")
+	}
+	if !strings.Contains(err.Error(), `"Host"`) {
+		t.Fatalf("error %q does not name the offending reach class", err)
+	}
+	var nodes int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&nodes); err != nil {
+		t.Fatalf("count nodes: %v", err)
+	}
+	if nodes != 0 {
+		t.Fatalf("nodes = %d after a rejected registration, want 0", nodes)
+	}
+
+	// Accepted values are canonicalised: trimmed, de-duplicated, sorted.
+	id, _, err := RegisterNode(ctx, db, clock, RegisterRequest{
+		Name: "home-laptop", Role: "executor", ReachClasses: []string{" lan ", "host", "host"},
+	})
+	if err != nil {
+		t.Fatalf("register with valid reach classes: %v", err)
+	}
+	var reach string
+	if err := db.QueryRow(`SELECT reach_classes FROM nodes WHERE id=?`, id).Scan(&reach); err != nil {
+		t.Fatalf("read reach: %v", err)
+	}
+	if reach != `["host","lan"]` {
+		t.Fatalf("reach_classes = %s, want the canonical [\"host\",\"lan\"]", reach)
+	}
+
+	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{
+		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host"}, Protocol: 1,
+	}); err != nil {
+		t.Fatalf("good heartbeat: %v", err)
+	}
+
+	_, err = Heartbeat(ctx, db, clock, id, HeartbeatRequest{
+		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"wan", "wfi"}, Protocol: 1,
+	})
+	if err == nil {
+		t.Fatalf("heartbeat accepted reach class %q", "wfi")
+	}
+	if !strings.Contains(err.Error(), `"wfi"`) {
+		t.Fatalf("error %q does not name the offending reach class", err)
+	}
+
+	// Nothing was written by the refused heartbeat: the node keeps its last
+	// good status, live set and reach set.
+	var status, live string
+	if err := db.QueryRow(`SELECT status, provides_live, reach_classes FROM nodes WHERE id=?`, id).
+		Scan(&status, &live, &reach); err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if status != "online" || live != `["agentic"]` || reach != `["host"]` {
+		t.Fatalf("node = (status %q, live %s, reach %s), want the last good heartbeat kept", status, live, reach)
 	}
 }

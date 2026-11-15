@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -18,10 +19,21 @@ type Server struct {
 	db             *sql.DB
 	clock          Clock
 	adminTokenHash string
+	// enrollTokenHash is a credential that can do exactly one thing: register a
+	// node. It is deliberately not the admin token (spec §15 read register as a
+	// node-token endpoint, which cannot bootstrap itself): an enrolling machine
+	// must never hold the credential that can create items, read every brief and
+	// drive the admin API.
+	enrollTokenHash string
 }
 
-func NewServer(db *sql.DB, clock Clock, adminTokenHash string) *Server {
-	return &Server{db: db, clock: clock, adminTokenHash: adminTokenHash}
+func NewServer(db *sql.DB, clock Clock, adminTokenHash, enrollTokenHash string) *Server {
+	return &Server{
+		db:              db,
+		clock:           clock,
+		adminTokenHash:  adminTokenHash,
+		enrollTokenHash: enrollTokenHash,
+	}
 }
 
 // HashToken is the only form in which a credential is stored or compared.
@@ -44,7 +56,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.Handle("GET /admin/board", s.adminAuth(http.HandlerFunc(s.handleBoard)))
 	mux.Handle("POST /admin/items", s.adminAuth(http.HandlerFunc(s.handleCreateItem)))
-	mux.HandleFunc("POST /nodes/register", s.handleRegister)
+	mux.Handle("POST /nodes/register", s.enrollAuth(http.HandlerFunc(s.handleRegister)))
 	mux.Handle("POST /nodes/heartbeat", s.nodeAuth(http.HandlerFunc(s.handleHeartbeat)))
 	mux.Handle("POST /claim", s.nodeAuth(http.HandlerFunc(s.handleClaim)))
 	mux.Handle("POST /runs/{id}/start", s.nodeAuth(http.HandlerFunc(s.handleStartRun)))
@@ -71,6 +83,21 @@ func bearer(r *http.Request) (string, bool) {
 		return "", false
 	}
 	return h[len(p):], true
+}
+
+// enrollAuth gates registration with the enrollment credential. An empty enroll
+// hash authenticates nothing: a manager started without an enrollment secret
+// must not mint node tokens, because every token it mints can claim work and
+// read the operator's prose. Failing closed is the only safe default.
+func (s *Server) enrollAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := bearer(r)
+		if !ok || s.enrollTokenHash == "" || HashToken(tok) != s.enrollTokenHash {
+			WriteError(w, http.StatusUnauthorized, "unauthorized", "enrollment token required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 type ctxKey string
@@ -182,10 +209,19 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 // handleWhy is the operator's explanation endpoint. It returns the whole
 // placement decision, rejects included, because the summary reason alone does
 // not say which rule failed for which node.
+//
+// An unknown item is a 404. Anything else — a corrupt needs column, a broken
+// board — is a 500 that names what could not be read: the item exists, and
+// answering "not found" would send the operator looking for a row that is right
+// there, at the moment they most need the explainer.
 func (s *Server) handleWhy(w http.ResponseWriter, r *http.Request) {
 	ex, err := Explain(r.Context(), s.db, s.clock, r.PathValue("id"))
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "not_found", err.Error())
+		if errors.Is(err, sql.ErrNoRows) {
+			WriteError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		WriteError(w, http.StatusInternalServerError, "why", err.Error())
 		return
 	}
 	WriteJSON(w, http.StatusOK, ex)

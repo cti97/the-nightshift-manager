@@ -33,11 +33,16 @@ func Explain(ctx context.Context, db *sql.DB, clock Clock, itemID string) (Expla
 	if err := db.QueryRowContext(ctx,
 		`SELECT id, status, needs FROM work_items WHERE id=?`, itemID).
 		Scan(&ex.ItemID, &ex.Status, &needsJSON); err != nil {
+		// sql.ErrNoRows stays wrapped (not swallowed into a new error): the HTTP
+		// layer tells "this item does not exist" from "this item cannot be read"
+		// by errors.Is, and the two answers are 404 and 500.
 		return ex, fmt.Errorf("item %s: %w", itemID, err)
 	}
 	needs, err := decodeList(needsJSON)
 	if err != nil {
-		return ex, err
+		// Name the column. A corrupt row must not read as "not found": the item
+		// is right there, and the operator needs to know which column to look at.
+		return ex, fmt.Errorf("work_items.needs for item %s: %w", itemID, err)
 	}
 	ex.Needs = needs
 

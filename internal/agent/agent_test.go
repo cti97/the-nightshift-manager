@@ -51,7 +51,7 @@ func newFixture(t *testing.T, wrap ...func(http.Handler) http.Handler) *fixture 
 		t.Fatalf("create item: %v", err)
 	}
 
-	var h http.Handler = board.NewServer(db, clock, board.HashToken("admin")).Handler()
+	var h http.Handler = board.NewServer(db, clock, board.HashToken("admin"), board.HashToken("enroll")).Handler()
 	for _, w := range wrap {
 		h = w(h)
 	}
@@ -308,7 +308,7 @@ func TestAgentRetriesATransientReportFailure(t *testing.T) {
 	exec := StubExecutor{OnRun: func(item board.ClaimedItem) (Result, error) {
 		return Result{Summary: "made it"}, nil
 	}}
-	a := New(f.config(exec))
+	a := withFastReportRetries(New(f.config(exec)))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	errc := startAgent(a, ctx)
@@ -352,7 +352,7 @@ func TestAgentGivesUpAfterBoundedReportRetries(t *testing.T) {
 	exec := StubExecutor{OnRun: func(item board.ClaimedItem) (Result, error) {
 		return Result{Summary: "made it"}, nil
 	}}
-	a := New(f.config(exec))
+	a := withFastReportRetries(New(f.config(exec)))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	errc := startAgent(a, ctx)
@@ -534,4 +534,45 @@ func TestRefusedClaimDoesNotSpin(t *testing.T) {
 
 	cancel()
 	waitAgent(t, errc, context.Canceled)
+}
+
+// withFastReportRetries shrinks the retry window so a test drives the same loop
+// without waiting half a minute. The real policy is pinned separately by
+// TestReportRetryWindowIsAboutThirtySeconds.
+func withFastReportRetries(a *Agent) *Agent {
+	a.reportBackoff = time.Millisecond
+	a.reportBackoffLimit = 5 * time.Millisecond
+	return a
+}
+
+// TestReportRetryWindowIsAboutThirtySeconds pins the size of the window, not
+// the loop: a one-second network blip must not discard a completed run, because
+// the dropped report lets the lease expire and the reaper executes the work a
+// second time while its tokens are never recorded. The retry is safe precisely
+// because board.Report is idempotent, which is why the window can be generous.
+func TestReportRetryWindowIsAboutThirtySeconds(t *testing.T) {
+	a := New(Config{BaseURL: "http://127.0.0.1:9", Token: "t", NodeID: "n", Executor: StubExecutor{}})
+
+	if a.reportTries != 5 {
+		t.Fatalf("report tries = %d, want 5", a.reportTries)
+	}
+	var total time.Duration
+	var prev time.Duration
+	for retry := 1; retry < a.reportTries; retry++ {
+		wait := a.reportWait(retry)
+		if wait <= 0 {
+			t.Fatalf("backoff before retry %d = %s, want a positive wait", retry, wait)
+		}
+		if wait < prev {
+			t.Fatalf("backoff before retry %d = %s shrank from %s", retry, wait, prev)
+		}
+		if wait > a.reportBackoffLimit {
+			t.Fatalf("backoff before retry %d = %s exceeds the %s cap", retry, wait, a.reportBackoffLimit)
+		}
+		prev = wait
+		total += wait
+	}
+	if total < 20*time.Second || total > 35*time.Second {
+		t.Fatalf("total retry window = %s, want roughly 30s", total)
+	}
 }
