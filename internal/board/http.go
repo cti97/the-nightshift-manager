@@ -47,6 +47,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /nodes/register", s.handleRegister)
 	mux.Handle("POST /nodes/heartbeat", s.nodeAuth(http.HandlerFunc(s.handleHeartbeat)))
 	mux.Handle("POST /claim", s.nodeAuth(http.HandlerFunc(s.handleClaim)))
+	mux.Handle("POST /runs/{id}/start", s.nodeAuth(http.HandlerFunc(s.handleStartRun)))
+	mux.Handle("POST /runs/{id}/report", s.nodeAuth(http.HandlerFunc(s.handleReport)))
+	mux.Handle("GET /admin/why/{id}", s.adminAuth(http.HandlerFunc(s.handleWhy)))
 	return mux
 }
 
@@ -146,6 +149,46 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		items = []ClaimedItem{}
 	}
 	WriteJSON(w, http.StatusOK, items)
+}
+
+// handleStartRun is the node's "I have begun executing" call. The run id comes
+// from the path and the node id from the bearer token, so ownership is part of
+// the request rather than something the body could claim.
+func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
+	if err := StartRun(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r)); err != nil {
+		WriteError(w, http.StatusConflict, "start", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]string{"status": "running"})
+}
+
+// handleReport is the node's final word on a run. A retry after the first
+// report is a 200 with applied=false, not an error: the node cannot tell which
+// of its calls settled the item, and only the first one did.
+func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
+	var req ReportRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	res, err := Report(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r), req)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "report", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, res)
+}
+
+// handleWhy is the operator's explanation endpoint. It returns the whole
+// placement decision, rejects included, because the summary reason alone does
+// not say which rule failed for which node.
+func (s *Server) handleWhy(w http.ResponseWriter, r *http.Request) {
+	ex, err := Explain(r.Context(), s.db, s.clock, r.PathValue("id"))
+	if err != nil {
+		WriteError(w, http.StatusNotFound, "not_found", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, ex)
 }
 
 func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
