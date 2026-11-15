@@ -117,14 +117,15 @@ func TestOllamaPassesConformance(t *testing.T) {
 
 // TestOllamaReportsWarmingWhileAModelLoads is the test this task exists for. A
 // local server that is loading a model answers 503 until it is ready; that is not
-// a broken endpoint, and collapsing it to down removes the node from placement
-// for the whole load — which on a Raspberry Pi or a laptop is the common case.
+// a broken endpoint, and the state exists so the label says so.
 //
 // The distinction is not the status: every case below is a 503 (or a later
 // check's status). It is an affirmative in-progress signal in a JSON error body,
 // with no failure signal beside it. A 503 whose body gives nothing to go on is
-// down: a dead endpoint marked warming is silent and stays dead, while a loading
-// endpoint marked down is visible, alerted, and fixes itself on the next probe.
+// down, because a body that says nothing about a load is not evidence of one:
+// inventing the state from silence is a board lying about what it observed, and
+// the label is the only thing that changes (Eligible requires "ok", and no
+// endpoint-health event exists either way).
 func TestOllamaReportsWarmingWhileAModelLoads(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -196,6 +197,12 @@ func TestOllamaReportsWarmingWhileAModelLoads(t *testing.T) {
 			name:   "a full request queue",
 			status: http.StatusServiceUnavailable,
 			body:   `{"error":"server busy, please try again. maximum queue of pending requests exceeded"}`,
+			want:   HealthDown,
+		},
+		{
+			name:   "an error object that is not a message",
+			status: http.StatusServiceUnavailable,
+			body:   `{"error":{"loading_status":true}}`,
 			want:   HealthDown,
 		},
 		{
@@ -394,6 +401,42 @@ func TestOllamaReadsModelNamesFromTags(t *testing.T) {
 			}
 			if strings.Join(names, ",") != strings.Join(tc.want, ",") {
 				t.Fatalf("ollamaTagsModels(%s) = %v, want %v", tc.body, names, tc.want)
+			}
+		})
+	}
+}
+
+// TestOllamaErrorMessageReadsOnlyTheMessage pins the two shapes the loading rule
+// may read, and the absences it must not turn into evidence. It is a direct test
+// because the contract is invisible through Probe: an envelope with no message and
+// an envelope whose message is empty both classify as down either way, so only
+// this keeps the "no message" return honest.
+func TestOllamaErrorMessageReadsOnlyTheMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+		ok   bool
+	}{
+		{"ollama's string error", `{"error":"Loading model"}`, "Loading model", true},
+		{
+			"llama.cpp's nested message",
+			`{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}`,
+			"Loading model", true,
+		},
+		{"a null error", `{"error":null}`, "", false},
+		{"an empty error string", `{"error":""}`, "", false},
+		{"an error object that is not a message", `{"error":{"loading_status":true}}`, "", false},
+		{"an empty nested message", `{"error":{"message":""}}`, "", false},
+		{"no error field at all", `{"message":"Loading model"}`, "", false},
+		{"not json", `<html>Loading model</html>`, "", false},
+		{"an empty body", ``, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			message, ok := ollamaErrorMessage([]byte(tc.body))
+			if ok != tc.ok || message != tc.want {
+				t.Fatalf("ollamaErrorMessage(%s) = %q, %v; want %q, %v", tc.body, message, ok, tc.want, tc.ok)
 			}
 		})
 	}

@@ -83,14 +83,22 @@ func (o *Ollama) Name() string { return ollamaProviderName }
 //	no answer              → no state, ErrTransport
 //
 // The 503 split is the whole reason this method is not inherited, and it is
-// argued below (ollamaLoading). The uninformative 503 falls to down on purpose:
-// a reverse proxy's 503 is not a model load, and the two mistakes are not
-// symmetric. A loading server marked down is loud, visible, and corrects itself
-// on the next probe; a dead server marked warming is silent — warming is not an
-// alert and not a placement — so the endpoint stays dead and nobody is told.
-// Guessing "loading" from a bare 503 is how this probe would report warming for
-// an endpoint that will never load, which is the failure mode the state exists to
-// prevent. So warming requires an affirmative signal, and down is the default.
+// argued below (ollamaLoading). The uninformative 503 falls to down on purpose,
+// for an epistemic reason rather than a safety one: a 503 whose body says nothing
+// about a load is not evidence of a load, and inventing a state from silence is
+// how a board starts lying about what it knows. Both states cost the same
+// placement — placement requires health "ok" — and neither raises an event, so the
+// only thing the label changes is what the operator reads in /why. "down" then
+// says what the probe actually observed; "warming" would say something it did not.
+// The load-vs-down distinction the state exists for survives where it is
+// justified: a 503 that names a load in progress is warming, and one that does
+// not is down.
+//
+// A decision this rule owes to Task 9: if the probe schedule alerts on a
+// transition to down, an uninformative 503 during a cold load will page someone.
+// That has to be settled when the schedule lands — either the load path gets an
+// affirmative body signal from the servers this project actually runs, or the
+// alerting rule treats a first down after ok differently from a sustained one.
 //
 // The probe lists models and nothing else: it sends no completion canary, because
 // the canary would load the very model the probe is trying to observe. On a
@@ -142,23 +150,25 @@ func (o *Ollama) Probe(ctx context.Context) (Health, error) {
 
 // ollamaLoading reports whether a 503 body says a model is being loaded.
 //
-// The rule has three parts, and each exists to answer one of the two costs:
+// The rule has three parts, and each makes the label rest on evidence rather than
+// on a guess:
 //
 //  1. The body must be this family's JSON error document ({"error": "..."} or
 //     {"error": {"message": ...}}). A non-JSON body determines nothing: an HTML
 //     503 page is a reverse proxy, and proxy pages routinely contain the word
 //     "loading" (a spinner's id, a script's name), so matching substrings in one
-//     is exactly how a dead endpoint would be called warming forever. A
-//     plain-text "Loading model" is refused for the same reason: the documented
-//     servers answer JSON, and a body without the envelope is not one of them.
+//     is how a dead endpoint would be called warming forever. A plain-text
+//     "Loading model" is refused for the same reason: the documented servers
+//     answer JSON, and a body without the envelope is not one of them.
 //
 //  2. The error text must not name a failure. "loading" appears in "error loading
 //     model weights" and "failed to load" appears in a load that died; those are
-//     a broken server, and calling them warming hides it. Failure language vetoes
-//     a loading phrase, because a load that failed is not a load in progress.
-//     Only the message is scanned, not the envelope: llama.cpp's own loading body
-//     carries {"type":"unavailable_error"}, whose "error" would otherwise veto
-//     every real warming response.
+//     a broken server, and labelling them warming tells the operator to wait for a
+//     load that will not finish. Failure language vetoes a loading phrase, because
+//     a load that failed is not a load in progress. Only the message is scanned,
+//     never the whole envelope: llama.cpp's own loading body carries
+//     {"type":"unavailable_error"}, whose "error" would otherwise veto every real
+//     warming response.
 //
 //  3. The text must contain one of the in-progress phrases below. They are the
 //     spellings the servers in this family use for "not up yet", and each names a
@@ -168,10 +178,8 @@ func (o *Ollama) Probe(ctx context.Context) (Health, error) {
 // One case is deliberately on the down side: Ollama's own 503 for a full queue
 // ("server busy, please try again. maximum queue of pending requests exceeded")
 // is a temporary overload, not a model load. warming is a cause — "a model is
-// loading, wait" — not a severity for every temporary 503, and with no fifth
-// state an overloaded endpoint that cannot serve is better reported as down,
-// where it is visible, than as a silent warming that would need a phrase no
-// server actually says to become ok.
+// loading, wait" — not a severity for every temporary 503, and an overloaded
+// endpoint whose body names no load is reported as what it said.
 //
 // The phrases are matched case-insensitively against the message text, wherever
 // in the message the server puts them.
@@ -224,9 +232,15 @@ func ollamaLoading(body []byte) bool {
 
 // ollamaErrorMessage extracts the message from the documented error envelope: the
 // error is a string on Ollama's own routes and an object with a message on the
-// OpenAI-compatible ones. A body that is not a JSON object with an "error" field
-// has no message this protocol can read, so it is reported as no message rather
-// than as an empty one.
+// OpenAI-compatible ones.
+//
+// It returns no message — not an empty one — when the body is not a JSON object
+// with an "error" field, and when the field carries neither a non-empty string nor
+// a non-empty nested message. That includes {"error":null} and {"error":""}:
+// unmarshalling null into a string is a no-op that leaves it empty, so the two are
+// the same absence here. Only a real message is ever returned, because the caller
+// scans what it gets for phrases and a scan of nothing must not look like a scan
+// of something.
 func ollamaErrorMessage(body []byte) (string, bool) {
 	var envelope struct {
 		Error json.RawMessage `json:"error"`
@@ -235,7 +249,7 @@ func ollamaErrorMessage(body []byte) (string, bool) {
 		return "", false
 	}
 	var text string
-	if err := json.Unmarshal(envelope.Error, &text); err == nil {
+	if err := json.Unmarshal(envelope.Error, &text); err == nil && text != "" {
 		return text, true
 	}
 	var nested struct {
@@ -244,10 +258,11 @@ func ollamaErrorMessage(body []byte) (string, bool) {
 	if err := json.Unmarshal(envelope.Error, &nested); err == nil && nested.Message != "" {
 		return nested.Message, true
 	}
-	// An error object with no message is not a shape the servers above produce;
-	// its raw text is still the most honest thing to scan, and scanning it cannot
-	// turn a failure into warming because the veto list runs first.
-	return string(envelope.Error), true
+	// Neither shape produced a message. The envelope's raw bytes are deliberately
+	// NOT scanned as a fallback: an error object with fields this adapter does not
+	// know ({ "loading_status": true }) is not a message, and classifying it as one
+	// would contradict "only the message is scanned".
+	return "", false
 }
 
 // ollamaTagsModels returns the model names in a GET /api/tags body and whether the
