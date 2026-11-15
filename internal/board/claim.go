@@ -59,12 +59,19 @@ type ClaimModel struct {
 // their enabled models: the input to claiming. Callers narrow it to the node
 // that is asking, because capability eligibility is per node (spec §9).
 //
+// A candidate row whose capability cells cannot be decoded is SKIPPED and
+// reported (see reportSkippedRow), not returned as an error. This loader feeds
+// the claim path, and one malformed provides_live/features cell on one row must
+// not 500 every node's claim. Skipping a candidate is safe in one direction
+// only, and that is the direction that matters: it can remove a placement
+// option, never add one, so the worst case is a node that claims less.
+//
 // These filters repeat rules Eligible enforces. That is intentional: here they
 // are a prefilter so Claim does not scan rows it would discard, while the rule
 // itself lives in one place. /why uses LoadAllCandidates for the rows this
 // loader removes.
 func LoadCandidates(ctx context.Context, db *sql.DB) ([]Candidate, error) {
-	return loadCandidates(ctx, db, true)
+	return loadCandidates(ctx, db, true, true)
 }
 
 // LoadAllCandidates is LoadCandidates without the availability prefilter: every
@@ -73,11 +80,16 @@ func LoadCandidates(ctx context.Context, db *sql.DB) ([]Candidate, error) {
 // because a candidate that is never loaded is a candidate the explanation
 // cannot name — "your only gpu node is offline" is exactly the answer an
 // operator asks /why for.
+//
+// It is also STRICT about decode failures, unlike LoadCandidates. Swallowing a
+// corrupt row here would hide it from the one endpoint whose job is to explain
+// the board, at the moment the operator needs the explanation; /why answers 500
+// naming the row and column instead.
 func LoadAllCandidates(ctx context.Context, db *sql.DB) ([]Candidate, error) {
-	return loadCandidates(ctx, db, false)
+	return loadCandidates(ctx, db, false, false)
 }
 
-func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly bool) ([]Candidate, error) {
+func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly, skipCorrupt bool) ([]Candidate, error) {
 	query := `
 		SELECT n.id, n.name, n.role, n.provides_live, n.reach_classes, n.concurrency,
 		       n.status, n.agent_version,
@@ -111,22 +123,36 @@ func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly bool) ([]Cand
 		); err != nil {
 			return nil, err
 		}
-		var err error
-		if c.Node.ProvidesLive, err = decodeList(live); err != nil {
-			return nil, err
-		}
-		if c.Node.ReachClasses, err = decodeList(reach); err != nil {
-			return nil, err
-		}
-		if c.Model.Provides, err = decodeList(provides); err != nil {
-			return nil, err
-		}
-		if c.Model.Features, err = decodeList(features); err != nil {
-			return nil, err
+		if err := c.decodeLists(live, reach, provides, features); err != nil {
+			if !skipCorrupt {
+				return nil, err
+			}
+			reportSkippedRow("%v", err)
+			continue
 		}
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// decodeLists decodes the four capability cells on one candidate row. The error
+// names the row and the column, because both the skip report and /why's 500 are
+// only actionable with that pair.
+func (c *Candidate) decodeLists(live, reach, provides, features string) error {
+	var err error
+	if c.Node.ProvidesLive, err = decodeList(live); err != nil {
+		return fmt.Errorf("nodes/%s column provides_live: %w", c.Node.ID, err)
+	}
+	if c.Node.ReachClasses, err = decodeList(reach); err != nil {
+		return fmt.Errorf("nodes/%s column reach_classes: %w", c.Node.ID, err)
+	}
+	if c.Model.Provides, err = decodeList(provides); err != nil {
+		return fmt.Errorf("models/%s column provides: %w", c.Model.ID, err)
+	}
+	if c.Model.Features, err = decodeList(features); err != nil {
+		return fmt.Errorf("models/%s column features: %w", c.Model.ID, err)
+	}
+	return nil
 }
 
 func decodeList(raw string) ([]string, error) {
@@ -195,7 +221,12 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 	//     this claim does, so the event log and the config row agree.
 	//
 	// A ceiling the board cannot read is an error, not unlimited: a typo must
-	// not silently disable the safety mechanism.
+	// not silently disable the safety mechanism. This is the fail-CLOSED half of
+	// the claim path's failure policy, and it is deliberately not the same
+	// policy as the corrupt-row skip below: a row that cannot be decoded is
+	// skipped (a lost placement option), while a safety value that cannot be
+	// read refuses the claim (a silently unlimited budget would be a lost
+	// guard). Do not route this read through the skip-and-log helper.
 	paused, _, err := reconcileCeiling(ctx, conn, clock)
 	if err != nil {
 		return nil, err
@@ -259,7 +290,16 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 		}
 		needs, err := decodeList(r.needs)
 		if err != nil {
-			return nil, err
+			// Skip and report, do not abort: one hand-edited `needs` cell must
+			// not 500 every node's claim (M1's final review). The item is left
+			// queued, not failed or cancelled — the board has no authority to
+			// destroy work whose contents it could not read, and a manual SQL
+			// typo is repairable. It is therefore skipped forever until the
+			// operator fixes it; the report names the row and column, and /why
+			// keeps answering 500 naming the column too, so the stale row is
+			// discoverable without depending on log retention.
+			reportSkippedRow("work_items/%s column needs: %v", r.id, err)
+			continue
 		}
 		item := WorkItem{ID: r.id, Title: r.title, Needs: needs, Status: r.status, Attempt: r.attempt}
 
