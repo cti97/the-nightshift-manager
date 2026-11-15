@@ -3624,3 +3624,36 @@ NSM_NODE_TOKEN=<printed token> ./bin/nsm agent run \
 
 And one manual proof that the design claim holds: register two nodes with the enrollment token,
 create one item, start one agent on each, and confirm exactly one `run` row exists for the item.
+
+---
+
+## Corrections applied during execution
+
+This plan was written before it was run. Running it found defects in the plan itself, not just in
+the code. They are recorded here rather than silently edited, because a plan that has been
+quietly rewritten teaches nobody anything.
+
+| Where | The plan said | What was true | Consequence if unnoticed |
+|---|---|---|---|
+| Task 3, `git add` line | commit the four named files | `events_test.go` calls `OpenForTest` from `testing.go`, which the `git add` omitted | a commit that does not build |
+| Task 2, `schema.sql` header comment | "no statement contains `;`" | that comment contained three `;`, and the splitter shredded it | migration 1 fails on every first open |
+| Task 5, six tests | six tests cover the eligibility rules | four of nine rules and the tie-break were unexercised; a WAN candidate for a `no_egress` item dies at rule 1, so rule 4 was never reached | a rule can be deleted with the suite green |
+| Task 6, zero-fill list | six statuses | the schema permits seven (`cancelled` was missing) | response shape changes with the data |
+| Task 8, `StartRun` | defined in Task 10 | the reaper needs it in Task 9; Task 10 also re-declared it | duplicate declaration |
+| Task 9, `Advance(leaseSeconds + 1)` | 301 seconds | 301 **nanoseconds**; `FixedClock.Advance` truncates | reaper tests that never expire a lease |
+| Task 9, attempt arithmetic | "requeue with `attempt+1`" | the claim already increments; the spec's prose and pseudocode contradicted each other | abandoned claims burn budget, or the item becomes unclaimable |
+| Task 10, `Executor.Run` | takes `board.WorkItem` | `Brief` lives on `ClaimedItem`; `WorkItem` is deliberately prose-free | a worker that cannot read its own brief |
+| Task 12, arch `case` | explicit arms per target | no `*)` catch-all, so an unknown target exits 0, ships unasserted, and drops another platform | a successful-looking release missing a platform |
+| Task 12, `[ ... ] && ...` under `set -e` | used for the `.exe` suffix | a failing `&&` list exits the script on every non-Windows target | release aborts on target 1 |
+| Global constraints | `go 1.24` | `go mod tidy` writes `go 1.24.0`; the newest `modernc.org/sqlite` requires 1.26 | the floor silently rises |
+
+Two patterns are worth carrying into the next plan:
+
+1. **Enumerations are wrong by the time you finish writing them.** Status lists, capability lists,
+   case arms, and attempt arithmetic were each correct for the states the author remembered and
+   wrong for at least one they forgot. Where an enumeration can be derived from the schema or the
+   constant beside it, derive it.
+2. **A test can be green for a reason other than the one it names.** Rule ordering makes an early
+   rule shadow a later one; a single-connection pool serialises the concurrency the test claims to
+   prove; a `path.Clean` upstream made a trim test pass with trimming broken. Mutation testing —
+   delete the thing and confirm the test dies — was the only reliable way to tell the difference.

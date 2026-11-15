@@ -56,6 +56,11 @@ it done" answerable — and nothing else.
 | D16 | Providers are protocol families (`anthropic`, `openai`, `ollama`, `stub`), not products | llama.cpp, vLLM, LM Studio, OpenRouter and OpenAI all speak one shape. Adding a model is a row in `endpoints`; adding a *protocol* is one file and a registry line. |
 | D17 | A model without native tool calling is `reflex`-only; there is exactly one agent loop | Emulating tools as parsed text is a second, weaker control path that fails in ways that look like model weakness. Restriction is visible in `/why`; a silent fallback is not. |
 
+**On D2 as built:** M0/M1 ships `work_items` and `checkpoints`'s design, but not the
+`watches`, `threads`, `messages` or `checkpoints` tables — they arrive with M4/M5, which is what
+the versioned migration runner exists for. The decision's *reason* (don't discover three
+lifecycles after shipping one) held; its *implementation* is spread across milestones.
+
 ## 4. Non-goals
 
 - Multi-user / multi-tenant. One admin, bearer token per node.
@@ -327,15 +332,37 @@ degradation).
 arithmetic is server-side.
 
 **Reaper** (every 30s):
-- lease expired, run still `claimed` → requeue, **attempt unchanged**, run `abandoned` (no tokens spent)
-- lease expired, run `running` → run `lost`, requeue with `attempt+1`
-- `attempt > max_attempts` → `failed`, event, dashboard card. Never auto-retried.
+- lease expired, run still `claimed` → run `abandoned`, requeue, and **refund** the attempt
+- lease expired, run `running` → run `lost`, requeue, attempt stays spent
+- `attempt >= max_attempts` → `failed`, event, dashboard card. Never auto-retried.
+- `last_seen_at` older than 2× the lease → node `offline` (see §8.1)
+
+`>=`, not `>`: with `>` a `max_attempts` of 1 would permit two executions.
 
 That distinction is the reason `POST /runs/:id/start` exists. A node that claims work and dies
 before starting has spent nothing; a node that started and died has spent tokens and, more
 importantly, may have had side effects. Without a `claimed → running` transition the board
 cannot tell those apart, and either innocent claims burn attempts or dead runs get retried as if
 they were free.
+
+### 8.1 Two counters, and why they are not one
+
+`work_items.attempt` counts **started** runs: incremented at claim, refunded when a run is
+abandoned before starting. It is what the budget checks.
+
+`runs.attempt` is a **per-item claim ordinal**, derived from `MAX(attempt)+1` over that item's
+runs. It exists to satisfy `UNIQUE(work_item_id, attempt)` on an append-only table.
+
+They are deliberately not equal, and they must never be joined to each other — use the run id.
+An earlier design had one counter serve both purposes, which made a refund collide with the
+abandoned run's ordinal and left the item permanently unclaimable.
+
+### 8.2 Node staleness
+
+A pull-based board cannot know a node is gone until something notices it stopped asking. The
+reaper sweeps a node whose `last_seen_at` is older than twice the lease to `offline`. Without
+that sweep an offline node stays `online` forever, `/why` cheerfully explains work that nothing
+will ever claim, and the answer to "why is this not running" becomes a confident lie.
 
 ## 9. Placement
 
@@ -386,7 +413,7 @@ placement.
 register(role, provides_declared, reach_classes, concurrency) -> token
 loop:
   heartbeat(leases, provides_live)   every 15s
-  items = claim(free_slots)          long-poll 25s
+  items = claim(free_slots)          poll every 25s (a ticker, NOT a held request)
   for item in items:
       sandbox = mkdir(run_root/<run_id>)   # executor only
       result  = Executor.run(item, sandbox, model, budget)
@@ -403,6 +430,10 @@ AgenticExecutor    # executor: tool loop, sandbox, caps
 ReflexExecutor     # steward: one call or one probe, no sandbox
 StubExecutor       # replays a scripted transcript; no network, no key
 ```
+
+The poll is a ticker, not a long-poll. A long-poll would hold the board's single database
+connection for its whole duration and block every heartbeat and report behind it — a property
+of the single-writer design, not a preference.
 
 ### Provider registry
 
@@ -548,6 +579,8 @@ synonym for `lost` and the board stops being believed.
 
 ```
 POST /nodes/register           {name, role, provides_declared, reach_classes, concurrency}
+                               requires NSM_ENROLL_TOKEN — a secret that can ONLY enroll,
+                               never the admin token, so a node never carries admin rights
 POST /nodes/heartbeat          {status, provides_live, reach_classes, free_slots}
 POST /claim                    {node_id, free_slots} -> [items]
 POST /runs/:id/start           {} — the node has begun executing; claimed → running
@@ -756,6 +789,10 @@ Auto-update is opt-in per node and Unix-only in v1. Windows cannot replace a run
 and the workaround costs more than a manual update every few weeks — stated rather than hidden.
 
 ### Install order in the build plan
+
+The M1 script emits `SHA256SUMS` unsigned. Signing arrives with the `/dist` channel at M6,
+which is when a pinned verification key becomes meaningful — an unsigned checksum is a typo
+detector, not a trust boundary.
 
 `make release` lands at M1 because it is a script and proves the matrix early. `agent install`,
 signing, and the release channel land at M6 with the steward, because that is the first machine
