@@ -1081,10 +1081,12 @@ func TestOpenAIRefusesBeforeItSends(t *testing.T) {
 			want: ErrBadRequest,
 		},
 		{
-			name: "a call whose arguments are not JSON",
+			name: "an assistant call with no id",
 			mutate: func(r *Request) {
-				r.Messages = []Message{assistant, {Role: "tool", Name: "read_file", CallID: "call_1", Content: "x"}}
-				r.Messages[0].ToolCalls = []Call{{ID: "call_1", Name: "read_file", Arguments: json.RawMessage(`{"path":`)}}
+				// No tool result, so checkToolMessages has nothing to refuse: this
+				// is the adapter's own empty-id refusal, and without it the call
+				// would reach the wire for a real server to reject.
+				r.Messages = []Message{{Role: "assistant", ToolCalls: []Call{{Name: "read_file", Arguments: json.RawMessage(`{}`)}}}}
 			},
 			want: ErrBadRequest,
 		},
@@ -1120,8 +1122,12 @@ func TestOpenAIRefusesBeforeItSends(t *testing.T) {
 		before := fake.count()
 		cancelled, cancel := context.WithCancel(ctx)
 		cancel()
-		if _, err := p.Complete(cancelled, valid()); !errors.Is(err, context.Canceled) {
+		_, err := p.Complete(cancelled, valid())
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Complete with a cancelled context = %v, want context.Canceled", err)
+		}
+		if errors.Is(err, ErrTransport) {
+			t.Fatalf("Complete with a cancelled context = %v; a cancellation is not a transport failure, and the retry policy reads that sentinel", err)
 		}
 		if after := fake.count(); after != before {
 			t.Errorf("a cancelled Complete issued %d request(s)", after-before)
@@ -1270,6 +1276,109 @@ func TestOpenAIEstimateTokensIsThePackageHeuristic(t *testing.T) {
 	}
 }
 
+// TestOpenAIReplaysWhateverTheModelWrote covers the ruling on replay: the decode
+// side preserves an arguments string that is not valid JSON, so the replay side
+// must send it back unchanged. Otherwise the passthrough promise is unkeepable
+// and a run dead-ends on exactly the local servers that return "" for a
+// no-argument tool. The empty string, a truncated object and a bare word are the
+// three shapes the model layer has to be able to answer with a tool error.
+func TestOpenAIReplaysWhateverTheModelWrote(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct{ name, arguments string }{
+		{"the empty string a no-argument tool returns", ""},
+		{"a truncated object", `{"path":`},
+		{"a bare word", "not json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newOpenAIFake(t)
+			p := newOpenAITestProvider(t, Config{BaseURL: fake.URL})
+			call := Call{ID: "call_1", Name: "read_file", Arguments: json.RawMessage(tc.arguments)}
+			_, err := p.Complete(ctx, Request{
+				Model:     "gpt-4o-mini",
+				MaxTokens: 16,
+				Messages: []Message{
+					{Role: "user", Content: "Read the brief."},
+					{Role: "assistant", ToolCalls: []Call{call}},
+					{Role: "tool", Name: "read_file", CallID: "call_1", Content: `{"error":"the arguments did not parse"}`},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Complete = %v; a replayed arguments string is echoed, not refused", err)
+			}
+			sent := fake.requests()
+			if len(sent) != 1 {
+				t.Fatalf("the replay sent %d requests, want 1", len(sent))
+			}
+			body := decodeJSON[map[string]json.RawMessage](t, sent[0].Body)
+			messages := decodeJSON[[]map[string]json.RawMessage](t, body["messages"])
+			calls := decodeJSON[[]fakeWireToolCall](t, messages[1]["tool_calls"])
+			if len(calls) != 1 {
+				t.Fatalf("the replayed assistant turn carries %d calls, want 1", len(calls))
+			}
+			var got string
+			if err := json.Unmarshal(calls[0].Function.Arguments, &got); err != nil {
+				t.Fatalf("replayed arguments = %s, want a JSON string: %v", calls[0].Function.Arguments, err)
+			}
+			if got != tc.arguments {
+				t.Fatalf("replayed arguments = %q, want the model's own %q byte-for-byte", got, tc.arguments)
+			}
+		})
+	}
+}
+
+// TestOpenAIReportsATimeoutAsADeadlineNotATransportFailure pins the other half of
+// the single-sentinel rule: a Config.Timeout expiry is its own deadline, not an
+// ErrTransport. Task 6 may retry a timeout; it must not retry a cancellation, and
+// it can only tell them apart if the adapter keeps the two apart.
+func TestOpenAIReportsATimeoutAsADeadlineNotATransportFailure(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	}))
+	t.Cleanup(func() {
+		unblock()
+		srv.Close()
+	})
+	// Config.Timeout is the adapter's own deadline, not the caller's: the caller's
+	// context has no deadline at all.
+	p := newOpenAITestProvider(t, Config{BaseURL: srv.URL, Timeout: 50 * time.Millisecond})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Complete(context.Background(), Request{
+			Model:     "gpt-4o-mini",
+			MaxTokens: 16,
+			Messages:  []Message{{Role: "user", Content: "Read the brief."}},
+		})
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		unblock()
+		t.Fatal("the request never reached the server")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Complete = %v; want an error satisfying errors.Is(err, context.DeadlineExceeded)", err)
+		}
+		if errors.Is(err, ErrTransport) {
+			t.Fatalf("Complete = %v; a Config.Timeout expiry must not also satisfy ErrTransport", err)
+		}
+	case <-time.After(5 * time.Second):
+		unblock()
+		t.Fatal("Complete did not return after its own timeout")
+	}
+	unblock()
+}
+
 // TestOpenAIStopsOnACancelledContext: Complete must return promptly when its
 // context is cancelled rather than leaving the request running behind it.
 func TestOpenAIStopsOnACancelledContext(t *testing.T) {
@@ -1313,6 +1422,9 @@ func TestOpenAIStopsOnACancelledContext(t *testing.T) {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Complete = %v; want an error satisfying errors.Is(err, context.Canceled)", err)
+		}
+		if errors.Is(err, ErrTransport) {
+			t.Fatalf("Complete = %v; an in-flight cancellation must not also satisfy ErrTransport, or the retry policy cannot tell a shutdown from a broken transport", err)
 		}
 	case <-time.After(5 * time.Second):
 		unblock()

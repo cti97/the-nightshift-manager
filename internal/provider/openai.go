@@ -253,8 +253,13 @@ func (o *OpenAI) Probe(ctx context.Context) (Health, error) {
 // do issues one request and returns the status and body. A non-2xx status is a
 // successful round trip, not an error here: Complete classifies it into the
 // taxonomy and Probe reads it as a health state. The error return is reserved for
-// "no answer arrived" — a transport failure, a body that could not be read, or a
-// context that ended the request — so the two callers cannot confuse the two.
+// "no answer arrived", and it is single-valued: when the context ended the
+// request, the context's own error is what comes back, never ErrTransport.
+// ErrTransport therefore means exactly "the transport failed on its own". A retry
+// policy keyed on ErrTransport can retry without re-sending a shutdown's request,
+// and a policy keyed on the context errors reads Canceled and DeadlineExceeded as
+// the distinct signals they are (the second covers a Config.Timeout expiry, which
+// is a legitimate timeout rather than a cancellation).
 //
 // The per-request timeout is applied with context.WithTimeout rather than the
 // client's own Timeout field so it also bounds a caller-supplied HTTPClient, and
@@ -282,11 +287,8 @@ func (o *OpenAI) do(ctx context.Context, method, path string, payload []byte) (i
 
 	resp, err := o.client.Do(req)
 	if err != nil {
-		// Both classes stay reachable: the call failed to reach the endpoint
-		// (ErrTransport) and, when the context is what ended it, the caller can
-		// still detect the cancellation with errors.Is.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return 0, nil, fmt.Errorf("%w: %w", ErrTransport, ctxErr)
+			return 0, nil, fmt.Errorf("provider: openai: %w", ctxErr)
 		}
 		return 0, nil, fmt.Errorf("%w: %w", ErrTransport, err)
 	}
@@ -294,6 +296,9 @@ func (o *OpenAI) do(ctx context.Context, method, path string, payload []byte) (i
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxOpenAIResponseBytes))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, nil, fmt.Errorf("provider: openai: %w", ctxErr)
+		}
 		return 0, nil, fmt.Errorf("%w: reading the response body: %w", ErrTransport, err)
 	}
 	return resp.StatusCode, data, nil
@@ -303,10 +308,16 @@ func (o *OpenAI) do(ctx context.Context, method, path string, payload []byte) (i
 // shape this protocol cannot carry. The shared checkToolMessages owns the tool
 // correlation rule; this covers the rest: an unnamed model, a negative reply cap,
 // a role that is not an OpenAI chat role, tool calls on a turn that cannot emit
-// them, a tool definition without a name or with a schema that is not JSON, and an
-// assistant turn whose arguments cannot be replayed as the wire's JSON string.
-// Each is the caller's data, so each is ErrBadRequest rather than a server error
-// that would be retried.
+// them, and an assistant call with no id. Each is the caller's data, so each is
+// ErrBadRequest rather than a server error that would be retried.
+//
+// Call arguments are deliberately NOT validated here. The wire field is a string,
+// and what the model produced is what must be echoed back: a replay that refused
+// an empty or malformed arguments string would make the decode-side passthrough
+// (see decodeOpenAIResponse) unkeepable and would dead-end a run on exactly the
+// local servers that return "" for a no-argument tool. The tool layer is where a
+// bad arguments string becomes a tool error the model can answer; refusing it at
+// the transport would turn the model's recoverable mistake into a failed step.
 func validateOpenAIRequest(req Request) error {
 	if strings.TrimSpace(req.Model) == "" {
 		return fmt.Errorf("%w: the request names no model", ErrBadRequest)
@@ -324,8 +335,8 @@ func validateOpenAIRequest(req Request) error {
 			return fmt.Errorf("%w: message %d is a %s turn carrying tool calls; only an assistant turn emits them", ErrBadRequest, i, m.Role)
 		}
 		for j, c := range m.ToolCalls {
-			if !json.Valid(c.Arguments) {
-				return fmt.Errorf("%w: message %d call %d (%s) has arguments that are not valid JSON, so they cannot be replayed as the wire's JSON string", ErrBadRequest, i, j, c.Name)
+			if c.ID == "" {
+				return fmt.Errorf("%w: message %d call %d (%s) has no id, so a tool result could never be attributed to it", ErrBadRequest, i, j, c.Name)
 			}
 		}
 	}
@@ -389,9 +400,9 @@ type openAIFunctionDef struct {
 }
 
 // marshalOpenAIRequest translates the seam's Request into the wire. It runs after
-// validateOpenAIRequest, so the only error left is a RawMessage that encoding/json
-// refuses — which is still the caller's data and is reported as ErrBadRequest
-// rather than as a transport failure.
+// validateOpenAIRequest, so the only error left is a tool schema RawMessage that
+// encoding/json refuses — which is still the caller's data and is reported as
+// ErrBadRequest rather than as a transport failure.
 func marshalOpenAIRequest(req Request) ([]byte, error) {
 	wire := openAIRequest{Model: req.Model, MaxTokens: req.MaxTokens}
 	if req.System != "" {
