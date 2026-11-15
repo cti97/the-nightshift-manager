@@ -388,10 +388,43 @@ func TestExplainSaysWhyNothingRan(t *testing.T) {
 	}
 }
 
-// The regression guard for the explanation gap: a candidate the claiming
-// loader filters out must still be named by /why. Before the unfiltered loader,
-// each of these cases produced zero rejects, so the operator saw only
-// "no eligible candidate" while the real reason was hidden in a WHERE clause.
+// An empty board is an explanation, not an error: no nodes, no endpoints and
+// no models means there is no candidate to name, so rejects is legitimately
+// empty — but Explain must still answer with placed:false and a blocked_reason
+// that names the needs. This case cannot distinguish the two loaders (both
+// return nothing here); the dropped-candidate table below is the
+// loader-reversion guard. This pins the other half: Explain never fails just
+// because the board is empty.
+func TestExplainOnAnEmptyBoard(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	id, err := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"gpu"}})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+
+	ex, err := Explain(ctx, db, clock, id)
+	if err != nil {
+		t.Fatalf("Explain on an empty board: %v", err)
+	}
+	if ex.Placed {
+		t.Fatal("Explain says the item is placeable with nothing on the board")
+	}
+	if ex.BlockedReason == "" {
+		t.Fatal("Explain returned no blocked_reason on an empty board")
+	}
+	if !strings.Contains(ex.BlockedReason, "gpu") {
+		t.Fatalf("blocked_reason = %q, want it to name the unsatisfiable need", ex.BlockedReason)
+	}
+	if len(ex.Rejects) != 0 {
+		t.Fatalf("rejects = %+v, want none: there is no candidate to explain", ex.Rejects)
+	}
+}
+
+// One candidate the claiming loader filters out must still be named by /why.
+// Before the unfiltered loader, each of these cases produced zero rejects, so
+// the operator saw only "no eligible candidate" while the real reason was
+// hidden in a WHERE clause.
 func TestExplainNamesTheRuleThatDroppedTheOnlyCandidate(t *testing.T) {
 	cases := []struct {
 		name  string
