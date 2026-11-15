@@ -1,0 +1,171 @@
+package board
+
+import "testing"
+
+func cand(nodeName, role string, provides []string, endpointName, reach, health string, features []string, cost float64) Candidate {
+	return Candidate{
+		Node:     Node{Name: nodeName, Role: role, ProvidesLive: provides, ReachClasses: []string{"host", "lan", "wan"}},
+		Endpoint: Endpoint{Name: endpointName, Reach: reach, Health: health},
+		Model:    Model{ModelID: endpointName + "-m", Features: features, CostInPerMtok: cost, ContextWindow: 200000},
+	}
+}
+
+func item(needs ...string) WorkItem {
+	return WorkItem{ID: "w1", Needs: needs, Status: "queued"}
+}
+
+func TestPlaceRejectsEndpointTheNodeCannotReach(t *testing.T) {
+	c := cand("laptop", "executor", []string{"agentic", "shell"}, "cloud", "wan", "ok", []string{"tools"}, 1)
+	c.Node.ReachClasses = []string{"host"}
+
+	d := Place(item("agentic"), []Candidate{c})
+	if d.OK {
+		t.Fatal("placed on an unreachable endpoint")
+	}
+	if len(d.Rejects) != 1 {
+		t.Fatalf("got %d rejects, want 1", len(d.Rejects))
+	}
+}
+
+func TestPlaceNeverCrossesWANForNoEgress(t *testing.T) {
+	cheapWAN := cand("laptop", "executor", []string{"agentic"}, "cloud", "wan", "ok", []string{"tools"}, 0.1)
+	lanPi := cand("pi", "steward", []string{"reflex", "no_egress"}, "local", "host", "ok", nil, 0)
+
+	d := Place(item("reflex", "no_egress"), []Candidate{cheapWAN, lanPi})
+	if !d.OK {
+		t.Fatalf("expected a placement, rejects: %+v", d.Rejects)
+	}
+	if d.Chosen.Endpoint.Reach != "host" {
+		t.Fatalf("chose reach %q, want host", d.Chosen.Endpoint.Reach)
+	}
+}
+
+func TestPlaceStrictLocalRequiresHost(t *testing.T) {
+	lan := cand("pi", "steward", []string{"reflex", "strict_local"}, "lan-ollama", "lan", "ok", nil, 0)
+	if d := Place(item("reflex", "strict_local"), []Candidate{lan}); d.OK {
+		t.Fatal("strict_local placed on a lan endpoint")
+	}
+}
+
+func TestAgenticRequiresToolsAndExecutor(t *testing.T) {
+	noTools := cand("laptop", "executor", []string{"agentic"}, "llamacpp", "host", "ok", nil, 0)
+	if d := Place(item("agentic"), []Candidate{noTools}); d.OK {
+		t.Fatal("agentic placed on a model without the tools feature")
+	}
+
+	stewardWithTools := cand("pi", "steward", []string{"agentic"}, "local", "host", "ok", []string{"tools"}, 0)
+	if d := Place(item("agentic"), []Candidate{stewardWithTools}); d.OK {
+		t.Fatal("agentic placed on a steward")
+	}
+}
+
+func TestPlaceSkipsUnhealthyAndPicksCheapest(t *testing.T) {
+	expensive := cand("a", "executor", []string{"agentic"}, "claude", "wan", "ok", []string{"tools"}, 9)
+	cheap := cand("b", "executor", []string{"agentic"}, "gpt", "wan", "ok", []string{"tools"}, 1)
+	warming := cand("c", "executor", []string{"agentic"}, "llamacpp", "host", "warming", []string{"tools"}, 0)
+
+	d := Place(item("agentic"), []Candidate{expensive, warming, cheap})
+	if !d.OK {
+		t.Fatalf("no placement: %+v", d.Rejects)
+	}
+	if d.Chosen.Endpoint.Name != "gpt" {
+		t.Fatalf("chose %q, want gpt (cheapest healthy)", d.Chosen.Endpoint.Name)
+	}
+	if d.Reason == "" {
+		t.Fatal("Reason is empty; every placement must explain itself")
+	}
+}
+
+func TestUnsatisfiableExplainsWhatIsMissing(t *testing.T) {
+	pi := cand("pi", "steward", []string{"reflex"}, "local", "host", "ok", nil, 0)
+
+	d := Place(item("reflex", "gpu"), []Candidate{pi})
+	if d.OK {
+		t.Fatal("placed work nothing can do")
+	}
+	if d.Reason == "" {
+		t.Fatal("unsatisfiable placement has no reason")
+	}
+}
+
+// The six tests above are the plan's. Mutation testing showed four of the
+// rules they cover can be deleted with the whole suite still green — the
+// no_egress reach rule (the wan candidate above is rejected earlier by the
+// capability subset), the reflex role rule, the vision feature rule, and the
+// context-window rule (no test uses a tokens: need) — plus the cost tie-break
+// on node name. These supplementary cases pin each one so a future refactor
+// cannot drop a rule silently. They assert the exact reason strings because
+// that string is the only thing a human sees when work sits queued.
+
+func TestPlaceNoEgressRejectsWanEvenWhenCapabilitiesMatch(t *testing.T) {
+	c := cand("laptop", "executor", []string{"reflex", "no_egress"}, "cloud", "wan", "ok", nil, 0)
+
+	ok, why := Eligible(item("reflex", "no_egress"), c)
+	if ok {
+		t.Fatal("no_egress placed work on a wan endpoint")
+	}
+	if why != "no_egress forbids wan" {
+		t.Fatalf("reason %q does not name the no_egress rule", why)
+	}
+}
+
+func TestPlaceReflexRequiresExecutorOrSteward(t *testing.T) {
+	c := cand("manager", "manager", []string{"reflex"}, "local", "host", "ok", nil, 0)
+
+	ok, why := Eligible(item("reflex"), c)
+	if ok {
+		t.Fatal("reflex placed on a manager node")
+	}
+	if why != "reflex requires an executor or steward" {
+		t.Fatalf("reason %q does not name the reflex rule", why)
+	}
+}
+
+func TestPlaceVisionRequiresModelFeature(t *testing.T) {
+	noVision := cand("laptop", "executor", []string{"vision"}, "vlm", "host", "ok", nil, 0)
+
+	ok, why := Eligible(item("vision"), noVision)
+	if ok {
+		t.Fatal("vision placed on a model without the vision feature")
+	}
+	if why != "vision requires the model vision feature" {
+		t.Fatalf("reason %q does not name the vision rule", why)
+	}
+
+	withVision := cand("laptop", "executor", []string{"vision"}, "vlm", "host", "ok", []string{"vision"}, 0)
+	if ok, why := Eligible(item("vision"), withVision); !ok {
+		t.Fatalf("vision rejected a model with the vision feature: %s", why)
+	}
+}
+
+func TestPlaceContextWindowMustCoverTokenNeed(t *testing.T) {
+	c := cand("laptop", "executor", []string{"tokens:500000"}, "small", "host", "ok", nil, 0)
+	// cand() pins ContextWindow at 200000, so the provider claim exceeds the
+	// window: the typed capability alone must not win.
+
+	ok, why := Eligible(item("tokens:500000"), c)
+	if ok {
+		t.Fatal("placed a 500k-token need on a 200k window")
+	}
+	if why != "context 200000 < 500000" {
+		t.Fatalf("reason %q does not name the context rule", why)
+	}
+
+	c.Model.ContextWindow = 600000
+	if ok, why := Eligible(item("tokens:500000"), c); !ok {
+		t.Fatalf("rejected a sufficient window: %s", why)
+	}
+}
+
+func TestPlaceTieBreaksOnNodeName(t *testing.T) {
+	b := cand("b", "executor", []string{"agentic"}, "gpt-b", "wan", "ok", []string{"tools"}, 1)
+	a := cand("a", "executor", []string{"agentic"}, "gpt-a", "wan", "ok", []string{"tools"}, 1)
+
+	d := Place(item("agentic"), []Candidate{b, a})
+	if !d.OK {
+		t.Fatalf("no placement: %+v", d.Rejects)
+	}
+	if d.Chosen.Node.Name != "a" {
+		t.Fatalf("tie chose node %q, want a (cost, then node name)", d.Chosen.Node.Name)
+	}
+}
