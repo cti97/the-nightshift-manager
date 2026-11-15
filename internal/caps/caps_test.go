@@ -81,6 +81,30 @@ func TestParseCanonicalisesLanName(t *testing.T) {
 	}
 }
 
+// TestParseNil pins the empty-input contract: no error, and a non-nil empty
+// canonical list.
+func TestParseNil(t *testing.T) {
+	got, err := Parse(nil)
+	if err != nil {
+		t.Fatalf("Parse(nil): %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("Parse(nil) = %#v, want a non-nil empty slice", got)
+	}
+}
+
+// TestParseDedupesAfterTrimming pins the TrimSpace path: entries are trimmed
+// before validation and dedup, so " shell " and "shell" collapse to one name.
+func TestParseDedupesAfterTrimming(t *testing.T) {
+	got, err := Parse([]string{" shell ", "shell"})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if want := []string{"shell"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Parse = %v, want %v", got, want)
+	}
+}
+
 func TestSatisfies(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -104,6 +128,11 @@ func TestSatisfies(t *testing.T) {
 		{"local_fs need with trailing slash", []string{"local_fs:/a/"}, []string{"local_fs:/a"}, true},
 		{"local_fs provider with trailing slash", []string{"local_fs:/a"}, []string{"local_fs:/a/"}, true},
 		{"local_fs traversal escapes containment", []string{"local_fs:/data/../../etc"}, []string{"local_fs:/data"}, false},
+		// Fix-round-2 additions: identical malformed local_fs spellings must
+		// not match either (see the comment on parameterised).
+		{"local_fs empty path identical inputs do not match", []string{"local_fs:"}, []string{"local_fs:"}, false},
+		{"local_fs relative identical inputs do not match", []string{"local_fs:rel"}, []string{"local_fs:rel"}, false},
+		{"local_fs traversal identical inputs do not match", []string{"local_fs:/x/.."}, []string{"local_fs:/x/.."}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

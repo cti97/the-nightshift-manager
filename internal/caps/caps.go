@@ -105,11 +105,19 @@ func Missing(needs, provides []string) []string {
 
 // parameterised reports whether c carries one of the parameterised prefixes.
 // Such capabilities match only through their typed rule, never plain string
-// equality, so two identical malformed spellings cannot satisfy each other.
+// equality, and every typed rule validates its parameter first, so two
+// identical malformed spellings cannot satisfy each other.
 func parameterised(c string) bool {
 	return strings.HasPrefix(c, localFSPrefix) ||
 		strings.HasPrefix(c, tokensPrefix) ||
 		strings.HasPrefix(c, lanPrefix)
+}
+
+// validLocalFSPath reports whether p is an absolute non-root path — the same
+// rule validate applies before accepting a local_fs capability. The matcher
+// uses it so malformed spellings can never satisfy each other.
+func validLocalFSPath(p string) bool {
+	return strings.HasPrefix(p, "/") && p != "/"
 }
 
 // lanName extracts the service name of a lan: capability and reports whether
@@ -133,7 +141,10 @@ func satisfiedBy(need string, provides []string) bool {
 			// traversal segments from faking containment.
 			np := path.Clean(strings.TrimPrefix(need, localFSPrefix))
 			pp := path.Clean(strings.TrimPrefix(p, localFSPrefix))
-			if np == pp || strings.HasPrefix(np, pp+"/") {
+			// The path-validity rule keeps malformed spellings (which clean
+			// to a relative or root path) from satisfying anything, even an
+			// identical copy of themselves.
+			if validLocalFSPath(np) && validLocalFSPath(pp) && (np == pp || strings.HasPrefix(np, pp+"/")) {
 				return true
 			}
 		case strings.HasPrefix(need, tokensPrefix) && strings.HasPrefix(p, tokensPrefix):
