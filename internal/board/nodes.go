@@ -19,6 +19,36 @@ const (
 	ProtocolMax = 1
 )
 
+// emptyJSONList is how an empty list is stored. json.Marshal(nil) would write
+// "null", and these columns are compared as raw strings, so every writer uses
+// this one spelling instead.
+const emptyJSONList = "[]"
+
+// marshalList encodes a list, keeping the empty case as [] rather than null so
+// the stored bytes do not depend on whether the caller passed nil or an empty
+// slice.
+func marshalList(v []string) string {
+	if len(v) == 0 {
+		return emptyJSONList
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+// nodeWriteFound checks that a heartbeat UPDATE matched a node. database/sql
+// reports zero rows as success, so without this an unknown node id would look
+// like a healthy heartbeat.
+func nodeWriteFound(res sql.Result, nodeID string) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("heartbeat: unknown node %q", nodeID)
+	}
+	return nil
+}
+
 type RegisterRequest struct {
 	Name             string   `json:"name"`
 	Role             string   `json:"role"`
@@ -68,8 +98,8 @@ func RegisterNode(ctx context.Context, db *sql.DB, clock Clock, req RegisterRequ
 		return "", "", err
 	}
 
-	idJSON, _ := json.Marshal(declared)
-	reachJSON, _ := json.Marshal(req.ReachClasses)
+	declaredJSON := marshalList(declared)
+	reachJSON := marshalList(req.ReachClasses)
 	conc := req.Concurrency
 	if conc < 1 {
 		conc = 1
@@ -84,11 +114,11 @@ func RegisterNode(ctx context.Context, db *sql.DB, clock Clock, req RegisterRequ
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO nodes (id,name,token_hash,role,provides_declared,provides_live,reach_classes,concurrency,created_at,status)
 		 VALUES (?,?,?,?,?,?,?,?,?,'offline')`,
-		id, req.Name, HashToken(token), req.Role, string(idJSON), string(idJSON),
-		string(reachJSON), conc, clock.Now()); err != nil {
+		id, req.Name, HashToken(token), req.Role, declaredJSON, emptyJSONList,
+		reachJSON, conc, clock.Now()); err != nil {
 		return "", "", fmt.Errorf("register %q: %w", req.Name, err)
 	}
-	if err := AppendEvent(ctx, tx, clock, "admin", "node", id, "registered",
+	if err := AppendEvent(ctx, tx, clock, "node", "node", id, "registered",
 		map[string]string{"name": req.Name, "role": req.Role}); err != nil {
 		return "", "", err
 	}
@@ -100,9 +130,13 @@ func RegisterNode(ctx context.Context, db *sql.DB, clock Clock, req RegisterRequ
 
 func Heartbeat(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req HeartbeatRequest) (HeartbeatResponse, error) {
 	if req.Protocol < ProtocolMin || req.Protocol > ProtocolMax {
-		_, err := db.ExecContext(ctx, `UPDATE nodes SET status='incompatible', last_seen_at=? WHERE id=?`,
-			clock.Now(), nodeID)
+		res, err := db.ExecContext(ctx,
+			`UPDATE nodes SET status='incompatible', provides_live=?, last_seen_at=? WHERE id=?`,
+			emptyJSONList, clock.Now(), nodeID)
 		if err != nil {
+			return HeartbeatResponse{}, err
+		}
+		if err := nodeWriteFound(res, nodeID); err != nil {
 			return HeartbeatResponse{}, err
 		}
 		return HeartbeatResponse{Status: "incompatible"}, nil
@@ -112,8 +146,8 @@ func Heartbeat(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req 
 	if err != nil {
 		return HeartbeatResponse{}, err
 	}
-	liveJSON, _ := json.Marshal(live)
-	reachJSON, _ := json.Marshal(req.ReachClasses)
+	liveJSON := marshalList(live)
+	reachJSON := marshalList(req.ReachClasses)
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -121,10 +155,15 @@ func Heartbeat(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req 
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE nodes SET provides_live=?, reach_classes=?, last_seen_at=?, status='online',
+	res, err := tx.ExecContext(ctx,
+		`UPDATE nodes SET provides_live=?, reach_classes=?, last_seen_at=?,
+		 status = CASE WHEN status='paused' THEN 'paused' ELSE 'online' END,
 		 agent_version=?, protocol_version=? WHERE id=?`,
-		string(liveJSON), string(reachJSON), clock.Now(), req.AgentVersion, req.Protocol, nodeID); err != nil {
+		liveJSON, reachJSON, clock.Now(), req.AgentVersion, req.Protocol, nodeID)
+	if err != nil {
+		return HeartbeatResponse{}, err
+	}
+	if err := nodeWriteFound(res, nodeID); err != nil {
 		return HeartbeatResponse{}, err
 	}
 
@@ -136,13 +175,16 @@ func Heartbeat(ctx context.Context, db *sql.DB, clock Clock, nodeID string, req 
 		return HeartbeatResponse{}, err
 	}
 
-	var queued int
+	var queued, approvals int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM work_items WHERE status='queued'`).Scan(&queued); err != nil {
+		return HeartbeatResponse{}, err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM work_items WHERE status='needs_approval'`).Scan(&approvals); err != nil {
 		return HeartbeatResponse{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return HeartbeatResponse{}, err
 	}
 
-	return HeartbeatResponse{Status: "online", LeaseUntil: lease, Queued: queued}, nil
+	return HeartbeatResponse{Status: "online", LeaseUntil: lease, Queued: queued, Approvals: approvals}, nil
 }

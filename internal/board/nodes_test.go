@@ -202,8 +202,8 @@ func TestIncompatibleHeartbeatPersistsStatusAndLeavesLeases(t *testing.T) {
 	if status != "incompatible" {
 		t.Fatalf("node status = %q, want incompatible", status)
 	}
-	if live != `["agentic"]` {
-		t.Fatalf("provides_live = %s, want it untouched at the declared set", live)
+	if live != "[]" {
+		t.Fatalf("provides_live = %s, want it cleared by the incompatible heartbeat", live)
 	}
 	if lastSeen != clock.Now() {
 		t.Fatalf("last_seen_at = %d, want %d", lastSeen, clock.Now())
@@ -368,5 +368,213 @@ func TestNodeAuthAcceptsIssuedTokenAndRejectsRotatedOrUnknown(t *testing.T) {
 	rec = postJSON(t, h, "/nodes/heartbeat", "rotated-secret", beat)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("heartbeat with the rotated-in token = %d, want 200: %s", rec.Code, rec.Body)
+	}
+}
+
+// Registration writes configuration, never reality: a node that has not
+// heartbeated yet provides nothing, and an empty list is stored as [].
+func TestRegisterWritesDeclaredButNoLiveCapabilities(t *testing.T) {
+	db, clock := newTestDB(t)
+	id, _, err := RegisterNode(context.Background(), db, clock, RegisterRequest{
+		Name: "home-laptop", Role: "executor",
+		ProvidesDeclared: []string{"agentic", "shell"},
+		ReachClasses:     nil,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	var declared, live, reach string
+	if err := db.QueryRow(`SELECT provides_declared, provides_live, reach_classes FROM nodes WHERE id=?`, id).
+		Scan(&declared, &live, &reach); err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if declared != `["agentic","shell"]` {
+		t.Fatalf("provides_declared = %s", declared)
+	}
+	if live != "[]" {
+		t.Fatalf("provides_live = %s, want [] until the first heartbeat", live)
+	}
+	if reach != "[]" {
+		t.Fatalf("reach_classes = %s, want [] (empty slice, not null)", reach)
+	}
+
+	var actor, typ string
+	if err := db.QueryRow(`SELECT actor, type FROM events WHERE entity='node' AND entity_id=?`, id).
+		Scan(&actor, &typ); err != nil {
+		t.Fatalf("read event: %v", err)
+	}
+	if actor != "node" || typ != "registered" {
+		t.Fatalf("event = %s/%s, want node/registered", actor, typ)
+	}
+}
+
+func TestIncompatibleHeartbeatClearsLiveCapabilities(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	id, _, err := RegisterNode(ctx, db, clock, RegisterRequest{
+		Name: "old-node", Role: "executor", ProvidesDeclared: []string{"agentic", "lan:nas"},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{
+		ProvidesLive: []string{"agentic", "lan:nas"}, Protocol: 1,
+	}); err != nil {
+		t.Fatalf("good heartbeat: %v", err)
+	}
+	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: 99}); err != nil {
+		t.Fatalf("incompatible heartbeat: %v", err)
+	}
+
+	var live string
+	if err := db.QueryRow(`SELECT provides_live FROM nodes WHERE id=?`, id).Scan(&live); err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if live != "[]" {
+		t.Fatalf("provides_live = %s after an incompatible heartbeat, want []", live)
+	}
+}
+
+func TestHeartbeatPreservesOperatorPause(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	id, _, err := RegisterNode(ctx, db, clock, RegisterRequest{Name: "pi", Role: "steward"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE nodes SET status='paused' WHERE id=?`, id); err != nil {
+		t.Fatalf("pause node: %v", err)
+	}
+
+	if _, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: 1}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM nodes WHERE id=?`, id).Scan(&status); err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if status != "paused" {
+		t.Fatalf("status = %q, want the operator pause preserved", status)
+	}
+}
+
+func TestHeartbeatReportsQueuedAndPendingApprovals(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	id, _, err := RegisterNode(ctx, db, clock, RegisterRequest{Name: "home-laptop", Role: "executor"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	for _, it := range []struct{ id, status string }{
+		{"w1", "queued"}, {"w2", "queued"}, {"w3", "needs_approval"}, {"w4", "needs_approval"}, {"w5", "done"},
+	} {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO work_items (id,title,brief,needs,status,created_by,created_at,updated_at)
+			VALUES (?,?,?,'[]',?,'admin',?,?)`,
+			it.id, "t", "b", it.status, clock.Now(), clock.Now()); err != nil {
+			t.Fatalf("insert %s: %v", it.id, err)
+		}
+	}
+
+	resp, err := Heartbeat(ctx, db, clock, id, HeartbeatRequest{Protocol: 1})
+	if err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	if resp.Queued != 2 {
+		t.Fatalf("queued = %d, want 2", resp.Queued)
+	}
+	if resp.Approvals != 2 {
+		t.Fatalf("pending_approvals = %d, want 2", resp.Approvals)
+	}
+}
+
+func TestHeartbeatRejectsUnknownNodeID(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	if _, _, err := RegisterNode(ctx, db, clock, RegisterRequest{Name: "pi", Role: "steward"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	for _, protocol := range []int{1, 99} {
+		if _, err := Heartbeat(ctx, db, clock, "no-such-node", HeartbeatRequest{Protocol: protocol}); err == nil {
+			t.Fatalf("heartbeat for an unknown node (protocol %d) succeeded, want an error", protocol)
+		}
+	}
+}
+
+func postRaw(t *testing.T, h http.Handler, path, bearer, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func errorCode(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode error envelope %q: %v", rec.Body, err)
+	}
+	return envelope.Error.Code
+}
+
+func TestRegisterHandlerReturnsConflictForDuplicateName(t *testing.T) {
+	srv, _ := newServer(t)
+	h := srv.Handler()
+	body := RegisterRequest{Name: "pi", Role: "steward", ProvidesDeclared: []string{"reflex"}}
+
+	if rec := postJSON(t, h, "/nodes/register", "", body); rec.Code != http.StatusCreated {
+		t.Fatalf("first register = %d, want 201: %s", rec.Code, rec.Body)
+	}
+	rec := postJSON(t, h, "/nodes/register", "", body)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate register = %d, want 409: %s", rec.Code, rec.Body)
+	}
+	if code := errorCode(t, rec); code != "register" {
+		t.Fatalf("error code = %q, want register", code)
+	}
+	if strings.Contains(rec.Body.String(), "token") {
+		t.Fatalf("a rejected registration leaked a token: %s", rec.Body)
+	}
+}
+
+func TestHandlersRejectMalformedJSON(t *testing.T) {
+	srv, _ := newServer(t)
+	h := srv.Handler()
+
+	rec := postRaw(t, h, "/nodes/register", "", "{")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("malformed register = %d, want 400: %s", rec.Code, rec.Body)
+	}
+	if code := errorCode(t, rec); code != "bad_json" {
+		t.Fatalf("register error code = %q, want bad_json", code)
+	}
+
+	reg := postJSON(t, h, "/nodes/register", "", RegisterRequest{Name: "pi", Role: "steward"})
+	if reg.Code != http.StatusCreated {
+		t.Fatalf("register = %d, want 201: %s", reg.Code, reg.Body)
+	}
+	var issued RegisterResponse
+	if err := json.Unmarshal(reg.Body.Bytes(), &issued); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+
+	rec = postRaw(t, h, "/nodes/heartbeat", issued.Token, "{")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("malformed heartbeat = %d, want 400: %s", rec.Code, rec.Body)
+	}
+	if code := errorCode(t, rec); code != "bad_json" {
+		t.Fatalf("heartbeat error code = %q, want bad_json", code)
 	}
 }
