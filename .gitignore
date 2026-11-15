@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Build output — built locally, published by the manager at /dist, never committed
+dist/
+bin/
+*.exe
+*.test
+*.out
+
+# Local runtime state
+*.db
+*.db-wal
+*.db-shm
+.nsm/
+
+# Editor
+.idea/
+.vscode/
