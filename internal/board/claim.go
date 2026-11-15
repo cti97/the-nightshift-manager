@@ -112,6 +112,18 @@ func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly, skipCorrupt 
 	for rows.Next() {
 		var c Candidate
 		var live, reach, provides, features string
+		// A Scan failure is deliberately fatal, unlike the JSON decode below.
+		// SQLite is dynamically typed, so a value the driver cannot convert to
+		// the destination type (an INTEGER in a TEXT cell, say) fails the scan
+		// for exactly one row while every other row scans fine — the same
+		// one-bad-row shape as a corrupt JSON cell. It is
+		// still not skipped, because a value the write path cannot produce is a
+		// schema or write-path breach, not a cell a human can repair like
+		// malformed JSON, and swallowing it would turn a broken board into a
+		// board that silently claims nothing. Unreachable today: every writer
+		// marshals these cells and the columns are NOT NULL. If this SELECT ever
+		// gains a nullable or unconstrained column, revisit this with the
+		// one-row-must-not-deny-everyone rule that decodeLists applies.
 		if err := rows.Scan(
 			&c.Node.ID, &c.Node.Name, &c.Node.Role, &live, &reach, &c.Node.Concurrency,
 			&c.Node.Status, &c.Node.AgentVersion,
@@ -272,6 +284,10 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 	var queued []row
 	for rows.Next() {
 		var r row
+		// Fatal for the same reason as the scan in loadCandidates: a wrong
+		// storage class in a NOT NULL column is a write-path breach, and
+		// skipping the row would hide it. The repairable cell-level case is the
+		// JSON decode below, which is skipped and reported.
 		if err := rows.Scan(&r.id, &r.title, &r.brief, &r.needs, &r.status, &r.attempt); err != nil {
 			rows.Close()
 			return nil, err

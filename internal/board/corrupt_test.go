@@ -4,6 +4,7 @@ package board
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
@@ -255,5 +256,100 @@ func TestWhyStillFailsLoudlyOnACorruptCandidateRow(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "provides_live") {
 		t.Fatalf("why error %s does not name the offending column", rec.Body)
+	}
+}
+
+// The empty-but-healthy edge: when the only queued item is the corrupt one, the
+// claim answers 200 with [] — the same answer an idle board gives. An error here
+// would tell every node the board is broken because one row is unreadable, which
+// is exactly the failure this task removes; a node cannot distinguish "no work"
+// from "board down" otherwise.
+func TestClaimOfOnlyACorruptItemIsAnEmptySuccess(t *testing.T) {
+	// The report is asserted by the tests above; capture it here so this
+	// test's expected skip does not print over the suite's output.
+	captureLog(t)
+	srv, clock := newServer(t)
+	h := srv.Handler()
+	ctx := context.Background()
+
+	reg := postJSON(t, h, "/nodes/register", testEnrollToken, RegisterRequest{
+		Name: "a", Role: "executor", ProvidesDeclared: []string{"agentic"},
+		ReachClasses: []string{"host", "lan", "wan"}, Concurrency: 1,
+	})
+	if reg.Code != http.StatusCreated {
+		t.Fatalf("register = %d: %s", reg.Code, reg.Body)
+	}
+	var issued RegisterResponse
+	if err := json.Unmarshal(reg.Body.Bytes(), &issued); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+	if rec := postJSON(t, h, "/nodes/heartbeat", issued.Token, HeartbeatRequest{
+		ProvidesLive: []string{"agentic"},
+		ReachClasses: []string{"host", "lan", "wan"},
+		Protocol:     ProtocolMax,
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat = %d: %s", rec.Code, rec.Body)
+	}
+	SeedEndpointForTest(t, srv.db, clock, "local", "host", 0, "tools")
+
+	itemID, err := CreateItem(ctx, srv.db, clock, CreateItemRequest{
+		Title: "only", Brief: "b", Needs: []string{"agentic"},
+	})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	if _, err := srv.db.ExecContext(ctx,
+		`UPDATE work_items SET needs='not-json' WHERE id=?`, itemID); err != nil {
+		t.Fatalf("corrupt the only item: %v", err)
+	}
+
+	rec := postJSON(t, h, "/claim", issued.Token, ClaimRequest{FreeSlots: 1})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("claim whose only item is corrupt = %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != "[]" {
+		t.Fatalf("claim body = %q, want [] (an unreadable row is not a board outage)", got)
+	}
+}
+
+// And the whole-board edge: every candidate row corrupt is still an empty
+// success, not a 500. Each skipped row is reported, and the queued item is left
+// alone for the operator to repair rather than destroyed.
+func TestClaimReturnsEmptyWhenEveryCandidateRowIsCorrupt(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	logged := captureLog(t)
+
+	nodeA := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	nodeB := SeedNodeForTest(t, db, clock, "b", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	if _, err := db.ExecContext(ctx, `UPDATE nodes SET provides_live='not-json'`); err != nil {
+		t.Fatalf("corrupt every candidate row: %v", err)
+	}
+	itemID, err := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+
+	got, err := Claim(ctx, db, clock, nodeA, 1)
+	if err != nil {
+		t.Fatalf("Claim failed when every candidate row is corrupt: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("claimed %d items with no readable candidate, want 0", len(got))
+	}
+	var status string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM work_items WHERE id=?`, itemID).Scan(&status); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("item status = %q, want queued", status)
+	}
+
+	out := logged.String()
+	for _, id := range []string{nodeA, nodeB} {
+		if !strings.Contains(out, id) {
+			t.Fatalf("corrupt candidate row %s was skipped silently; log output: %q", id, out)
+		}
 	}
 }
