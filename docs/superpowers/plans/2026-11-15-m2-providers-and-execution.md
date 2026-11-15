@@ -314,6 +314,8 @@ Implements `agent.Executor` (already defined in M1, taking `board.ClaimedItem`).
 
 **Caps:** `maxSteps` (default 40) **and** a token budget; whichever trips first ends the run with a result that says which cap tripped.
 
+**Accepted from Task 5, binding on this task:** `Request.MaxTokens` must be set for every call. The Anthropic adapter refuses a zero cap locally with `ErrBadRequest` — deliberately, because the output cap is the caller's spending decision — so an endpoint row naming `anthropic` fails its first step until this executor sets one. The OpenAI adapter has no such requirement, so a bug here is visible only against Anthropic.
+
 **Acceptance:**
 - `TestExecutorStopsAtTheStepCap` and `TestExecutorStopsAtTheTokenBudget` — each names the cap that fired.
 - `TestExecutorReportsACapTripAsAnErrorNotASuccess` — an item that ran out of steps is `failed` with a reason, so the operator sees it rather than a truncated "done".
