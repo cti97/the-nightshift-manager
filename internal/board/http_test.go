@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/cti97/the-nightshift-manager/internal/provider"
 )
 
 // The two credentials are deliberately different values here, because the
@@ -23,7 +25,7 @@ const (
 func newServer(t *testing.T) (*Server, *FixedClock) {
 	t.Helper()
 	db, clock := newTestDB(t)
-	srv := NewServer(db, clock, HashToken(testAdminToken), HashToken(testEnrollToken))
+	srv := NewServer(db, clock, provider.NewRegistry(), HashToken(testAdminToken), HashToken(testEnrollToken))
 	return srv, clock
 }
 

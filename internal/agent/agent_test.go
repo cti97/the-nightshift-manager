@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cti97/the-nightshift-manager/internal/board"
+	"github.com/cti97/the-nightshift-manager/internal/provider"
 )
 
 // fixture is one board with one registered executor node, one local endpoint
@@ -51,7 +52,7 @@ func newFixture(t *testing.T, wrap ...func(http.Handler) http.Handler) *fixture 
 		t.Fatalf("create item: %v", err)
 	}
 
-	var h http.Handler = board.NewServer(db, clock, board.HashToken("admin"), board.HashToken("enroll")).Handler()
+	var h http.Handler = board.NewServer(db, clock, provider.NewRegistry(), board.HashToken("admin"), board.HashToken("enroll")).Handler()
 	for _, w := range wrap {
 		h = w(h)
 	}

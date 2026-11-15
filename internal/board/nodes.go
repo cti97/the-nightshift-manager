@@ -76,6 +76,19 @@ func parseReachClasses(raw []string) ([]string, error) {
 	return out, nil
 }
 
+// parseReach validates the single reach class an endpoint declares. It reads the
+// same vocabulary parseReachClasses uses, so an endpoint's reach and the node's
+// reach_classes cannot disagree about spelling — placement compares them by
+// exact equality, and "LAN" on one side of that comparison is silently never a
+// match.
+func parseReach(raw string) (string, error) {
+	c := strings.TrimSpace(raw)
+	if _, ok := reachClassVocabulary[c]; !ok {
+		return "", fmt.Errorf("unknown reach class %q (want host, lan or wan)", c)
+	}
+	return c, nil
+}
+
 // nodeWriteFound checks that a heartbeat UPDATE matched a node. database/sql
 // reports zero rows as success, so without this an unknown node id would look
 // like a healthy heartbeat.

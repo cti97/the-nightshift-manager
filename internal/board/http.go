@@ -12,12 +12,20 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/cti97/the-nightshift-manager/internal/provider"
 	"github.com/cti97/the-nightshift-manager/internal/version"
 )
 
 type Server struct {
-	db             *sql.DB
-	clock          Clock
+	db    *sql.DB
+	clock Clock
+	// providers is the same registry the executor will construct endpoints
+	// from, so an endpoint row this API accepts is one the runtime can build an
+	// adapter for. It is read, never mutated here; nil means nothing is
+	// registered and every create is refused (fail closed).
+	providers *provider.Registry
+	// adminTokenHash is the credential the operator's CLI/UI carries. Handlers
+	// never see the plaintext; they compare the hash of the bearer token.
 	adminTokenHash string
 	// enrollTokenHash is a credential that can do exactly one thing: register a
 	// node. It is deliberately not the admin token (spec §15 read register as a
@@ -27,10 +35,15 @@ type Server struct {
 	enrollTokenHash string
 }
 
-func NewServer(db *sql.DB, clock Clock, adminTokenHash, enrollTokenHash string) *Server {
+// NewServer wires the API to the board, the clock and the provider registry the
+// admin write path validates endpoint rows against. providers may be nil: a nil
+// registry refuses every endpoint creation (nothing is registered) rather than
+// accepting a name it cannot check.
+func NewServer(db *sql.DB, clock Clock, providers *provider.Registry, adminTokenHash, enrollTokenHash string) *Server {
 	return &Server{
 		db:              db,
 		clock:           clock,
+		providers:       providers,
 		adminTokenHash:  adminTokenHash,
 		enrollTokenHash: enrollTokenHash,
 	}
@@ -56,6 +69,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.Handle("GET /admin/board", s.adminAuth(http.HandlerFunc(s.handleBoard)))
 	mux.Handle("POST /admin/items", s.adminAuth(http.HandlerFunc(s.handleCreateItem)))
+	mux.Handle("POST /admin/endpoints", s.adminAuth(http.HandlerFunc(s.handleCreateEndpoint)))
+	mux.Handle("GET /admin/endpoints", s.adminAuth(http.HandlerFunc(s.handleListEndpoints)))
+	mux.Handle("POST /admin/models", s.adminAuth(http.HandlerFunc(s.handleCreateModel)))
+	mux.Handle("PATCH /admin/models/{id}", s.adminAuth(http.HandlerFunc(s.handlePatchModel)))
 	mux.Handle("POST /nodes/register", s.enrollAuth(http.HandlerFunc(s.handleRegister)))
 	mux.Handle("POST /nodes/heartbeat", s.nodeAuth(http.HandlerFunc(s.handleHeartbeat)))
 	mux.Handle("POST /claim", s.nodeAuth(http.HandlerFunc(s.handleClaim)))
@@ -239,6 +256,80 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusCreated, map[string]string{"id": id})
+}
+
+// handleCreateEndpoint is the operator's way into the endpoints table. The
+// provider name is checked against the registry the server was built with, so a
+// typo is a 400 here rather than a row that never places.
+func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
+	var req CreateEndpointRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	ep, err := CreateEndpoint(r.Context(), s.db, s.clock, s.providers, req)
+	if err != nil {
+		writeAdminWriteError(w, "create_endpoint", err)
+		return
+	}
+	WriteJSON(w, http.StatusCreated, ep)
+}
+
+// handleListEndpoints is the read side: every endpoint with its models and its
+// current health. It is a GET, so it takes no body and writes nothing.
+func (s *Server) handleListEndpoints(w http.ResponseWriter, r *http.Request) {
+	eps, err := ListEndpoints(r.Context(), s.db)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "endpoints", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, eps)
+}
+
+func (s *Server) handleCreateModel(w http.ResponseWriter, r *http.Request) {
+	var req CreateModelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	m, err := CreateModel(r.Context(), s.db, s.clock, req)
+	if err != nil {
+		writeAdminWriteError(w, "create_model", err)
+		return
+	}
+	WriteJSON(w, http.StatusCreated, m)
+}
+
+// handlePatchModel is the update path, and the only disable path: enabled=0.
+// There is no DELETE route — see the endpoint-deletion note in endpoints.go's
+// file comment and the Task 8 report.
+func (s *Server) handlePatchModel(w http.ResponseWriter, r *http.Request) {
+	var req PatchModelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	m, err := PatchModel(r.Context(), s.db, s.clock, r.PathValue("id"), req)
+	if err != nil {
+		writeAdminWriteError(w, "patch_model", err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, m)
+}
+
+// writeAdminWriteError maps the store's three outcomes onto the three answers an
+// operator can act on: the row is not there (404), the value is well-formed but
+// taken (409), or the request itself is wrong (400). The code names the
+// operation, matching every other handler's envelope.
+func writeAdminWriteError(w http.ResponseWriter, code string, err error) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		WriteError(w, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, ErrAlreadyExists):
+		WriteError(w, http.StatusConflict, "conflict", err.Error())
+	default:
+		WriteError(w, http.StatusBadRequest, code, err.Error())
+	}
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {

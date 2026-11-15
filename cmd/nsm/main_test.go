@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cti97/the-nightshift-manager/internal/board"
+	"github.com/cti97/the-nightshift-manager/internal/provider"
 )
 
 func TestRunVersionExitsZero(t *testing.T) {
@@ -197,7 +198,7 @@ func field(t *testing.T, stdout, key string) string {
 // smoke path for C2.
 func TestNodeRegisterEnrollsAgainstARealBoard(t *testing.T) {
 	db, clock := board.OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
-	srv := httptest.NewServer(board.NewServer(db, clock,
+	srv := httptest.NewServer(board.NewServer(db, clock, provider.NewRegistry(),
 		board.HashToken("admin-token"), board.HashToken("enroll-token")).Handler())
 	defer srv.Close()
 
@@ -260,7 +261,7 @@ func TestNodeRegisterEnrollsAgainstARealBoard(t *testing.T) {
 // exits 1 and says what the board said.
 func TestNodeRegisterReportsAnEnrollmentRefusal(t *testing.T) {
 	db, clock := board.OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
-	srv := httptest.NewServer(board.NewServer(db, clock,
+	srv := httptest.NewServer(board.NewServer(db, clock, provider.NewRegistry(),
 		board.HashToken("admin-token"), board.HashToken("enroll-token")).Handler())
 	defer srv.Close()
 

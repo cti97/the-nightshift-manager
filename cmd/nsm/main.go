@@ -15,6 +15,7 @@ import (
 
 	"github.com/cti97/the-nightshift-manager/internal/agent"
 	"github.com/cti97/the-nightshift-manager/internal/board"
+	"github.com/cti97/the-nightshift-manager/internal/provider"
 	"github.com/cti97/the-nightshift-manager/internal/version"
 )
 
@@ -108,7 +109,7 @@ func managerServe(args []string, errOut io.Writer) int {
 	}
 	defer db.Close()
 
-	srv := board.NewServer(db, board.SystemClock(), board.HashToken(admin), board.HashToken(enroll))
+	srv := board.NewServer(db, board.SystemClock(), provider.NewRegistry(), board.HashToken(admin), board.HashToken(enroll))
 	fmt.Fprintf(errOut, "nsm manager listening on %s (db %s)\n", *addr, *path)
 	// The reaper is the only thing that expires a lease: without it a node that
 	// dies mid-run holds its item forever. It lives for the life of the process;

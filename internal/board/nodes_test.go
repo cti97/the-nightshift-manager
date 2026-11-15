@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/cti97/the-nightshift-manager/internal/provider"
 )
 
 func TestRegisterIssuesAWorkingTokenAndStoresOnlyItsHash(t *testing.T) {
@@ -664,7 +666,7 @@ func TestRegisterRequiresTheEnrollTokenAndTheAdminTokenCannotEnroll(t *testing.T
 // Failing open would undo the credential entirely.
 func TestRegisterFailsClosedWithoutAnEnrollSecret(t *testing.T) {
 	db, clock := newTestDB(t)
-	h := NewServer(db, clock, HashToken(testAdminToken), "").Handler()
+	h := NewServer(db, clock, provider.NewRegistry(), HashToken(testAdminToken), "").Handler()
 
 	for _, bearer := range []string{"", testAdminToken, testEnrollToken} {
 		rec := postJSON(t, h, "/nodes/register", bearer, RegisterRequest{Name: "a", Role: "executor"})
