@@ -200,7 +200,17 @@ func TestNewSandboxCreatesAFreshRunDirectory(t *testing.T) {
 	root := t.TempDir()
 	sb := newTestSandbox(t, SandboxConfig{Root: root, RunID: "abc-123"})
 
-	if got, want := sb.Dir(), filepath.Join(root, "abc-123"); got != want {
+	// NewSandbox resolves the root (sandbox.go's EvalSymlinks) so Dir() names
+	// the real directory. $TMPDIR may itself be a symlink — on macOS /var is
+	// /private/var, and t.TempDir() hands back whichever spelling the
+	// environment used — so resolve the expectation the same way the
+	// constructor does. Comparing raw spellings is an environment-dependent
+	// failure, not a defect in the sandbox.
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve temporary root %q: %v", root, err)
+	}
+	if got, want := sb.Dir(), filepath.Join(resolvedRoot, "abc-123"); got != want {
 		t.Fatalf("Dir() = %q, want %q", got, want)
 	}
 	fi, err := os.Stat(sb.Dir())

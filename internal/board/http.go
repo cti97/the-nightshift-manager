@@ -402,6 +402,13 @@ func writeAdminWriteError(w http.ResponseWriter, code string, err error) {
 // ceiling it is measured against, and whether the board is refusing work. It is
 // a read of `runs` on every call — there is no running total to go stale, so the
 // number here is the same number the claim gate acts on.
+//
+// paused_by, when present, is exactly one of "ceiling" (the day's spend reached
+// the configured limit), "operator" (a person wrote board_paused), or
+// "ceiling+operator" (both hold). /why uses the same three values. The old
+// spelling "spend_ceiling" was retired before any consumer existed, so the two
+// endpoints never disagreed in public; the audit event source keeps
+// "spend_ceiling" because it names the reconciling subsystem, not the owner.
 func (s *Server) handleSpendToday(w http.ResponseWriter, r *http.Request) {
 	st, err := TodaySpend(r.Context(), s.db, s.clock)
 	if err != nil {

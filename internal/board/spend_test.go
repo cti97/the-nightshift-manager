@@ -816,6 +816,61 @@ func TestSpendTodayEndpointReportsTheLedger(t *testing.T) {
 	}
 }
 
+// TestSpendTodayPausedByWireVocabulary pins the exact strings this endpoint
+// puts on the wire. The expected values are literals, not the pauseBy*
+// constants that produce them: the constants are implementation, the JSON is
+// the API, and a test written against the former would let a rename of the
+// latter pass. /why's side of the same vocabulary is pinned in why_test.go.
+func TestSpendTodayPausedByWireVocabulary(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		ceiling  bool
+		operator bool
+		want     string
+	}{
+		{name: "ceiling alone", ceiling: true, want: "ceiling"},
+		{name: "operator alone", operator: true, want: "operator"},
+		{name: "both", ceiling: true, operator: true, want: "ceiling+operator"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, clock := newServer(t)
+			node, itemID := seedClaimableBoard(t, srv.db, clock)
+
+			if tc.ceiling {
+				mustSetCeiling(t, srv.db, clock, 1)
+				dayStart, _ := SpendDay(clock.Now())
+				seedRunForTest(t, srv.db, node, itemID, "run-spent", 1, dayStart, 1)
+			}
+			if tc.operator {
+				if _, err := srv.db.Exec(
+					`INSERT INTO config (key,value) VALUES (?,?)`, configBoardPaused, "hold for the deploy"); err != nil {
+					t.Fatalf("write an operator pause: %v", err)
+				}
+			}
+
+			rec := do(t, srv.Handler(), "GET", "/admin/spend/today", testAdminToken)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode body: %v (body %s)", err, rec.Body)
+			}
+			raw, ok := body["paused_by"]
+			if !ok {
+				t.Fatalf("body has no paused_by key (body %s)", rec.Body)
+			}
+			var got string
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("paused_by is not a JSON string: %s", raw)
+			}
+			if got != tc.want {
+				t.Fatalf("paused_by = %q, want %q (body %s)", got, tc.want, rec.Body)
+			}
+		})
+	}
+}
+
 func TestSetCeilingEndpointValidates(t *testing.T) {
 	srv, _ := newServer(t)
 	h := srv.Handler()

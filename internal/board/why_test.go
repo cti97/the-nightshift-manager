@@ -25,9 +25,12 @@ func TestWhyReportsWhoPausedTheBoard(t *testing.T) {
 		operator bool
 		want     string
 	}{
-		{name: "ceiling alone", ceiling: true, want: pauseByCeiling},
-		{name: "operator alone", operator: true, want: pauseByOperator},
-		{name: "both", ceiling: true, operator: true, want: pauseByBoth},
+		// The values are literals on purpose: the pauseBy* constants produce
+		// them, so comparing against the constants would let a rename pass
+		// every test while silently changing the API a consumer reads.
+		{name: "ceiling alone", ceiling: true, want: "ceiling"},
+		{name: "operator alone", operator: true, want: "operator"},
+		{name: "both", ceiling: true, operator: true, want: "ceiling+operator"},
 		{name: "neither", want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
