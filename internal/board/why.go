@@ -13,9 +13,13 @@ import (
 // Both are returned because the summary names only the unsatisfied needs, which
 // is not an explanation: the human needs to see which rule rejected which node.
 type Explanation struct {
-	ItemID        string   `json:"item_id"`
-	Status        string   `json:"status"`
-	Needs         []string `json:"needs"`
+	ItemID string   `json:"item_id"`
+	Status string   `json:"status"`
+	Needs  []string `json:"needs"`
+	// Placed reports the placement verdict: whether a candidate would take the
+	// item now. It is false for a terminal item even when one would, because a
+	// done/failed/cancelled item cannot be claimed (C13); that item's placement
+	// verdict is in Reason.
 	Placed        bool     `json:"placed"`
 	Reason        string   `json:"reason"`
 	BlockedReason string   `json:"blocked_reason"`
@@ -67,6 +71,33 @@ func corruptCandidatesClause(rows []CorruptRow) string {
 	}
 }
 
+// terminalStatus reports whether status names a finished item. done, failed and
+// cancelled are the terminal members of the board's status vocabulary (the set
+// http.go's filter lists); an item in one of them is never claimable, so /why
+// must not report it as placed (C13). A status outside the vocabulary is not
+// treated as terminal: there is no defined finished state to report, so the
+// placement verdict is left to speak for it.
+func terminalStatus(status string) bool {
+	switch status {
+	case "done", "failed", "cancelled":
+		return true
+	}
+	return false
+}
+
+// terminalReason is the answer for an already-finished item. It states the fact
+// a caller must act on — the item is finished and cannot be claimed — and keeps
+// the placement explanation, because an operator may still want to know whether
+// it would have placed. The two facts are separated by punctuation, not merged:
+// "already done" must not be readable as "done, and also placeable".
+func terminalReason(itemID, status string, d Decision) string {
+	reason := fmt.Sprintf("item %s is already %s, so it is finished and cannot be claimed", itemID, status)
+	if d.OK {
+		return reason + "; the placement it would have received: " + d.Reason
+	}
+	return reason + "; even if it were still open it could not be placed: " + d.Reason
+}
+
 // Explain answers for one item by re-running placement against the board as it
 // is now. It is a read-only view: it writes no blocked_reason and settles
 // nothing, so asking why cannot change the answer it is explaining. The clock
@@ -105,17 +136,29 @@ func Explain(ctx context.Context, db *sql.DB, clock Clock, itemID string) (Expla
 	}
 	ex.Warnings = warnings
 	d := Place(WorkItem{ID: ex.ItemID, Needs: needs, Status: ex.Status}, cands)
-	ex.Placed = d.OK
-	ex.Reason = d.Reason
 	ex.Rejects = d.Rejects
-	if !d.OK {
-		ex.BlockedReason = d.Reason
-		if clause := corruptCandidatesClause(warnings); clause != "" {
-			// Compose, do not replace: the placement failure and the skipped
-			// candidates are two facts. Saying only "no eligible candidate"
-			// would send the operator looking for a capability hole when the
-			// row that could have served the item is sitting there corrupt.
-			ex.BlockedReason += "; " + clause
+	if terminalStatus(ex.Status) {
+		// A finished item cannot be claimed, whatever placement would say about
+		// it. Reporting placed:true here read as "this could be claimed" and
+		// sent an operator looking for a run that will never happen (C13). The
+		// placement verdict is still part of the answer — it is the second
+		// question /why answers — so it moves into the reason instead of
+		// vanishing.
+		ex.Placed = false
+		ex.Reason = terminalReason(ex.ItemID, ex.Status, d)
+		ex.BlockedReason = ex.Reason
+	} else {
+		ex.Placed = d.OK
+		ex.Reason = d.Reason
+		if !d.OK {
+			ex.BlockedReason = d.Reason
+			if clause := corruptCandidatesClause(warnings); clause != "" {
+				// Compose, do not replace: the placement failure and the skipped
+				// candidates are two facts. Saying only "no eligible candidate"
+				// would send the operator looking for a capability hole when the
+				// row that could have served the item is sitting there corrupt.
+				ex.BlockedReason += "; " + clause
+			}
 		}
 	}
 

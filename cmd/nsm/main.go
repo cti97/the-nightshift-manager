@@ -257,13 +257,17 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	}
 
 	// The token is read once and then removed from this process's environment.
-	// What that buys is inheritance, not secrecy: a command started after this
-	// point does not receive the token in its environment, which is what the
-	// sandbox's scrubbed child environment builds on. It does NOT hide the
-	// token from the process table: /proc/<pid>/environ reports the exec-time
-	// environment block and unsetenv(3) only edits the in-process environ, so
-	// on Linux a process the kernel permits to read us can still see it (and
-	// ps e where permitted). This is defense in depth, not the sandbox.
+	// What that buys is inheritance, not secrecy: an ordinary child process
+	// started after this point does not receive the token in its environment.
+	// It is NOT what scrubs the sandbox: Sandbox.Command builds its children's
+	// environment from a fixed list (sandboxEnv), so a command the shell tool
+	// starts never inherits this process's environment whether or not the
+	// variable was unset. The Unsetenv and the sandbox are independent layers.
+	// It also does NOT hide the token from the process table:
+	// /proc/<pid>/environ reports the exec-time environment block and
+	// unsetenv(3) only edits the in-process environ, so on Linux a process the
+	// kernel permits to read us can still see it (and ps e where permitted).
+	// This is defense in depth, not the sandbox.
 	_ = os.Unsetenv("NSM_NODE_TOKEN")
 
 	return agent.Config{

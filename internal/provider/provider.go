@@ -109,7 +109,17 @@ type Response struct {
 	Content   string
 	ToolCalls []Call
 	Usage     Usage
-	Stop      string
+
+	// Stop is the endpoint's own stop/finish reason, passed through unchanged
+	// and therefore in the producing adapter's wire vocabulary: Anthropic's
+	// stop_reason ("end_turn", "tool_use", "max_tokens", ...) or OpenAI's
+	// finish_reason ("stop", "tool_calls", "length", ...). The families use
+	// different words for overlapping facts, so Stop is diagnostic, not a
+	// decision input: a caller that branches on a literal is coupled to one
+	// adapter, and an adapter whose wire response omitted the field leaves Stop
+	// empty. The tool loop decides that a run finished from the finish tool, and
+	// never from this field; the stub copies whatever its script declares.
+	Stop string
 }
 
 // Health is what Probe reports: a state, not a bool, because the four states

@@ -109,7 +109,11 @@ type AgenticExecutor struct {
 	// MaxTokens caps one reply. Zero selects defaultMaxTokens; a zero sent to
 	// the Anthropic adapter would be refused.
 	MaxTokens int
-	// MaxSteps caps the number of provider calls in one run. Zero selects
+	// MaxSteps caps the loop's steps. One step is one turn of the conversation
+	// and one call to e.complete, and that call may issue up to
+	// provider.MaxAttempts (three) provider requests when a transient failure
+	// is retried. The run is therefore bounded by MaxSteps × MaxAttempts
+	// provider requests, not by MaxSteps requests. Zero selects
 	// defaultMaxSteps.
 	MaxSteps int
 	// TokenBudget caps the tokens one run may spend or reserve. Zero selects
@@ -144,7 +148,9 @@ type AgenticExecutor struct {
 }
 
 // Run implements Executor. It is the whole loop: one sandbox, one conversation,
-// one provider call per step, one tool dispatch per call.
+// one conversation turn per step (issued as one provider request, or up to
+// provider.MaxAttempts when a retryable failure is retried), and one tool
+// dispatch per call.
 //
 // The run context is passed unchanged to the retry policy and to every tool;
 // the executor never creates a per-attempt timeout. That is deliberate: the
@@ -260,11 +266,20 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 		// The assistant turn must carry the calls themselves, not just their
 		// ids: every family replays them (OpenAI assistant.tool_calls,
 		// Anthropic tool_use blocks), and provider.Message documents that.
-		messages = append(messages, provider.Message{
-			Role:      "assistant",
-			Content:   resp.Content,
-			ToolCalls: resp.ToolCalls,
-		})
+		//
+		// An empty turn is not appended. A response with no content and no call
+		// has nothing to replay, and Anthropic has no empty turn at all — its
+		// adapter refuses one instead of serialising `content: null`. Appending
+		// it would make the nudge below undeliverable: the next request would
+		// fail at the adapter's own validation, so the one turn meant to recover
+		// a silent model would end the run instead.
+		if resp.Content != "" || len(resp.ToolCalls) > 0 {
+			messages = append(messages, provider.Message{
+				Role:      "assistant",
+				Content:   resp.Content,
+				ToolCalls: resp.ToolCalls,
+			})
+		}
 
 		if len(resp.ToolCalls) == 0 {
 			// A model that answers with prose has not finished the run. Nudge it

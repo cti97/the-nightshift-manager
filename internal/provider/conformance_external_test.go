@@ -10,7 +10,7 @@ import (
 // TestConformanceIsCallableFromAnotherPackage is the compile-time proof of the
 // suite's contract: an adapter's test in package x_test can call
 // provider.Conformance with nothing but the exported Provider interface and a
-// *testing.T. It runs the same six checks as the in-package stub test, so a
+// *testing.T. It runs the same seven checks as the in-package stub test, so a
 // failure here is a failure of the exported surface rather than of the fixture.
 func TestConformanceIsCallableFromAnotherPackage(t *testing.T) {
 	provider.Conformance(t, func() provider.Provider {

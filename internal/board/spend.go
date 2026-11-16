@@ -53,6 +53,14 @@ const (
 	// reaches, so the board refuses work), kept on disk so the state is visible
 	// to `sqlite3` and survives a restart, and rewritten or deleted by
 	// reconcileCeiling whenever the projection changes.
+	//
+	// The VALUE is the reason as of the report that tripped the ceiling. Nothing
+	// reads its text to decide anything: the key's presence is the projection,
+	// paused_by is derived from the ledger, and the reason /why and the spend
+	// view serve is recomputed from today's spend by effectivePause. The stored
+	// sentence therefore describes the trip, not the current total, and can
+	// differ from what is served — it is also the "was" recorded on the resume
+	// event. It is not a second status, and the two must not be compared.
 	configCeilingPaused = "spend_ceiling_paused"
 
 	// pauseByCeiling / pauseByOperator / pauseByBoth are the paused_by
@@ -170,6 +178,16 @@ func RunCost(tokensIn, tokensOut, reservedTokens int, costInPerMtok, costOutPerM
 // Negatives are refused because a negative price makes spend fall (and wins
 // placement's cost ordering); NaN and ±Inf because they are not amounts. NaN is
 // the one the old `v < 0` test could not see.
+//
+// Finiteness is not the same as usability. math.MaxFloat64 passes this rule, and
+// it is deliberately left unguarded: a run of up to 1e6 tokens prices finitely,
+// between about 1.8e302 for one token and 1.8e308 for a million (enough to trip
+// any positive ceiling for the rest of the day), while a run above 1e6 tokens
+// overflows and Report refuses to ledger it through RunCost's finite-result
+// check. A bound here would have to be price ≤ MaxFloat64×1e6/MaxInt64 ≈
+// 1.9e295 per Mtok to keep the arithmetic finite for every possible token count,
+// which is still absurd; anything tighter is an arbitrary business limit, not a
+// correctness rule. The finite-result check in RunCost is the actual backstop.
 func checkPrice(name string, v float64) error {
 	switch {
 	case math.IsNaN(v):
@@ -182,10 +200,15 @@ func checkPrice(name string, v float64) error {
 	return nil
 }
 
-// ModelSpend is one model's share of today's ledger: the wire name its runs
-// recorded and the aggregate over those rows, so an operator can see which model
-// is spending the day rather than only that the day is being spent.
+// ModelSpend is one model's share of today's ledger: the models row id, its
+// wire name and endpoint, and the aggregate over those rows, so an operator can
+// see which model is spending the day AND act on its price without a second
+// lookup. ID is the key PATCH /admin/models/{id} takes; model_id is the name the
+// endpoint is called with and is not accepted by that route. ID is empty when
+// the left join finds no model row (runs.model_id is nullable), and that is a
+// case where there is no price to edit.
 type ModelSpend struct {
+	ID         string  `json:"id"`
 	ModelID    string  `json:"model_id"`
 	EndpointID string  `json:"endpoint_id"`
 	Runs       int     `json:"runs"`
@@ -373,9 +396,12 @@ func reconcileCeiling(ctx context.Context, q spendTx, clock Clock) (paused bool,
 			return false, "", err
 		}
 	case over:
-		// Already recorded. The stored reason is the report that tripped it,
-		// which is history; rewriting it every claim would make the record
-		// follow the total instead of the trip.
+		// Already recorded. The stored reason is the report that tripped it, and
+		// it stays as the trip record and the presence marker: rewriting it every
+		// claim would make the record follow the total instead of the trip.
+		// effectivePause does not read it — the reason /why serves is recomputed
+		// from today's spend — so the stored sentence and the served one can
+		// disagree, by design rather than by drift.
 	case mine != "":
 		if _, err := q.ExecContext(ctx,
 			`DELETE FROM config WHERE key=?`, configCeilingPaused); err != nil {
@@ -506,7 +532,7 @@ func sumSpend(ctx context.Context, q spendReader, dayStart int64) (SpendStatus, 
 // answer to "which model is eating the day", which a single total cannot give.
 func spendByModel(ctx context.Context, db *sql.DB, dayStart int64) ([]ModelSpend, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT COALESCE(m.model_id,''), COALESCE(r.endpoint_id,''), COUNT(*),
+		SELECT COALESCE(m.id,''), COALESCE(m.model_id,''), COALESCE(r.endpoint_id,''), COUNT(*),
 		       COALESCE(SUM(r.cost_estimate),0)
 		  FROM runs r
 		  LEFT JOIN models m ON m.id = r.model_id
@@ -522,7 +548,7 @@ func spendByModel(ctx context.Context, db *sql.DB, dayStart int64) ([]ModelSpend
 	for rows.Next() {
 		var m ModelSpend
 		var runs int64
-		if err := rows.Scan(&m.ModelID, &m.EndpointID, &runs, &m.Spend); err != nil {
+		if err := rows.Scan(&m.ID, &m.ModelID, &m.EndpointID, &runs, &m.Spend); err != nil {
 			return nil, err
 		}
 		m.Runs = int(runs)

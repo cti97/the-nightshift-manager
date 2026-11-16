@@ -95,7 +95,7 @@ func TestSandboxCannotReachTheHomeDirectory(t *testing.T) {
 
 	// The kernel layer. Its absence is reported, not papered over.
 	if runtime.GOOS != "darwin" {
-		t.Skipf("kernel confinement is macOS-only (this is %s); the design gives a %s node a plain directory (spec §4), so the tool layer is the only boundary and the shell is unconfined", runtime.GOOS, runtime.GOOS)
+		t.Skipf("kernel confinement is macOS-only (this is %s); the design gives a %s node a plain directory (spec §4), so the tool layer is the only boundary and the shell is unconfined. NSM_REQUIRE_KERNEL_SANDBOX has no effect here: this platform check runs before the variable is read, and there is no kernel layer to require", runtime.GOOS, runtime.GOOS)
 	}
 	active, why := KernelConfinement()
 	if !active {
@@ -585,10 +585,14 @@ func TestSandboxProfileParses(t *testing.T) {
 		return
 	}
 	// A parse failure is a defect in the generated profile, not an
-	// environment limitation: sandbox-exec exits 65 before it ever calls
-	// sandbox_apply.
-	if strings.Contains(msg, "syntax error") || strings.Contains(msg, "unbound variable") {
-		t.Fatalf("the generated sandbox profile does not parse: %v: %s\nprofile:\n%s", err, msg, sb.profile)
+	// environment limitation: sandbox-exec exits 65 (EX_DATAERR) when the
+	// profile does not parse, before it ever calls sandbox_apply. A denied
+	// apply is a different failure with its own exit code (71 in this process),
+	// so the two do not collide. The exit code is the exact signal; matching the
+	// sentence is a second-hand guess that a future wording can break.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 65 {
+		t.Fatalf("the generated sandbox profile does not parse (sandbox-exec exited 65): %v: %s\nprofile:\n%s", err, msg, sb.profile)
 	}
 	t.Logf("the generated profile parsed, but sandbox-exec could not apply it here: %v: %s", err, msg)
 }

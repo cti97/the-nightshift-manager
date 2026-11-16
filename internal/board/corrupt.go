@@ -35,9 +35,12 @@ import (
 //
 // What makes the log line discoverable without drowning the operator is the
 // dedupe below: the FULL message — row id, column and the offending value's
-// error — is the key, so each distinct corruption is reported once per process
-// and a repair that corrupts the cell again reports again. The row itself is
-// never mutated.
+// error — is the key, so each distinct corruption is reported once per process.
+// A repair followed by a re-corruption that produces the SAME message (same
+// row, column and offending value) is NOT reported again, because the key is
+// unchanged and the dedupe cannot tell it from a repeat scan; a re-corruption
+// with a different offending value has a different message and does report. The
+// row itself is never mutated.
 //
 // A log line is still not a LIST: after rotation a long-lived manager cannot
 // answer "what is broken" from it, and /why answers one item at a time. That is

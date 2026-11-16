@@ -51,13 +51,13 @@ func TestStubPassesConformance(t *testing.T) {
 	})
 }
 
-// TestConformanceRunsEveryCheck guards the count the brief fixes at six. A check
-// dropped from the list would otherwise leave a silent hole: the suite would
-// still pass.
+// TestConformanceRunsEveryCheck guards the count the brief fixes at seven. A
+// check dropped from the list would otherwise leave a silent hole: the suite
+// would still pass.
 func TestConformanceRunsEveryCheck(t *testing.T) {
 	checks := conformanceChecks()
-	if len(checks) != 6 {
-		t.Fatalf("conformanceChecks() returned %d checks, want 6", len(checks))
+	if len(checks) != 7 {
+		t.Fatalf("conformanceChecks() returned %d checks, want 7", len(checks))
 	}
 	seen := make(map[string]bool, len(checks))
 	for _, c := range checks {
@@ -480,5 +480,78 @@ func TestCheck2RefusesAnUnattributableResult(t *testing.T) {
 				t.Fatalf("check 2 failed with %v; want the %q leg, not a failure of an earlier leg", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestCheck7RefusesAProbeThatCannotFailOrInventsAState gives check 7 teeth in
+// both directions. The suite's live leg accepts any declared state because it
+// does not own the fake's probe route, so the cancelled leg is what refuses a
+// Probe that never asked anything; and the state leg is what refuses a word no
+// caller can act on.
+type probeLiarProvider struct{ Provider }
+
+func (p probeLiarProvider) Probe(context.Context) (Health, error) { return HealthOK, nil }
+
+type probeUndefinedProvider struct{ Provider }
+
+func (p probeUndefinedProvider) Probe(context.Context) (Health, error) { return Health("healthy"), nil }
+
+func TestCheck7RefusesAProbeThatCannotFailOrInventsAState(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    Provider
+		want string
+	}{
+		{
+			// The shape of a Probe that reports ok without testing anything.
+			name: "always ok, even when cancelled",
+			p:    probeLiarProvider{Provider: NewStub(conformanceScript())},
+			want: "cancelled context",
+		},
+		{
+			// A state outside the declared four: "healthy" is a plausible
+			// invention that no operator response maps to.
+			name: "a state outside the four",
+			p:    probeUndefinedProvider{Provider: NewStub(conformanceScript())},
+			want: "not one of the four declared states",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkProbe(context.Background(), tc.p)
+			if err == nil {
+				t.Fatalf("check 7 passed %s; Probe is not certified by anything", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("check 7 failed with %v; want a failure naming %q, so it is attributable to the defect", err, tc.want)
+			}
+		})
+	}
+}
+
+// probeStateProvider answers one declared state while the context is live, and
+// errors once it ends — the shape of a correct Probe with a scripted verdict.
+type probeStateProvider struct {
+	Provider
+	state Health
+}
+
+func (p probeStateProvider) Probe(ctx context.Context) (Health, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return p.state, nil
+}
+
+// TestCheck7AcceptsTheStubAndEveryDeclaredState pins the passing side: the stub
+// is the reference implementation, and each declared state is a legitimate
+// answer to a healthy fixture (an adapter maps the fake's own status).
+func TestCheck7AcceptsTheStubAndEveryDeclaredState(t *testing.T) {
+	if err := checkProbe(context.Background(), NewStub(conformanceScript())); err != nil {
+		t.Fatalf("check 7 refused the reference stub: %v", err)
+	}
+	for _, state := range []Health{HealthOK, HealthWarming, HealthDown, HealthAuthFailed} {
+		if err := checkProbe(context.Background(), probeStateProvider{Provider: NewStub(conformanceScript()), state: state}); err != nil {
+			t.Errorf("check 7 refused declared state %q: %v", state, err)
+		}
 	}
 }

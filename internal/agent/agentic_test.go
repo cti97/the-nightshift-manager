@@ -412,6 +412,41 @@ func TestAgenticExecutorNeverReportsSuccessWithoutFinish(t *testing.T) {
 	}
 }
 
+// TestAgenticExecutorDoesNotSendAnEmptyAssistantTurn pins C3. Anthropic has no
+// empty turn: its adapter refuses one rather than serialising `content: null`,
+// so a response with neither content nor a call used to poison the request that
+// carried the recovery nudge — the nudge never reached the model and the run
+// failed at the adapter instead. The empty reply is therefore not replayed; the
+// nudge still is.
+func TestAgenticExecutorDoesNotSendAnEmptyAssistantTurn(t *testing.T) {
+	p := &testProvider{name: "acme", complete: func(call int, _ provider.Request) (provider.Response, error) {
+		if call == 0 {
+			return provider.Response{}, nil // a silent model: no content, no call
+		}
+		return finishResponse("call-finish", "finished: do it", finishUsage()), nil
+	}}
+	exec := newAgentic(t, p)
+	exec.MaxSteps = 2
+
+	res, err := exec.Run(context.Background(), claimedItem("run-1", "do it", "agentic"))
+	if err != nil {
+		t.Fatalf("Run: %v (summary %q)", err, res.Summary)
+	}
+	if got := p.callCount(); got != 2 {
+		t.Fatalf("provider calls = %d, want 2: the nudge must reach the model", got)
+	}
+	second := p.request(1)
+	for i, m := range second.Messages {
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 {
+			t.Fatalf("message %d is an empty assistant turn; Anthropic's adapter refuses that shape, so the nudge is undeliverable", i)
+		}
+	}
+	last, ok := lastMessageOfRole(second, "user")
+	if !ok || !strings.Contains(last.Content, "tool") {
+		t.Fatalf("second request's last user turn = %q, want the no-tool-call nudge", last.Content)
+	}
+}
+
 // --- the board-facing cap test --------------------------------------------
 
 // TestAgenticExecutorReportsACapTripAsAnErrorNotASuccess is the acceptance test

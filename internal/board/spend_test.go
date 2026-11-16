@@ -967,6 +967,57 @@ func TestSpendTodayEndpointReportsTheLedger(t *testing.T) {
 	}
 }
 
+// TestByModelNamesTheModelRowAnOperatorCanPatch pins C9: by_model used to return
+// only the wire model name and the endpoint id, neither of which
+// PATCH /admin/models/{id} accepts, so an operator told which model was eating
+// the day could not act on its price without a second lookup. The row id is now
+// in the answer, and the test proves it is the key the write path takes.
+func TestByModelNamesTheModelRowAnOperatorCanPatch(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	epID, modelID := seedPricedEndpointForTest(t, db, clock, "local", 1, 2, "tools")
+	itemID := mustCreateItem(t, db, clock, "priced")
+	dayStart, _ := SpendDay(clock.Now())
+	seedRunForTest(t, db, node, itemID, "run-priced", 1, dayStart, 0.5)
+	if _, err := db.ExecContext(ctx,
+		`UPDATE runs SET model_id=?, endpoint_id=? WHERE id='run-priced'`, modelID, epID); err != nil {
+		t.Fatalf("attribute the run to the model: %v", err)
+	}
+
+	st := mustSpend(t, db, clock)
+	if len(st.ByModel) != 1 {
+		t.Fatalf("by_model = %+v, want one entry", st.ByModel)
+	}
+	m := st.ByModel[0]
+	if m.ID != modelID {
+		t.Fatalf("by_model[0].id = %q, want the models row id %q; the wire name alone cannot be PATCHed", m.ID, modelID)
+	}
+	if m.ModelID != "local-model" || m.EndpointID != epID {
+		t.Fatalf("by_model[0] = %+v, want model_id local-model and endpoint_id %s", m, epID)
+	}
+	if _, err := PatchModel(ctx, db, clock, m.ID, PatchModelRequest{CostInPerMtok: floatPtr(7)}); err != nil {
+		t.Fatalf("PATCH the model id by_model reported (%q): %v", m.ID, err)
+	}
+	if got := mustGetModel(t, db, "local-model"); got.CostInPerMtok != 7 {
+		t.Fatalf("cost after PATCH by the reported id = %v, want 7", got.CostInPerMtok)
+	}
+
+	// The empty-id half: a run with no model row reports no id, because there is
+	// no price to edit. It must still be counted, not dropped from the ledger.
+	seedRunForTest(t, db, node, itemID, "run-unattributed", 2, dayStart, 0.25)
+	st = mustSpend(t, db, clock)
+	var unattributed bool
+	for _, row := range st.ByModel {
+		if row.ID == "" && row.Runs == 1 && row.Spend == 0.25 {
+			unattributed = true
+		}
+	}
+	if !unattributed {
+		t.Fatalf("by_model = %+v, want an entry with no id for the run that has no model row", st.ByModel)
+	}
+}
+
 // TestSpendTodayPausedByWireVocabulary pins the exact strings this endpoint
 // puts on the wire. The expected values are literals, not the pauseBy*
 // constants that produce them: the constants are implementation, the JSON is

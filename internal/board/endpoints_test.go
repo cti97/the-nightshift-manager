@@ -538,18 +538,25 @@ func TestCreateModelRejectsNegativeNumbers(t *testing.T) {
 }
 
 func TestCreateModelRejectsNonFiniteNumbers(t *testing.T) {
-	// A NaN price is not negative, so the old "< 0" check let it through. Once
-	// stored it would price runs as NaN (or NULL), and ceilingReached would be
-	// false forever while unpriced_runs stayed blind. An infinite price is the
-	// same class of corrupt number: the ledger becomes infinity.
+	// The reachable half of this class is the INFINITE price. The old "< 0"
+	// check caught -Inf by accident, and SQLite refuses a NaN bind into this
+	// REAL NOT NULL column outright, so those legs do not exercise the
+	// finite-number rule: NaN still fails at the column when only that rule is
+	// removed, and -Inf is refused by the negative rule either way. +Inf is the
+	// value that was silently stored: it is neither negative nor refused by the
+	// driver, and every later ledger comparison treats it as unbounded. The
+	// +Inf legs are therefore what give this test teeth against the finite
+	// rule; the NaN and -Inf legs stay because the contract refuses them too,
+	// and a narrower test would let a later rewrite drop them.
 	db, clock := newTestDB(t)
 	ep := endpointFixture(t, db, clock)
 
 	cases := map[string]CreateModelRequest{
-		"NaN input price":  {EndpointID: ep.ID, ModelID: "m1", CostInPerMtok: math.NaN()},
-		"NaN output price": {EndpointID: ep.ID, ModelID: "m2", CostOutPerMtok: math.NaN()},
-		"+Inf input price": {EndpointID: ep.ID, ModelID: "m3", CostInPerMtok: math.Inf(1)},
-		"-Inf output":      {EndpointID: ep.ID, ModelID: "m4", CostOutPerMtok: math.Inf(-1)},
+		"NaN input price":   {EndpointID: ep.ID, ModelID: "m1", CostInPerMtok: math.NaN()},
+		"NaN output price":  {EndpointID: ep.ID, ModelID: "m2", CostOutPerMtok: math.NaN()},
+		"+Inf input price":  {EndpointID: ep.ID, ModelID: "m3", CostInPerMtok: math.Inf(1)},
+		"+Inf output price": {EndpointID: ep.ID, ModelID: "m4", CostOutPerMtok: math.Inf(1)},
+		"-Inf output price": {EndpointID: ep.ID, ModelID: "m5", CostOutPerMtok: math.Inf(-1)},
 	}
 	for name, req := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -797,9 +804,9 @@ func TestPatchModelRejectsNegativeNumbers(t *testing.T) {
 
 func TestPatchModelRejectsNonFiniteNumbers(t *testing.T) {
 	// The PATCH path validates inline rather than through checkModelNumbers, so
-	// it needs the same finite rule. A NaN or infinite price written here is
-	// just as invisible as one written at creation, and the run that prices
-	// against it comes later.
+	// it needs the same finite rule. As above, +Inf is the value that gives this
+	// test teeth against that rule: a NaN bind is refused by the NOT NULL column
+	// and -Inf by the negative rule, while +Inf was accepted and stored.
 	db, clock := newTestDB(t)
 	ep := endpointFixture(t, db, clock)
 	m := mustCreateModel(t, db, clock, CreateModelRequest{
@@ -813,6 +820,7 @@ func TestPatchModelRejectsNonFiniteNumbers(t *testing.T) {
 		{"NaN input price", PatchModelRequest{CostInPerMtok: floatPtr(math.NaN())}},
 		{"NaN output price", PatchModelRequest{CostOutPerMtok: floatPtr(math.NaN())}},
 		{"+Inf input price", PatchModelRequest{CostInPerMtok: floatPtr(math.Inf(1))}},
+		{"+Inf output price", PatchModelRequest{CostOutPerMtok: floatPtr(math.Inf(1))}},
 		{"-Inf output price", PatchModelRequest{CostOutPerMtok: floatPtr(math.Inf(-1))}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

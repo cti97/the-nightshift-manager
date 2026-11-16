@@ -55,6 +55,10 @@ const (
 // must:
 //
 //   - answer an ordinary request with non-empty content and positive Usage;
+//   - answer the probe route with a healthy model list, so Probe can determine a
+//     state: for an HTTP adapter that is the family's own list route
+//     (GET /v1/models for OpenAI and Anthropic, GET /api/tags for Ollama). The
+//     stub needs no such route because its Probe never asks an endpoint;
 //   - answer a request that offers tools with at least one Call whose Name is
 //     one of the offered tools (the suite offers read_file) and whose Arguments
 //     are valid JSON, and answer the follow-up request that replays the
@@ -79,6 +83,12 @@ const (
 // local-only work — cannot be expressed through func() Provider, which cannot
 // rebuild the provider with a different Config; it is covered by the stub's own
 // tests and, once endpoints land, by their wiring.
+//
+// Probe must return one of the four declared Health states with a nil error when
+// it did determine one, and must return an error with the zero Health when it
+// did not. Check 7 certifies both halves: the state must be in the closed set,
+// and a probe handed an already-cancelled context must fail loudly instead of
+// answering "ok" to a question it never asked.
 //
 // Each check runs under its own deadline (conformanceCheckTimeout), so a
 // provider that hangs fails that one check and the rest of the suite still runs
@@ -168,6 +178,7 @@ func conformanceChecks() []conformanceCheck {
 		{name: "estimate_is_within_forty_percent", run: checkTokenEstimate},
 		{name: "errors_map_to_the_taxonomy", run: checkErrorMapping},
 		{name: "refuses_local_only_without_a_local_reach", run: checkReachRefusal},
+		{name: "probe_reports_a_declared_state", run: checkProbe},
 	}
 }
 
@@ -389,6 +400,51 @@ func checkReachRefusal(ctx context.Context, p Provider) error {
 		}
 	}
 	return errors.Join(problems...)
+}
+
+// checkProbe is check 7. Probe is what the operator's health view stands on, and
+// until now the suite never called it: an adapter whose Probe returned an empty
+// or invented string, or one that answered "ok" no matter what, passed every
+// check above. The states are a closed set because each asks the operator to do
+// something different (Health's doc), so a value outside it is not a
+// near-miss — it is an answer no caller can act on.
+//
+// The failure leg uses the one probe failure the suite can force without owning
+// the endpoint: a context that has already ended before Probe starts. No probe
+// can have asked the endpoint anything then, so a Health with a nil error is
+// either a fabricated answer or a context that was ignored — the silent "ok"
+// this check exists to refuse. A failed probe must also return the zero Health,
+// because the seam says a non-nil error means no state was determined; returning
+// "ok" beside an error would let a caller that ignores the error report a
+// healthy endpoint.
+//
+// Every current adapter checks ctx.Err() before its request, as does the stub,
+// so a real adapter satisfies the cancelled leg against the healthy fixture. The
+// live leg accepts any of the four states rather than requiring HealthOK: the
+// suite does not own the fake's probe route, and an adapter that correctly maps
+// a fake's 503 to "down" or "warming" has done exactly what Probe promises.
+func checkProbe(ctx context.Context, p Provider) error {
+	health, err := p.Probe(ctx)
+	if err != nil {
+		return fmt.Errorf("Probe: %w", err)
+	}
+	switch health {
+	case HealthOK, HealthWarming, HealthDown, HealthAuthFailed:
+	default:
+		return fmt.Errorf("Probe returned Health %q, which is not one of the four declared states (%q, %q, %q, %q)",
+			health, HealthOK, HealthWarming, HealthDown, HealthAuthFailed)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	health, err = p.Probe(cancelled)
+	if err == nil {
+		return fmt.Errorf("Probe with a cancelled context returned Health %q and no error; a probe that never asked the endpoint must report an error instead of a state", health)
+	}
+	if health != "" {
+		return fmt.Errorf("Probe with a cancelled context returned Health %q alongside %v; a failed probe determines no state, and the zero Health is how the seam says so", health, err)
+	}
+	return nil
 }
 
 func plainRequest(model string) Request {

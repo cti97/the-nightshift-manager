@@ -650,6 +650,15 @@ var (
 // present but unable to apply a profile — for example when the agent itself
 // runs inside a sandbox, because a nested sandbox_apply is denied. Callers
 // should log the reason once and must not describe the run as kernel-confined.
+//
+// The acceptance test that proves the kernel half
+// (TestSandboxCannotReachTheHomeDirectory) skips when confinement is inactive,
+// because a green tick over an unenforced boundary is worse than no test. On a
+// machine that is supposed to have the layer, NSM_REQUIRE_KERNEL_SANDBOX=1 turns
+// that skip into a failure. The variable is read by that test only, never by
+// this function or by the running process, and on a non-darwin OS it has no
+// effect: the test skips on the platform before it reads the variable, and there
+// is no kernel layer here for it to require.
 func KernelConfinement() (bool, string) {
 	k := detectKernel()
 	if k.path != "" {

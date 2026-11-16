@@ -367,9 +367,12 @@ func decodeToolArgs(raw json.RawMessage, v any) error {
 //     later.
 //   - An absolute path, a volume-qualified path (Windows) and a NUL byte are
 //     refused before anything is opened.
-//   - The check runs on the slash-separated form, so a Windows-style
-//     "..\\..\\etc" is refused on Windows, while on Unix a backslash is an
-//     ordinary filename byte and is left alone.
+//   - A backslash is refused on every OS, before the path is split. On Windows
+//     it is the separator, so "..\\..\\etc" would traverse; on Unix it is an
+//     ordinary filename byte, but accepting it would make the same call behave
+//     differently on two OSes, and a Windows-style traversal would hide in a
+//     name a Unix reader sees as flat. A path here uses '/', or it is a
+//     mistake.
 //
 // No Unicode normalisation happens anywhere: not NFC/NFD, not fullwidth
 // separators. A lookalike character is an ordinary byte in an ordinary name, so
