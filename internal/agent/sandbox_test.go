@@ -539,6 +539,9 @@ func TestSandboxProfileIsGenerated(t *testing.T) {
 		"(deny default)",
 		"(subpath " + quoteProfilePath(sb.Dir()) + ")",
 		"(deny file-read-data",
+		// macOS 26+ dyld aborts before main when the root directory is not
+		// readable; the run directory rules do not cover "/" itself.
+		`(literal "/")`,
 	} {
 		if !strings.Contains(profile, want) {
 			t.Errorf("profile is missing %q:\n%s", want, profile)

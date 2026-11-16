@@ -732,6 +732,13 @@ func buildProfile(dir string, network bool) string {
 	b.WriteString("; Read-only system paths. /usr/local and /opt/homebrew are not here: a\n")
 	b.WriteString("; tool that is not part of the OS is not available to the shell.\n")
 	b.WriteString("(allow file-read*\n")
+	// The root directory itself, as a literal. macOS 26+ dyld aborts the
+	// process before main (SIGABRT from CacheFinder's ignition, no message on
+	// stderr) when it cannot read "/", even when every path it goes on to
+	// load is allowed below. Naming the root lets it readdir("/") -- top-level
+	// names only -- and no file contents anywhere; the subpath rules still
+	// bound what can be opened.
+	b.WriteString("    (literal \"/\")\n")
 	b.WriteString("    (subpath \"/System\")\n")
 	b.WriteString("    (subpath \"/usr\")\n")
 	b.WriteString("    (subpath \"/bin\")\n")
