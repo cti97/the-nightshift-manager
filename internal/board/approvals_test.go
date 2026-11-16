@@ -781,3 +781,51 @@ func TestTheEscalationRouteParksTheRun(t *testing.T) {
 		t.Fatalf("stored request = %v, want the action the node posted", stored)
 	}
 }
+
+// TestAGrantIsConsumedOnce pins the intended rule, which the plan asked to be
+// stated: a grant is spent by the claim that carries it, not left standing on the
+// item. So run 2 (which holds it) acts; if run 2 dies and the reaper requeues the
+// item, run 3 asks again. The alternative — leaving it on the row — lets a run
+// that already acted be re-run with the same permission, which is the one
+// direction a permission must not fail in.
+func TestAGrantIsConsumedOnce(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	itemID, node := parkEscalated(t, db, clock, "delete /var/cache/app")
+	ctx := context.Background()
+
+	if _, err := Decide(ctx, db, clock, itemID, Approve, "go ahead"); err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	second, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("second claim = %d items, err %v", len(second), err)
+	}
+	if second[0].Item.ApprovalGranted == nil {
+		t.Fatal("the second run's payload has no grant; the approval was never delivered")
+	}
+	var stored sql.NullString
+	if err := db.QueryRow(`SELECT approval_granted FROM work_items WHERE id=?`, itemID).Scan(&stored); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if stored.Valid {
+		t.Fatalf("approval_granted = %q after the claim that used it, want NULL: a grant authorises one run", stored.String)
+	}
+
+	// Run 2 dies without reporting: the lease expires and the reaper requeues.
+	if err := StartRun(ctx, db, clock, second[0].RunID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	stepPastLease(clock)
+	if _, err := Reap(ctx, db, clock); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	third, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(third) != 1 {
+		t.Fatalf("third claim = %d items, err %v", len(third), err)
+	}
+	if third[0].Item.ApprovalGranted != nil {
+		t.Fatalf("the third run inherited %+v; a grant is consumed by its run, not kept on the item", third[0].Item.ApprovalGranted)
+	}
+}

@@ -390,8 +390,14 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 		}
 		lease := clock.Now() + leaseSeconds
 
+		// The grant is consumed by this claim (M3 D3): it authorised one run, and
+		// that run is starting now. Clearing it here, rather than at report time,
+		// is what makes a third run ask again instead of inheriting a permission
+		// an earlier run may already have acted on — the safe direction when the
+		// run is interrupted before the board hears from it.
 		res, err := conn.ExecContext(ctx,
-			`UPDATE work_items SET status='claimed', claimed_by=?, lease_expires_at=?, attempt=attempt+1, updated_at=?
+			`UPDATE work_items SET status='claimed', claimed_by=?, lease_expires_at=?, attempt=attempt+1,
+			        approval_granted=NULL, updated_at=?
 			  WHERE id=? AND claimed_by IS NULL AND status='queued'`,
 			nodeID, lease, clock.Now(), r.id)
 		if err != nil {

@@ -272,6 +272,89 @@ func TestTheApprovalRequestReachesTheBoard(t *testing.T) {
 	}
 }
 
+// TestAGrantedActionDoesNotEscalateTwice is the loop the feature exists for: the
+// second run asks for the same action, the grant on the item answers it, and the
+// run continues to finish instead of parking the item for a decision a human has
+// already made.
+func TestAGrantedActionDoesNotEscalateTwice(t *testing.T) {
+	p := &testProvider{name: "acme", complete: func(call int, _ provider.Request) (provider.Response, error) {
+		if call == 0 {
+			return approvalResponse("call-ask", "delete /var/cache/app", "it holds 40GB"), nil
+		}
+		return finishResponse("call-finish", "deleted the cache", finishUsage()), nil
+	}}
+	exec := newAgentic(t, p)
+
+	item := claimedItem("run-2", "do it", "agentic")
+	item.Item.ApprovalGranted = &board.ApprovalGrant{
+		Action: "delete /var/cache/app", Note: "go ahead, it is regenerable", DecidedAt: 1,
+	}
+
+	res, err := exec.Run(context.Background(), item)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Approval != nil {
+		t.Fatalf("Result.Approval = %+v, want nil: the grant answered the question, the run completed", res.Approval)
+	}
+	if res.Summary != "deleted the cache" {
+		t.Fatalf("Summary = %q, want the finish summary", res.Summary)
+	}
+	if got := p.callCount(); got != 2 {
+		t.Fatalf("provider calls = %d, want 2: ask, then act", got)
+	}
+
+	// The model must be told the answer, with the operator's note, or it will
+	// ask again on the next step and the run dies of politeness.
+	second := p.request(1)
+	msg, ok := lastMessageOfRole(second, "tool")
+	if !ok {
+		t.Fatalf("the second request carries no tool message; the model was never told the action was approved")
+	}
+	if !strings.Contains(msg.Content, "approved") || !strings.Contains(msg.Content, "go ahead, it is regenerable") {
+		t.Fatalf("tool result = %q, want an approval naming the operator's note", msg.Content)
+	}
+
+	// And the first request's brief already names the grant: a run that starts
+	// allowed to act should not spend a step asking.
+	first := p.request(0)
+	user, ok := lastMessageOfRole(first, "user")
+	if !ok || !strings.Contains(user.Content, "delete /var/cache/app") || !strings.Contains(user.Content, "already approved") {
+		t.Fatalf("brief = %q, want it to state the action already approved", user.Content)
+	}
+}
+
+// TestAGrantForADifferentActionEscalatesAgain is D3's other half: an approval is
+// for one action. A run holding a grant to delete the cache that asks to rotate a
+// key is refused, parks again, and the reason names both actions so the operator
+// can see why their earlier approval did not cover it.
+func TestAGrantForADifferentActionEscalatesAgain(t *testing.T) {
+	stub := provider.NewStub([]provider.Response{
+		approvalResponse("call-ask", "rotate the api key", "the old one leaked"),
+	})
+	exec := newAgentic(t, stub)
+
+	item := claimedItem("run-2", "do it", "agentic")
+	item.Item.ApprovalGranted = &board.ApprovalGrant{
+		Action: "delete /var/cache/app", Note: "yes", DecidedAt: 1,
+	}
+
+	res, err := exec.Run(context.Background(), item)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Approval == nil {
+		t.Fatal("a grant for a different action let the run proceed; an approval is not a master key")
+	}
+	if res.Approval.Action != "rotate the api key" {
+		t.Fatalf("Action = %q, want the action this run asked for", res.Approval.Action)
+	}
+	if !strings.Contains(res.Approval.Reason, "delete /var/cache/app") ||
+		!strings.Contains(res.Approval.Reason, "rotate the api key") {
+		t.Fatalf("Reason = %q, want it to name both the granted action and the requested one", res.Approval.Reason)
+	}
+}
+
 func listDirResponse(id string) provider.Response {
 	return callResponse(id, ToolListDir, `{}`, provider.Usage{In: 10, Out: 5})
 }

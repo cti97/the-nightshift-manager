@@ -322,6 +322,31 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 			// that stops to ask is not a failed run, so the error is nil.
 			var need *ApprovalNeeded
 			if errors.As(terr, &need) {
+				// M3 D3: a grant names ONE action, and it is worth exactly that.
+				// A grant for the action being asked for is the answer to this
+				// question: the run continues and the model is told who allowed
+				// it, instead of parking the item for a second identical decision.
+				if g := item.Item.ApprovalGranted; g != nil {
+					if g.Action == need.Request.Action {
+						messages = append(messages, provider.Message{
+							Role:    "tool",
+							Name:    call.Name,
+							CallID:  call.ID,
+							Content: approvalGrantedMessage(g),
+						})
+						continue
+					}
+					// A grant for a different action is a refusal, not a
+					// permission. Park again, and put both actions in the reason:
+					// the operator needs to see that the approval they gave does
+					// not cover what this run is asking for.
+					req := need.Request
+					req.Reason = fmt.Sprintf("%s (this run holds an approval for %q, not %q, so that approval does not authorise this action)",
+						strings.TrimSpace(req.Reason), g.Action, req.Action)
+					res := meter.result(fmt.Sprintf("run stopped to ask for approval: %s", req.Action))
+					res.Approval = &req
+					return res, nil
+				}
 				req := need.Request
 				res := meter.result(fmt.Sprintf("run stopped to ask for approval: %s", req.Action))
 				res.Approval = &req
@@ -606,9 +631,26 @@ func nonNegative(n int) int {
 	return n
 }
 
+// approvalGrantedMessage is what the model is told when the action it asked
+// about is already approved. It names the action and the operator's note: the
+// grant is the answer to the question, and the model should act rather than ask
+// again — a second identical request would park the item for a decision that has
+// already been made.
+func approvalGrantedMessage(g *board.ApprovalGrant) string {
+	msg := fmt.Sprintf("approved: an operator allowed the action %q, and this run carries that approval. Proceed with it.", g.Action)
+	if note := strings.TrimSpace(g.Note); note != "" {
+		msg += " Their note: " + note
+	}
+	return msg
+}
+
 // userBrief is the one user turn the run starts from. The brief is the only
 // prose the operator gives the worker; the title is included because it is the
 // human-readable name of the work.
+//
+// The approval grant is repeated here, not left for the model to discover by
+// asking: a run that starts already allowed to act should not spend a step asking
+// permission it holds.
 func userBrief(item board.ClaimedItem) string {
 	var b strings.Builder
 	if title := strings.TrimSpace(item.Item.Title); title != "" {
@@ -617,6 +659,13 @@ func userBrief(item board.ClaimedItem) string {
 	b.WriteString(item.Brief)
 	if strings.TrimSpace(b.String()) == "" {
 		b.WriteString("(no brief or title was supplied; call finish and say what you could not do)")
+	}
+	if g := item.Item.ApprovalGranted; g != nil {
+		fmt.Fprintf(&b, "\n\nAn operator already approved this action for this run: %q", g.Action)
+		if note := strings.TrimSpace(g.Note); note != "" {
+			fmt.Fprintf(&b, " (their note: %s)", note)
+		}
+		b.WriteString(". Do not ask for it again; call request_approval only if you need permission for a different action.")
 	}
 	return b.String()
 }
