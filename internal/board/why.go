@@ -4,6 +4,7 @@ package board
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 )
 
@@ -104,6 +105,47 @@ func terminalReason(itemID, status string, d Decision) string {
 	return reason + "; even against today's board it could not be placed: " + d.Reason
 }
 
+// parkedReason is the answer for a parked item. It names the action and how long
+// the item has waited, because those are the two facts that decide whether the
+// operator approves now, denies, or goes looking for the run that asked. A row
+// whose request cannot be read says so and points at the only way out (deny):
+// silence here would read as "nothing is waiting", which is the opposite of true.
+func parkedReason(itemID string, raw sql.NullString, now int64) string {
+	if !raw.Valid || raw.String == "" {
+		return fmt.Sprintf("item %s is waiting on a human, but no approval request was recorded on it (it was parked before the column existed, or hand-edited); deny it from the approvals page to clear it", itemID)
+	}
+	var req ApprovalRequest
+	if err := json.Unmarshal([]byte(raw.String), &req); err != nil {
+		return fmt.Sprintf("item %s is waiting on a human, but its approval request cannot be read (%v); deny it from the approvals page to clear it", itemID, err)
+	}
+	asked := "at an unknown time"
+	if req.RequestedAt > 0 {
+		asked = fmt.Sprintf("%s ago", waitedFor(now-req.RequestedAt))
+	}
+	return fmt.Sprintf("item %s is waiting on a human: the action %q has to be approved or denied (asked %s by %s)",
+		itemID, req.Action, asked, req.RequestedBy)
+}
+
+// waitedFor renders a wait in the unit an operator thinks in: seconds under a
+// minute, minutes under an hour, then hours and days. It clamps a negative wait
+// (a clock that moved backwards) to zero rather than printing "-3m", which would
+// read as a bug in the board instead of a clock skew.
+func waitedFor(seconds int64) string {
+	if seconds < 0 {
+		seconds = 0
+	}
+	switch {
+	case seconds < 60:
+		return fmt.Sprintf("%ds", seconds)
+	case seconds < 3600:
+		return fmt.Sprintf("%dm", seconds/60)
+	case seconds < 86400:
+		return fmt.Sprintf("%dh%dm", seconds/3600, (seconds%3600)/60)
+	default:
+		return fmt.Sprintf("%dd%dh", seconds/86400, (seconds%86400)/3600)
+	}
+}
+
 // Explain answers for one item by re-running placement against the board as it
 // is now. It is a read-only view: it writes no blocked_reason and settles
 // nothing, so asking why cannot change the answer it is explaining. The clock
@@ -143,7 +185,23 @@ func Explain(ctx context.Context, db *sql.DB, clock Clock, itemID string) (Expla
 	ex.Warnings = warnings
 	d := Place(WorkItem{ID: ex.ItemID, Needs: needs, Status: ex.Status}, cands)
 	ex.Rejects = d.Rejects
-	if terminalStatus(ex.Status) {
+	switch {
+	case ex.Status == "needs_approval":
+		// A parked item is not waiting for a placement; it is waiting for a
+		// person. Reporting the placement verdict as "placed: true" would say the
+		// board could claim it, and it cannot: Claim only takes 'queued' rows, so
+		// the board will not issue this item until a human decides (M3 D2, D6).
+		// The parked branch therefore comes first, and the verdict is never
+		// printed as placed.
+		var rawRequest sql.NullString
+		if err := db.QueryRowContext(ctx,
+			`SELECT approval_request FROM work_items WHERE id=?`, itemID).Scan(&rawRequest); err != nil {
+			return ex, fmt.Errorf("item %s: %w", itemID, err)
+		}
+		ex.Placed = false
+		ex.Reason = parkedReason(ex.ItemID, rawRequest, clock.Now())
+		ex.BlockedReason = ex.Reason
+	case terminalStatus(ex.Status):
 		// A finished item cannot be claimed, whatever placement would say about
 		// it. Reporting placed:true here read as "this could be claimed" and
 		// sent an operator looking for a run that will never happen (C13). The
@@ -153,7 +211,7 @@ func Explain(ctx context.Context, db *sql.DB, clock Clock, itemID string) (Expla
 		ex.Placed = false
 		ex.Reason = terminalReason(ex.ItemID, ex.Status, d)
 		ex.BlockedReason = ex.Reason
-	} else {
+	default:
 		ex.Placed = d.OK
 		ex.Reason = d.Reason
 		if !d.OK {

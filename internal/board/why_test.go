@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestWhyReportsWhoPausedTheBoard pins A1: the explainer answers "who stopped
@@ -202,5 +203,120 @@ func TestWhyKeepsThePlacementExplanationForAnUnplaceableTerminalItem(t *testing.
 	}
 	if len(ex.Rejects) == 0 || !strings.Contains(ex.Rejects[0].Why, "offline") {
 		t.Fatalf("rejects = %+v, want the offline node named; the placement explanation was lost", ex.Rejects)
+	}
+}
+
+// TestWhySaysAParkedItemIsAwaitingAHuman: a parked item is not unplaced, it is
+// waiting. The explanation has to name the action a human is being asked about
+// and how long it has waited — those are the two facts that decide whether the
+// operator approves now or goes looking for the run that asked.
+func TestWhySaysAParkedItemIsAwaitingAHuman(t *testing.T) {
+	db, clock := OpenForTest(t, t.TempDir()+"/board.db")
+	itemID, _ := parkEscalated(t, db, clock, "delete /var/cache/app")
+	clock.Advance(7 * time.Minute)
+
+	ex, err := Explain(context.Background(), db, clock, itemID)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if ex.Status != "needs_approval" {
+		t.Fatalf("status = %q, want needs_approval", ex.Status)
+	}
+	if !strings.Contains(ex.BlockedReason, "waiting on a human") {
+		t.Fatalf("blocked_reason = %q, want it to say a human is being waited on", ex.BlockedReason)
+	}
+	if !strings.Contains(ex.BlockedReason, "delete /var/cache/app") {
+		t.Fatalf("blocked_reason = %q, want the action being asked about", ex.BlockedReason)
+	}
+	if !strings.Contains(ex.BlockedReason, "7m ago") {
+		t.Fatalf("blocked_reason = %q, want how long it has waited", ex.BlockedReason)
+	}
+}
+
+// TestWhyDoesNotSayAParkedItemCouldBeClaimed: the board would place this item —
+// the node is online and the endpoint eligible — but it must never report
+// placed:true for it, because Claim takes only queued rows. The positive control
+// keeps the assertion honest: without it the test would pass on an unplaceable
+// fixture and prove nothing.
+func TestWhyDoesNotSayAParkedItemCouldBeClaimed(t *testing.T) {
+	db, clock := OpenForTest(t, t.TempDir()+"/board.db")
+	itemID, _ := parkEscalated(t, db, clock, "delete /var/cache/app")
+
+	cands, err := LoadCandidates(context.Background(), db)
+	if err != nil {
+		t.Fatalf("LoadCandidates: %v", err)
+	}
+	if d := Place(WorkItem{ID: itemID, Needs: []string{"agentic"}, Status: "queued"}, cands); !d.OK {
+		t.Fatalf("fixture is not placeable (%s); the assertion below would pass vacuously", d.Reason)
+	}
+
+	ex, err := Explain(context.Background(), db, clock, itemID)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if ex.Placed {
+		t.Fatalf("placed = true for a parked item; the board will not issue it until a human decides")
+	}
+	if strings.Contains(ex.Reason, "would give it") {
+		t.Fatalf("reason = %q; a parked item's placement verdict must not read as \"could be claimed\"", ex.Reason)
+	}
+}
+
+// TestWhyHandlesAParkedItemWithNoRequest is the migration's NULL edge again, this
+// time in the explainer: the row is still waiting on a person even though nothing
+// is recorded about what it wants, and /why points at the way out instead of
+// answering "not found" or nothing at all.
+func TestWhyHandlesAParkedItemWithNoRequest(t *testing.T) {
+	db, clock := OpenForTest(t, t.TempDir()+"/board.db")
+	itemID, _ := parkEscalated(t, db, clock, "delete /var/cache/app")
+	if _, err := db.Exec(`UPDATE work_items SET approval_request=NULL WHERE id=?`, itemID); err != nil {
+		t.Fatalf("clear request: %v", err)
+	}
+
+	ex, err := Explain(context.Background(), db, clock, itemID)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if ex.Placed {
+		t.Fatal("placed = true for a parked item with no request")
+	}
+	if !strings.Contains(ex.BlockedReason, "waiting on a human") {
+		t.Fatalf("blocked_reason = %q, want it to say a human is waited on", ex.BlockedReason)
+	}
+	// The two unreadable-row cases are different facts and the operator is told
+	// which: no request at all, or a cell that does not decode. Accepting either
+	// message here would let one replace the other.
+	if !strings.Contains(ex.BlockedReason, "no approval request was recorded") {
+		t.Fatalf("blocked_reason = %q, want it to say the row carries no request", ex.BlockedReason)
+	}
+	if !strings.Contains(ex.BlockedReason, "deny") {
+		t.Fatalf("blocked_reason = %q, want the way out (deny) named", ex.BlockedReason)
+	}
+}
+
+// TestBoardCountsParkedItems: the dashboard's counts are the operator's first
+// answer to "is anything waiting", so needs_approval must be counted and must be
+// zero-filled when nothing is. The board route already iterates every status;
+// this pins the parked one.
+func TestBoardCountsParkedItems(t *testing.T) {
+	f := newApprovalsFixture(t)
+	f.create(t, "first", 0)
+	f.parkNext(t, "delete /var/cache/app")
+	f.create(t, "second", 10)
+	f.parkNext(t, "rotate the api key")
+
+	rec := do(t, f.srv.Handler(), "GET", "/admin/board", testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("board = %d, want 200", rec.Code)
+	}
+	var counts map[string]int
+	if err := json.Unmarshal(rec.Body.Bytes(), &counts); err != nil {
+		t.Fatalf("decode board: %v", err)
+	}
+	if counts["needs_approval"] != 2 {
+		t.Fatalf("needs_approval = %d, want 2 (%v)", counts["needs_approval"], counts)
+	}
+	if counts["queued"] != 0 {
+		t.Fatalf("queued = %d, want 0: both items are parked", counts["queued"])
 	}
 }

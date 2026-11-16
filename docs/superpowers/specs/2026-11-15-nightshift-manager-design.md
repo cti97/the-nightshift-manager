@@ -689,6 +689,13 @@ behind the reverse proxy's auth.
 | Pi offline | No `no_egress` lane; dashboard shows degraded rather than items silently queueing |
 | VPS disk full | Board refuses writes, claims fail loudly, no silent state loss |
 | Thread budget exhausted | Send refused, thread frozen, admin notified |
+| Run asks for approval | Tool ends the run as `escalated`; item parked `needs_approval` with the request stored; lease released, so no worker waits on a human; the run is priced into the day's ledger and the reaper's scan cannot see the parked item |
+| Escalation request never reaches the board | The run stays live until its lease expires; the reaper requeues it like any lost run — no item is stranded parked or running |
+| Approval granted | Item requeued carrying `approval_granted {action, note, decided_at}`; the next claim consumes the grant; the run that asked is not retried and the attempt stays spent |
+| Approval granted for a different action | The grant is a refusal, not a permission: the run escalates again with both actions named in the reason |
+| Approval denied | Item `cancelled` with `blocked_reason` naming the decider and their note — not `failed`: nothing went wrong |
+| Second decision on the same item | `409`; the first decision stands, and exactly one decision event exists |
+| Parked item whose request is missing or corrupt | Listed and explained as waiting, with deny as the way out; approve is refused because it cannot name the action it would allow |
 
 ## 17. Testing
 
