@@ -392,11 +392,11 @@ func TestMigrationFourAddsTheApprovalColumn(t *testing.T) {
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if v != 4 {
-		t.Fatalf("user_version = %d after Open, want 4", v)
-	}
-	if SchemaVersion() != 4 {
-		t.Fatalf("SchemaVersion() = %d, want 4", SchemaVersion())
+	// Open applies the whole migration list, so it stamps the version that
+	// list ends at. Assert against that, not a literal, so appending
+	// migration 5 cannot break a test about migration 4's column.
+	if v != schemaVersion {
+		t.Fatalf("user_version = %d after Open, want %d (SchemaVersion)", v, schemaVersion)
 	}
 
 	var typ string
@@ -470,8 +470,8 @@ func TestMigrationFourAddsTheApprovalColumn(t *testing.T) {
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatalf("user_version after re-Open: %v", err)
 	}
-	if v != 4 {
-		t.Fatalf("user_version = %d after re-Open, want 4", v)
+	if v != schemaVersion {
+		t.Fatalf("user_version = %d after re-Open, want %d", v, schemaVersion)
 	}
 	if err := db.QueryRow(`SELECT count(*) FROM work_items`).Scan(&count); err != nil {
 		t.Fatalf("work_items count after re-Open: %v", err)
@@ -530,24 +530,28 @@ func TestTheParkedIndexServesTheApprovalsQuery(t *testing.T) {
 func TestAVersionFourDatabaseRefusesAnOlderBinary(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "board.db")
 
-	db, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO work_items
-		 (id,title,brief,status,created_by,created_at,updated_at)
-		 VALUES ('w1','parked','do it','needs_approval','admin',1,1)`); err != nil {
-		t.Fatalf("seed item: %v", err)
-	}
-	db.Close()
-
+	// Build the version-4 fixture from migrations[:4], the way
+	// TestMigrateAppliesOnlyNewerMigrations builds its v3 fixture. Open would
+	// stamp whichever version this binary implements, so the day migration 5
+	// appends, the "v4 database" handed to the older binary would silently be
+	// a v5 one.
 	raw, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	defer raw.Close()
 
-	err = migrate(context.Background(), raw, migrations[:3])
+	ctx := context.Background()
+	if err := migrate(ctx, raw, migrations[:4]); err != nil {
+		t.Fatalf("migrate to version 4: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO work_items
+		 (id,title,brief,status,created_by,created_at,updated_at)
+		 VALUES ('w1','parked','do it','needs_approval','admin',1,1)`); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+
+	err = migrate(ctx, raw, migrations[:3])
 	if err == nil {
 		t.Fatal("a version-3 migration list accepted a version-4 database, want a refusal")
 	}
@@ -562,6 +566,8 @@ func TestAVersionFourDatabaseRefusesAnOlderBinary(t *testing.T) {
 	if err := raw.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
+	// Still literally 4: the fixture is a version-4 database, and the refusal
+	// is what must have left it untouched.
 	if v != 4 {
 		t.Fatalf("user_version = %d after the refusal, want 4 (nothing applied)", v)
 	}
