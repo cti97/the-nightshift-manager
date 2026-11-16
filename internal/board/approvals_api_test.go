@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -98,6 +99,186 @@ func (f *approvalsFixture) list(t *testing.T, bearer string) (*httptest.Response
 		}
 	}
 	return rec, got
+}
+
+// page fetches a URL as a browser would, with the admin token in a Basic header
+// — the only credential a browser can present (M3 D8).
+func (f *approvalsFixture) page(t *testing.T, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.SetBasicAuth("operator", testAdminToken)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// submit posts the page's form the way a browser does.
+func (f *approvalsFixture) submit(t *testing.T, itemID, decision, note string) *httptest.ResponseRecorder {
+	t.Helper()
+	form := url.Values{"decision": {decision}, "note": {note}}.Encode()
+	req := httptest.NewRequest(http.MethodPost, "/admin/approvals/"+itemID, strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("operator", testAdminToken)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// TestApprovalsPageRendersEveryPendingItem is the daily screen: one card per
+// parked item, the action and the reason visible, a form per card, and no script
+// anywhere — a page that needs JavaScript to approve work is a page you cannot
+// trust from a locked-down phone.
+func TestApprovalsPageRendersEveryPendingItem(t *testing.T) {
+	f := newApprovalsFixture(t)
+	f.create(t, "cache cleanup", 0)
+	f.parkNext(t, "delete /var/cache/app")
+	f.create(t, "key rotation", 10)
+	f.parkNext(t, "rotate the api key")
+
+	rec := f.page(t, "/admin/approvals")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("page = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("Content-Type = %q, want text/html", ct)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"delete /var/cache/app", "rotate the api key",
+		"cache cleanup", "key rotation",
+		"the run needs it",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("page does not show %q:\n%s", want, body)
+		}
+	}
+	if got := strings.Count(body, "<form "); got != 2 {
+		t.Fatalf("forms = %d, want one per parked item (2)", got)
+	}
+	if strings.Contains(strings.ToLower(body), "<script") {
+		t.Fatal("the page ships JavaScript; it must be usable with scripts off")
+	}
+}
+
+// TestApprovalsPageIsPhoneReadable asserts the MARKUP that makes a single column:
+// a viewport meta tag, one main element, and block-level cards. Styling can be
+// edited by anyone; these are the parts that decide whether a phone reflows the
+// page at all.
+func TestApprovalsPageIsPhoneReadable(t *testing.T) {
+	f := newApprovalsFixture(t)
+	f.create(t, "cache cleanup", 0)
+	f.parkNext(t, "delete /var/cache/app")
+
+	body := f.page(t, "/admin/approvals").Body.String()
+	if !strings.Contains(body, `name="viewport"`) || !strings.Contains(body, "width=device-width") {
+		t.Fatalf("no viewport meta tag; a phone renders this at desktop width:\n%s", body)
+	}
+	if got := strings.Count(body, "<main>"); got != 1 {
+		t.Fatalf("<main> elements = %d, want 1", got)
+	}
+	if !strings.Contains(body, `<section class="card"`) {
+		t.Fatalf("items are not block-level sections:\n%s", body)
+	}
+	for _, forbidden := range []string{"<table", "grid-template-columns", "display: flex", "display:flex"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("page uses %q; the layout must be a single column a phone can reflow", forbidden)
+		}
+	}
+}
+
+// TestApprovalsPageSubmitsADecision is the whole loop on the page's own
+// transport: a form post decides, the answer is a redirect back to the queue (so a
+// refresh cannot re-decide), and the decided item has left the page.
+func TestApprovalsPageSubmitsADecision(t *testing.T) {
+	f := newApprovalsFixture(t)
+	approved := f.create(t, "cache cleanup", 0)
+	f.parkNext(t, "delete /var/cache/app")
+	f.create(t, "key rotation", 10)
+	f.parkNext(t, "rotate the api key")
+
+	rec := f.submit(t, approved, Approve, "go ahead, the cache is regenerable")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("form post = %d, want 303 (body %s)", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "/admin/approvals" {
+		t.Fatalf("Location = %q, want /admin/approvals", loc)
+	}
+
+	var status string
+	if err := f.db.QueryRow(`SELECT status FROM work_items WHERE id=?`, approved).Scan(&status); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("item status = %q after the form post, want queued", status)
+	}
+
+	body := f.page(t, "/admin/approvals").Body.String()
+	if !strings.Contains(body, "rotate the api key") {
+		t.Fatalf("the undecided item left the page too:\n%s", body)
+	}
+	if strings.Contains(body, "delete /var/cache/app") {
+		t.Fatalf("the decided item is still on the page:\n%s", body)
+	}
+	if got := strings.Count(body, "<form "); got != 1 {
+		t.Fatalf("forms = %d, want the one still waiting", got)
+	}
+}
+
+// TestJsonIsStillAvailableForScripts: the same route, the representation the API
+// client asked for. A script must not have to parse HTML to read the queue.
+func TestJsonIsStillAvailableForScripts(t *testing.T) {
+	f := newApprovalsFixture(t)
+	f.create(t, "cache cleanup", 0)
+	f.parkNext(t, "delete /var/cache/app")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/approvals", nil)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("json = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	var got []Approval
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 || got[0].Action != "delete /var/cache/app" {
+		t.Fatalf("approvals = %+v, want the parked item", got)
+	}
+}
+
+// TestTheApprovalsPageAcceptsBasicAuth is what makes the page usable from a phone:
+// the browser cannot set a bearer header, so the token arrives as the Basic
+// password. A wrong password is 401 with the prompt, not a JSON body.
+func TestTheApprovalsPageAcceptsBasicAuth(t *testing.T) {
+	f := newApprovalsFixture(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/approvals", nil)
+	req.Header.Set("Accept", "text/html")
+	req.SetBasicAuth("operator", testAdminToken)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("basic auth with the admin token = %d, want 200", rec.Code)
+	}
+
+	bad := httptest.NewRequest(http.MethodGet, "/admin/approvals", nil)
+	bad.Header.Set("Accept", "text/html")
+	bad.SetBasicAuth("operator", "wrong")
+	badRec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(badRec, bad)
+	if badRec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password = %d, want 401", badRec.Code)
+	}
+	if !strings.HasPrefix(badRec.Header().Get("WWW-Authenticate"), "Basic") {
+		t.Fatalf("WWW-Authenticate = %q, want a Basic prompt so the browser can retry", badRec.Header().Get("WWW-Authenticate"))
+	}
 }
 
 // TestDecisionRouteAnswersConflicts walks the status codes a caller meets on

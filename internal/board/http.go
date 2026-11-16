@@ -91,13 +91,35 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) adminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tok, ok := bearer(r)
+		tok, ok := adminCredential(r)
 		if !ok || HashToken(tok) != s.adminTokenHash {
+			// Always offer the Basic prompt: a phone's browser has no other way
+			// to present the token, and a JSON client ignores the header.
+			w.Header().Set("WWW-Authenticate", `Basic realm="nightshift admin", charset="UTF-8"`)
 			WriteError(w, http.StatusUnauthorized, "unauthorized", "admin token required")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// adminCredential reads the admin token from either form the deployment uses: a
+// bearer header, which is what the CLI, scripts and the JSON API send, or HTTP
+// Basic, where the token is the password and the username is ignored.
+//
+// Basic is what makes the approvals page usable from a phone at all (M3 D8): a
+// browser cannot set an Authorization header, and a token in the URL would land
+// in the history, the proxy log and the Referer of every form post. It carries
+// the same secret as the bearer path, so it is no weaker there — the transport is
+// the operator's to protect either way.
+func adminCredential(r *http.Request) (string, bool) {
+	if tok, ok := bearer(r); ok {
+		return tok, true
+	}
+	if _, pass, ok := r.BasicAuth(); ok {
+		return pass, true
+	}
+	return "", false
 }
 
 func bearer(r *http.Request) (string, bool) {
@@ -243,24 +265,57 @@ type DecisionRequest struct {
 // A 404 means the id is not on the board at all; a 400 means the body did not
 // name a decision, which is a malformed request rather than a lost race.
 func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
+	// The page posts a form; the API posts JSON. The page's answer is a redirect
+	// back to the queue (so a refresh does not re-decide) or a readable error
+	// page, because a phone cannot read a JSON envelope.
+	form := isFormPost(r)
+	if form {
+		if err := r.ParseForm(); err != nil {
+			renderHTML(w, http.StatusBadRequest, decisionErrorPage, map[string]string{"Message": err.Error()})
+			return
+		}
+	}
 	var req DecisionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if form {
+		req = DecisionRequest{Decision: r.PostFormValue("decision"), Note: r.PostFormValue("note")}
+	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
 	if req.Decision != Approve && req.Decision != Deny {
-		WriteError(w, http.StatusBadRequest, "decision", fmt.Sprintf("decision %q is neither approve nor deny", req.Decision))
+		msg := fmt.Sprintf("decision %q is neither approve nor deny", req.Decision)
+		if form {
+			renderHTML(w, http.StatusBadRequest, decisionErrorPage, map[string]string{"Message": msg})
+			return
+		}
+		WriteError(w, http.StatusBadRequest, "decision", msg)
 		return
 	}
 	res, err := Decide(r.Context(), s.db, s.clock, r.PathValue("id"), req.Decision, req.Note)
 	switch {
 	case err == nil:
+		if form {
+			http.Redirect(w, r, "/admin/approvals", http.StatusSeeOther)
+			return
+		}
 		WriteJSON(w, http.StatusOK, res)
 	case errors.Is(err, ErrNotParked), errors.Is(err, ErrNoRequest):
+		if form {
+			renderHTML(w, http.StatusConflict, decisionErrorPage, map[string]string{"Message": err.Error()})
+			return
+		}
 		WriteError(w, http.StatusConflict, "decision", err.Error())
 	case errors.Is(err, sql.ErrNoRows):
+		if form {
+			renderHTML(w, http.StatusNotFound, decisionErrorPage, map[string]string{"Message": err.Error()})
+			return
+		}
 		WriteError(w, http.StatusNotFound, "not_found", err.Error())
 	default:
+		if form {
+			renderHTML(w, http.StatusInternalServerError, decisionErrorPage, map[string]string{"Message": err.Error()})
+			return
+		}
 		WriteError(w, http.StatusInternalServerError, "decision", err.Error())
 	}
 }
@@ -275,7 +330,15 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
 	approvals, err := ListApprovals(r.Context(), s.db)
 	if err != nil {
+		if wantsHTML(r) {
+			renderHTML(w, http.StatusInternalServerError, decisionErrorPage, map[string]string{"Message": err.Error()})
+			return
+		}
 		WriteError(w, http.StatusInternalServerError, "approvals", err.Error())
+		return
+	}
+	if wantsHTML(r) {
+		renderHTML(w, http.StatusOK, approvalsPage, approvals)
 		return
 	}
 	WriteJSON(w, http.StatusOK, approvals)
