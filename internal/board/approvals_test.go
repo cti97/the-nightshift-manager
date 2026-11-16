@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -157,7 +158,7 @@ func TestEscalationParksTheItemAndClosesTheRun(t *testing.T) {
 		Reason:  "the cache holds 40GB and the run needs the disk",
 		Options: []string{"delete it", "keep it"},
 	}
-	if err := Escalate(context.Background(), db, clock, runID, node, req); err != nil {
+	if err := Escalate(context.Background(), db, clock, runID, node, req, RunTokens{}); err != nil {
 		t.Fatalf("Escalate: %v", err)
 	}
 
@@ -238,7 +239,7 @@ func TestEscalationChargesTheAttemptButDoesNotGrowIt(t *testing.T) {
 
 	if err := Escalate(context.Background(), db, clock, runID, node, ApprovalRequest{
 		Action: "delete /var/cache/app", Reason: "needs the disk",
-	}); err != nil {
+	}, RunTokens{}); err != nil {
 		t.Fatalf("Escalate: %v", err)
 	}
 
@@ -276,7 +277,7 @@ func TestAVanishedRowCannotBeEscalated(t *testing.T) {
 
 	err := Escalate(context.Background(), db, clock, runID, node, ApprovalRequest{
 		Action: "delete /var/cache/app", Reason: "too late",
-	})
+	}, RunTokens{})
 	if err == nil {
 		t.Fatal("Escalate accepted a settled run; the escalation must not rewind it")
 	}
@@ -324,7 +325,7 @@ func parkEscalated(t *testing.T, db *sql.DB, clock *FixedClock, action string) (
 	itemID, runID, node := parkOneRun(t, db, clock)
 	if err := Escalate(context.Background(), db, clock, runID, node, ApprovalRequest{
 		Action: action, Reason: "the run needs it", Options: []string{"yes", "no"},
-	}); err != nil {
+	}, RunTokens{}); err != nil {
 		t.Fatalf("Escalate: %v", err)
 	}
 	return itemID, node
@@ -559,7 +560,7 @@ func TestTheReaperLeavesAParkedItemAlone(t *testing.T) {
 
 	if err := Escalate(context.Background(), db, clock, runID, node, ApprovalRequest{
 		Action: "delete /var/cache/app", Reason: "needs the disk",
-	}); err != nil {
+	}, RunTokens{}); err != nil {
 		t.Fatalf("Escalate: %v", err)
 	}
 
@@ -595,6 +596,108 @@ func TestTheReaperLeavesAParkedItemAlone(t *testing.T) {
 	}
 	if reaped != 0 {
 		t.Fatalf("reaped events = %d for a parked item, want 0", reaped)
+	}
+}
+
+// TestEscalationPricesTheRunIntoTheLedger closes the hole an escalation would
+// otherwise leave in the spend guard. The run used tokens and never reports, and
+// the day's ceiling sums runs.cost_estimate: an escalation that parked the item
+// without pricing the run would make every stopped-to-ask run free on the very
+// day the operator was watching the budget, and show up as unpriced in the
+// spend view.
+func TestEscalationPricesTheRunIntoTheLedger(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "priced", "host", 3.0, "tools")
+	itemID, err := CreateItem(ctx, db, clock, CreateItemRequest{
+		Title: "t", Brief: "b", Needs: []string{"agentic"},
+	})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	claimed, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim = %d items, err %v", len(claimed), err)
+	}
+	runID := claimed[0].RunID
+	if err := StartRun(ctx, db, clock, runID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	tokens := RunTokens{TokensIn: 1000, TokensOut: 200, ReservedTokens: 500}
+	if err := Escalate(ctx, db, clock, runID, node, ApprovalRequest{
+		Action: "delete /var/cache/app", Reason: "needs the disk",
+	}, tokens); err != nil {
+		t.Fatalf("Escalate: %v", err)
+	}
+
+	var in, out, reserved int
+	var cost float64
+	if err := db.QueryRow(
+		`SELECT input_tokens, output_tokens, reserved_tokens, cost_estimate FROM runs WHERE id=?`,
+		runID).Scan(&in, &out, &reserved, &cost); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if in != 1000 || out != 200 || reserved != 500 {
+		t.Fatalf("run tokens = %d/%d/%d, want 1000/200/500: the run's own report of what it spent", in, out, reserved)
+	}
+	// (tokens_in + reserved) at the input rate: 1500 × 3.0 / 1e6.
+	if want := 0.0045; math.Abs(cost-want) > 1e-12 {
+		t.Fatalf("cost_estimate = %v, want %v", cost, want)
+	}
+
+	st, err := TodaySpend(ctx, db, clock)
+	if err != nil {
+		t.Fatalf("TodaySpend: %v", err)
+	}
+	if math.Abs(st.Spent-cost) > 1e-12 || st.RunCount != 1 {
+		t.Fatalf("spend = %v over %d runs, want %v over 1: the escalated run is in the day's ledger", st.Spent, st.RunCount, cost)
+	}
+
+	var payload string
+	if err := db.QueryRow(
+		`SELECT payload FROM events WHERE entity='work_item' AND entity_id=? AND type='escalated'`,
+		itemID).Scan(&payload); err != nil {
+		t.Fatalf("read event: %v", err)
+	}
+	if !strings.Contains(payload, `"cost":0.0045`) {
+		t.Fatalf("escalated event payload = %s, want the priced cost in it", payload)
+	}
+}
+
+// TestEscalationRefusesNegativeTokens applies Report's spend rule to the
+// escalation path: a negative count is refused before any write, not parked as a
+// credit against the day.
+func TestEscalationRefusesNegativeTokens(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	itemID, runID, node := parkOneRun(t, db, clock)
+
+	err := Escalate(context.Background(), db, clock, runID, node, ApprovalRequest{
+		Action: "delete /var/cache/app", Reason: "needs the disk",
+	}, RunTokens{TokensIn: -1})
+	if err == nil {
+		t.Fatal("Escalate accepted a negative token count")
+	}
+
+	var itemStatus, runStatus string
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, itemID).Scan(&itemStatus); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if err := db.QueryRow(`SELECT status FROM runs WHERE id=?`, runID).Scan(&runStatus); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if itemStatus != "running" || runStatus != "running" {
+		t.Fatalf("item %q / run %q after a refused escalation, want both still running", itemStatus, runStatus)
+	}
+	var events int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM events WHERE entity='work_item' AND entity_id=? AND type='escalated'`,
+		itemID).Scan(&events); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if events != 0 {
+		t.Fatalf("escalated events = %d, want 0 (nothing written)", events)
 	}
 }
 

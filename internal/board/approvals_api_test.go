@@ -82,7 +82,7 @@ func (f *approvalsFixture) parkNext(t *testing.T, action string) string {
 	}
 	if err := Escalate(ctx, f.db, f.clock, runID, f.node, ApprovalRequest{
 		Action: action, Reason: "the run needs it", Options: []string{"yes", "no"},
-	}); err != nil {
+	}, RunTokens{}); err != nil {
 		t.Fatalf("Escalate: %v", err)
 	}
 	return claimed[0].Item.ID

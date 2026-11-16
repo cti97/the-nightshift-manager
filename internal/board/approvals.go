@@ -248,6 +248,33 @@ func declineReason(note string) string {
 	return "declined by admin: " + note
 }
 
+// RunTokens is the token accounting a run carries when it stops. Report takes
+// the same three numbers inline; an escalation takes them as a value because
+// the request it also carries has its own JSON contract, and a caller should
+// not be able to build one half and forget the other. Negative counts are
+// refused for the same reason Report refuses them: they are spend inputs, and a
+// negative one subtracts from the day's ceiling.
+type RunTokens struct {
+	TokensIn       int `json:"tokens_in"`
+	TokensOut      int `json:"tokens_out"`
+	ReservedTokens int `json:"reserved_tokens"`
+}
+
+// EscalationRequest is the node's body for POST /runs/{id}/approval: the
+// question and what the run spent before it asked. They travel together
+// because the board prices the run in the same transaction that parks it — a
+// separate "settle the spend" call could arrive after the item was already
+// approved, leaving the ledger short for exactly the runs that burned tokens
+// and then stopped to ask.
+type EscalationRequest struct {
+	Action         string   `json:"action"`
+	Reason         string   `json:"reason"`
+	Options        []string `json:"options"`
+	TokensIn       int      `json:"tokens_in"`
+	TokensOut      int      `json:"tokens_out"`
+	ReservedTokens int      `json:"reserved_tokens"`
+}
+
 // Escalate parks a run's item for a human and closes the run, in one
 // transaction (spec §11; M3 D1, D5, D6).
 //
@@ -268,27 +295,52 @@ func declineReason(note string) string {
 // settled between the claim and this call — a report that arrived first, a
 // reaper pass — must win, and the deferred rollback discards whatever this call
 // had already written.
-func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, req ApprovalRequest) error {
+//
+// The run is PRICED here, not left for a later report: an escalated run never
+// reports, and the daily ceiling sums runs.cost_estimate. Leaving it at zero
+// would make every escalation free on the one day it mattered, and show up as an
+// unpriced run in the spend view.
+func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, req ApprovalRequest, tokens RunTokens) error {
 	// A request with no action cannot be approved: a human is being asked to
 	// allow something, and D3's grant names that something. Refusing here keeps
 	// the approvals page from listing a question with no answer in it.
 	if req.Action == "" {
 		return fmt.Errorf("an approval request must name the action it wants")
 	}
+	// The same fail-closed rule as Report, for the same reason: these numbers
+	// are spend inputs, not display fields.
+	for _, field := range []struct {
+		name  string
+		value int
+	}{
+		{"tokens_in", tokens.TokensIn},
+		{"tokens_out", tokens.TokensOut},
+		{"reserved_tokens", tokens.ReservedTokens},
+	} {
+		if field.value < 0 {
+			return fmt.Errorf("escalation %s %d is negative; token counts are spend inputs", field.name, field.value)
+		}
+	}
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }() // a commit makes this a no-op
+	defer func() { _ = tx.Rollback() }() // a commit makes it a no-op
 
 	// Re-read the run inside the transaction. It is the only evidence that this
 	// node owns the work, and its status decides whether there is still anything
-	// to park.
+	// to park. The model's prices come back with the same read, because the cost
+	// is part of closing the run: left-joined, since runs.model_id is nullable
+	// and a run without a model predates pricing and costs 0 rather than failing.
 	var itemID, runStatus string
+	var costIn, costOut float64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT work_item_id, status FROM runs WHERE id=? AND node_id=?`,
-		runID, nodeID).Scan(&itemID, &runStatus); err != nil {
+		`SELECT r.work_item_id, r.status,
+		        COALESCE(m.cost_in_per_mtok,0), COALESCE(m.cost_out_per_mtok,0)
+		   FROM runs r LEFT JOIN models m ON m.id = r.model_id
+		  WHERE r.id=? AND r.node_id=?`,
+		runID, nodeID).Scan(&itemID, &runStatus, &costIn, &costOut); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("run %s is not a live run owned by node %s", runID, nodeID)
 		}
@@ -296,6 +348,14 @@ func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 	}
 	if runStatus != "claimed" && runStatus != "running" {
 		return fmt.Errorf("run %s is already %s; an escalation cannot re-open it", runID, runStatus)
+	}
+
+	cost, err := RunCost(tokens.TokensIn, tokens.TokensOut, tokens.ReservedTokens, costIn, costOut)
+	if err != nil {
+		// Fail closed, like Report: the run is left live and unpriced rather than
+		// parked with a number the ledger cannot add up. A corrupt model price is
+		// repairable; a free run is invisible.
+		return fmt.Errorf("run %s: %w", runID, err)
 	}
 
 	now := clock.Now()
@@ -331,8 +391,11 @@ func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 	}
 
 	res, err = tx.ExecContext(ctx,
-		`UPDATE runs SET status='escalated', ended_at=? WHERE id=? AND status IN ('claimed','running')`,
-		now, runID)
+		`UPDATE runs
+		    SET status='escalated', ended_at=?,
+		        input_tokens=?, output_tokens=?, reserved_tokens=?, cost_estimate=?
+		  WHERE id=? AND status IN ('claimed','running')`,
+		now, tokens.TokensIn, tokens.TokensOut, tokens.ReservedTokens, cost, runID)
 	if err != nil {
 		return err
 	}
@@ -343,10 +406,13 @@ func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 		return fmt.Errorf("run %s is no longer live; nothing was parked", runID)
 	}
 
+	// cost is in the event for the same reason Report puts it there: the
+	// operator asking "what did the run that stopped to ask cost me" reads the
+	// audit spine, not the ledger's sum for the day.
 	if err := AppendEvent(ctx, tx, clock, "node:"+nodeID, "work_item", itemID, "escalated",
 		map[string]any{
 			"run": runID, "action": req.Action, "reason": req.Reason,
-			"options": nonNilList(req.Options),
+			"options": nonNilList(req.Options), "cost": cost,
 		}); err != nil {
 		return err
 	}

@@ -291,16 +291,19 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
 // else's run, a run that already settled — is a 409, because the caller's view
 // of the world is stale and a retry of the same body will not fix it.
 func (s *Server) handleEscalate(w http.ResponseWriter, r *http.Request) {
-	var req ApprovalRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	var body EscalationRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
-	if req.Action == "" {
+	if body.Action == "" {
 		WriteError(w, http.StatusBadRequest, "approval", "an approval request must name the action it wants")
 		return
 	}
-	if err := Escalate(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r), req); err != nil {
+	err := Escalate(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r),
+		ApprovalRequest{Action: body.Action, Reason: body.Reason, Options: body.Options},
+		RunTokens{TokensIn: body.TokensIn, TokensOut: body.TokensOut, ReservedTokens: body.ReservedTokens})
+	if err != nil {
 		WriteError(w, http.StatusConflict, "approval", err.Error())
 		return
 	}
