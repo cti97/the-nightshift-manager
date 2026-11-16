@@ -84,6 +84,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /runs/{id}/approval", s.nodeAuth(http.HandlerFunc(s.handleEscalate)))
 	mux.Handle("GET /admin/why/{id}", s.adminAuth(http.HandlerFunc(s.handleWhy)))
 	mux.Handle("GET /admin/corrupt-rows", s.adminAuth(http.HandlerFunc(s.handleCorruptRows)))
+	mux.Handle("GET /admin/approvals", s.adminAuth(http.HandlerFunc(s.handleApprovals)))
 	return mux
 }
 
@@ -226,6 +227,22 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, res)
+}
+
+// handleApprovals is the approvals queue (M3 Task 3). JSON for now; Task 7's
+// page negotiates HTML on this same route, so a phone and a script read one
+// answer rather than two endpoints that can drift apart.
+//
+// It is an admin route by D2's rule: a parked item is a decision, and a node
+// that could read this list could also see every other node's brief. The list
+// is oldest first and [] when empty.
+func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
+	approvals, err := ListApprovals(r.Context(), s.db)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "approvals", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, approvals)
 }
 
 // handleEscalate is the node's request_approval (spec §11). The run stops

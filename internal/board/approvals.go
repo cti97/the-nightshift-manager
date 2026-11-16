@@ -35,6 +35,66 @@ func (a ApprovalRequest) MarshalJSON() ([]byte, error) {
 	return json.Marshal(w)
 }
 
+// Approval is one parked item as the approvals page lists it: the request's
+// fields lifted to the top level, so the HTML template and the JSON body read
+// the same shape and a script cannot get a different answer from the page.
+type Approval struct {
+	ItemID      string   `json:"item_id"`
+	Title       string   `json:"title"`
+	Action      string   `json:"action"`
+	Reason      string   `json:"reason"`
+	Options     []string `json:"options"`
+	RequestedBy string   `json:"requested_by"`
+	RequestedAt int64    `json:"requested_at"`
+	Attempt     int      `json:"attempt"`
+}
+
+// ListApprovals returns every parked item, oldest first. One query, because D1
+// stored the request on the item instead of eventing it; the partial index
+// idx_items_parked serves the WHERE and the ORDER BY together.
+//
+// An empty board returns an empty slice, not nil: the route answers [] so a
+// caller can tell "nothing is waiting" from "the request failed".
+//
+// A parked row with no request — parked before migration 4 added the column, or
+// written by a node whose body carried no action before the board refused it —
+// is still listed. It is waiting on a human either way, and a queue that hides
+// the rows it cannot describe is worse than one that shows an empty action. A
+// corrupt JSON cell is reported through reportCorruptRow and listed the same
+// way, for the same reason the claim path skips and reports rather than 500s:
+// one hand-edited cell must not hide every other approval.
+func ListApprovals(ctx context.Context, db *sql.DB) ([]Approval, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, title, approval_request, attempt
+		   FROM work_items WHERE status='needs_approval' ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []Approval{}
+	for rows.Next() {
+		var a Approval
+		var raw sql.NullString
+		if err := rows.Scan(&a.ItemID, &a.Title, &raw, &a.Attempt); err != nil {
+			return nil, err
+		}
+		a.Options = []string{}
+		if raw.Valid && raw.String != "" {
+			var req ApprovalRequest
+			if err := json.Unmarshal([]byte(raw.String), &req); err != nil {
+				reportCorruptRow(CorruptRow{Table: "work_items", RowID: a.ItemID, Column: "approval_request", Reason: err.Error()})
+			} else {
+				a.Action, a.Reason = req.Action, req.Reason
+				a.Options = nonNilList(req.Options)
+				a.RequestedBy, a.RequestedAt = req.RequestedBy, req.RequestedAt
+			}
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // Escalate parks a run's item for a human and closes the run, in one
 // transaction (spec §11; M3 D1, D5, D6).
 //
