@@ -125,6 +125,7 @@ func TestMigrationCreatesExpectedObjects(t *testing.T) {
 	want := []string{
 		"index idx_events_entity",
 		"index idx_items_claimable",
+		"index idx_items_parked",
 		"index idx_runs_started_at",
 		"table config",
 		"table endpoints",
@@ -156,39 +157,34 @@ func TestForeignKeysAreOn(t *testing.T) {
 func TestMigrateAppliesOnlyNewerMigrations(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "board.db")
 
-	db, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO nodes (id, name, token_hash, role, created_at)
-		 VALUES ('n1','a','t','manager',0)`); err != nil {
-		t.Fatalf("seed node: %v", err)
-	}
-	db.Close()
-
-	// The shape the next migration's author will create: entry 0 stays pinned
-	// at version 1, the shipped migrations keep their versions, the new script
-	// appends as version schemaVersion+1, and schemaVersion derives from the
-	// list's last entry.
-	next := []migration{
-		{version: 1, script: schema},
-		{version: 2, script: schema2},
-		{version: 3, script: schema3},
-		{version: 4, script: `CREATE TABLE watches (
-  id   TEXT PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE
-);
-
-CREATE INDEX idx_watches_name ON watches(name);`},
-	}
-
 	raw, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	defer raw.Close()
+	ctx := context.Background()
 
-	if err := migrate(context.Background(), raw, next); err != nil {
+	// The fixture is a version-3 board, exactly as the v3 binary left it. The
+	// injected list then stands in for the next migration's author: the
+	// shipping migrations keep their versions and one new script appends as
+	// the next version -- here a watches table, because whether migrate applies
+	// only the newer entries does not depend on what that script creates.
+	if err := migrate(ctx, raw, migrations[:3]); err != nil {
+		t.Fatalf("migrate to version 3: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO nodes (id, name, token_hash, role, created_at)
+		 VALUES ('n1','a','t','manager',0)`); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	next := append(slices.Clone(migrations[:3]), migration{version: 4, script: `CREATE TABLE watches (
+  id   TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE
+);
+
+CREATE INDEX idx_watches_name ON watches(name);`})
+
+	if err := migrate(ctx, raw, next); err != nil {
 		t.Fatalf("migrate v3 -> v4: %v", err)
 	}
 
@@ -361,5 +357,212 @@ func TestOpenUpgradesAVersionOneDatabase(t *testing.T) {
 	}
 	if nodes != 1 {
 		t.Fatalf("nodes rows = %d after the upgrade, want the existing 1", nodes)
+	}
+}
+
+// TestMigrationFourAddsTheApprovalColumn upgrades a database in the shape the
+// shipping v3 binary writes -- rows included -- and checks the parked-item
+// index the approvals page lists through. Migration 4 is additive: the rows
+// survive unchanged and the new column starts NULL.
+func TestMigrationFourAddsTheApprovalColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "board.db")
+
+	raw, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	ctx := context.Background()
+	if err := migrate(ctx, raw, migrations[:3]); err != nil {
+		t.Fatalf("migrate to version 3: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO work_items
+		 (id,title,brief,status,created_by,created_at,updated_at)
+		 VALUES ('w-queued','queued work','do it','queued','admin',100,100),
+		        ('w-parked','parked work','do it','needs_approval','admin',200,200)`); err != nil {
+		t.Fatalf("seed version-3 items: %v", err)
+	}
+	raw.Close()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open a version-3 database: %v", err)
+	}
+
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if v != 4 {
+		t.Fatalf("user_version = %d after Open, want 4", v)
+	}
+	if SchemaVersion() != 4 {
+		t.Fatalf("SchemaVersion() = %d, want 4", SchemaVersion())
+	}
+
+	var typ string
+	var notnull int
+	var dflt sql.NullString
+	if err := db.QueryRow(`SELECT type, "notnull", dflt_value FROM pragma_table_info('work_items')
+		 WHERE name = 'approval_request'`).Scan(&typ, &notnull, &dflt); err != nil {
+		t.Fatalf("work_items has no approval_request column: %v", err)
+	}
+	if typ != "TEXT" {
+		t.Fatalf("approval_request type = %q, want TEXT", typ)
+	}
+	if notnull != 0 || dflt.Valid {
+		t.Fatalf("approval_request notnull=%d default=%v, want a nullable column with no default", notnull, dflt)
+	}
+
+	var partial int
+	if err := db.QueryRow(`SELECT partial FROM pragma_index_list('work_items')
+		 WHERE name = 'idx_items_parked'`).Scan(&partial); err != nil {
+		t.Fatalf("work_items has no idx_items_parked index: %v", err)
+	}
+	if partial != 1 {
+		t.Fatalf("idx_items_parked partial = %d, want 1 (a full index would pay for every item)", partial)
+	}
+	keys, err := db.Query(`SELECT name FROM pragma_index_info('idx_items_parked') ORDER BY seqno`)
+	if err != nil {
+		t.Fatalf("pragma_index_info: %v", err)
+	}
+	var keyCols []string
+	for keys.Next() {
+		var name string
+		if err := keys.Scan(&name); err != nil {
+			t.Fatalf("scan index key: %v", err)
+		}
+		keyCols = append(keyCols, name)
+	}
+	if err := keys.Err(); err != nil {
+		t.Fatalf("index keys: %v", err)
+	}
+	keys.Close()
+	if !slices.Equal(keyCols, []string{"status", "created_at"}) {
+		t.Fatalf("idx_items_parked keys = %v, want [status created_at]", keyCols)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM work_items`).Scan(&count); err != nil {
+		t.Fatalf("work_items count: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("work_items rows = %d after the upgrade, want the existing 2", count)
+	}
+	var title, status string
+	var granted, request sql.NullString
+	if err := db.QueryRow(`SELECT title, status, approval_granted, approval_request
+		 FROM work_items WHERE id = 'w-parked'`).Scan(&title, &status, &granted, &request); err != nil {
+		t.Fatalf("read the parked row back: %v", err)
+	}
+	if title != "parked work" || status != "needs_approval" || granted.Valid || request.Valid {
+		t.Fatalf("parked row after upgrade = (%q, %q, granted=%v, request=%v), want it untouched and the new column NULL",
+			title, status, granted, request)
+	}
+
+	// Forward-only: a second Open applies nothing. Re-running migration 4 would
+	// fail on the duplicate column instead.
+	db.Close()
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("re-Open a version-4 database: %v", err)
+	}
+	defer db.Close()
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		t.Fatalf("user_version after re-Open: %v", err)
+	}
+	if v != 4 {
+		t.Fatalf("user_version = %d after re-Open, want 4", v)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM work_items`).Scan(&count); err != nil {
+		t.Fatalf("work_items count after re-Open: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("work_items rows = %d after re-Open, want 2", count)
+	}
+}
+
+// TestTheParkedIndexServesTheApprovalsQuery pins the index to the query the
+// approvals page is built on, rather than trusting that an index of that name
+// is consulted. A plan that scans work_items, or that sorts the result, fails.
+func TestTheParkedIndexServesTheApprovalsQuery(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "board.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`EXPLAIN QUERY PLAN
+		SELECT id, title, approval_request, created_at, attempt
+		FROM work_items
+		WHERE status = 'needs_approval'
+		ORDER BY created_at`)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+
+	var plan []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan query plan: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("query plan: %v", err)
+	}
+
+	joined := strings.Join(plan, " | ")
+	if !strings.Contains(joined, "idx_items_parked") {
+		t.Fatalf("the approvals query does not use idx_items_parked; plan = %s", joined)
+	}
+	if strings.Contains(joined, "TEMP B-TREE") {
+		t.Fatalf("the approvals query sorts instead of reading the index order; plan = %s", joined)
+	}
+}
+
+// TestAVersionFourDatabaseRefusesAnOlderBinary hands a real version-4 database
+// to the migration list a version-3 binary ships. It must refuse, before it
+// applies anything -- a v3 binary that "upgrades" a v4 board would skip the
+// column its own readers assume.
+func TestAVersionFourDatabaseRefusesAnOlderBinary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "board.db")
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO work_items
+		 (id,title,brief,status,created_by,created_at,updated_at)
+		 VALUES ('w1','parked','do it','needs_approval','admin',1,1)`); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	db.Close()
+
+	raw, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+
+	err = migrate(context.Background(), raw, migrations[:3])
+	if err == nil {
+		t.Fatal("a version-3 migration list accepted a version-4 database, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "newer than this binary") {
+		t.Fatalf("err = %q, want a newer-than-this-binary refusal", err)
+	}
+	if !strings.Contains(err.Error(), "v3") {
+		t.Fatalf("err = %q, want it to name the version 3 the older binary implements", err)
+	}
+
+	var v int
+	if err := raw.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if v != 4 {
+		t.Fatalf("user_version = %d after the refusal, want 4 (nothing applied)", v)
 	}
 }

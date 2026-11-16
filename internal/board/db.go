@@ -22,6 +22,9 @@ var schema2 string
 //go:embed schema3.sql
 var schema3 string
 
+//go:embed schema4.sql
+var schema4 string
+
 // A migration upgrades a database one version, to Version.
 type migration struct {
 	version int
@@ -39,8 +42,7 @@ var migrations = []migration{
 	// attempts that reported no usage.
 	{version: 2, script: schema2},
 	// Migration 3 (M2 Task 13): the runs(started_at) index the daily spend
-	// ledger reads through on every claim. M4 appends version 4 with the
-	// watches tables; the version below follows from the list.
+	// ledger reads through on every claim.
 	//
 	// Upgrade note: nothing here backfills runs.cost_estimate. A run settled by
 	// a binary from before pricing (schema version 1 or 2 — pricing shipped with
@@ -48,6 +50,10 @@ var migrations = []migration{
 	// invisible until UTC midnight. That is the frozen-ledger rule working as
 	// designed — history is not recomputed — not a migration bug.
 	{version: 3, script: schema3},
+	// Migration 4 (M3 Task 1): work_items.approval_request, the stored answer
+	// to "what is this parked item waiting for", and the partial index the
+	// approvals page lists through.
+	{version: 4, script: schema4},
 }
 
 // schemaVersion is the schema version this binary implements: the version
@@ -102,13 +108,24 @@ func dsn(path string) string {
 // migrate brings the database up to date by applying, in order, every
 // migration in ms newer than its user_version, each in its own transaction.
 // Open passes the production migrations; tests inject their own list.
+//
+// The version a caller implements is the last migration in the list it
+// supplied, so a database stamped newer than that is refused before anything
+// is applied. In production that list is the same one schemaVersion derives
+// from; an injected list also lets a test stand in for an older binary. An
+// empty list has no version of its own, so the guard falls back to the
+// package's schemaVersion rather than being skipped.
 func migrate(ctx context.Context, db *sql.DB, ms []migration) error {
 	var v int
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
 		return fmt.Errorf("read user_version: %w", err)
 	}
-	if v > schemaVersion {
-		return fmt.Errorf("database schema v%d is newer than this binary (v%d)", v, schemaVersion)
+	binaryVersion := schemaVersion
+	if len(ms) > 0 {
+		binaryVersion = ms[len(ms)-1].version
+	}
+	if v > binaryVersion {
+		return fmt.Errorf("database schema v%d is newer than this binary (v%d)", v, binaryVersion)
 	}
 	for i, m := range ms {
 		if m.version != i+1 {
