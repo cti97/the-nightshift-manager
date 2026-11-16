@@ -54,10 +54,21 @@ const (
 	// reconcileCeiling whenever the projection changes.
 	configCeilingPaused = "spend_ceiling_paused"
 
-	// pauseBySpendCeiling / pauseByOperator say whose pause is in force, so the
-	// dashboard can tell "the ceiling stopped this" from "a human stopped it".
-	pauseBySpendCeiling = "spend_ceiling"
-	pauseByOperator     = "operator"
+	// pauseByCeiling / pauseByOperator / pauseByBoth are the paused_by
+	// vocabulary shared by /why and /admin/spend/today. "Both" is a real state,
+	// not a convenience: the two keys have independent lifecycles, so clearing
+	// the operator's hold does not resume a board whose ceiling still reaches,
+	// and raising the ceiling does not clear a pause a person typed. An operator
+	// who is told only "operator" would clear their own key and be surprised.
+	pauseByCeiling  = "ceiling"
+	pauseByOperator = "operator"
+	pauseByBoth     = "ceiling+operator"
+
+	// eventSourceSpendCeiling is the `source` recorded on the pause/resume
+	// events. It is deliberately not the paused_by value: events name the
+	// subsystem that reconciled, while paused_by names the owner an operator
+	// must clear. Existing audit rows carry "spend_ceiling" and stay readable.
+	eventSourceSpendCeiling = "spend_ceiling"
 
 	// pricingRule is what the numbers on /admin/spend/today mean. It travels
 	// with the response because a spend figure nobody can reproduce is a spend
@@ -145,16 +156,18 @@ type SpendStatus struct {
 	// RunCount is every run ISSUED today, including ones still in flight. They
 	// carry no cost yet, so they do not inflate Spent; they are counted because
 	// "how much work did the board start today" is the other half of the ledger.
-	RunCount       int     `json:"runs"`
-	Spent          float64 `json:"spent"`
-	Ceiling        float64 `json:"ceiling"`
-	OverCeiling    bool    `json:"over_ceiling"`
-	Paused         bool    `json:"paused"`
-	PausedBy       string  `json:"paused_by,omitempty"`
-	PauseReason    string  `json:"pause_reason,omitempty"`
-	InputTokens    int64   `json:"input_tokens"`
-	OutputTokens   int64   `json:"output_tokens"`
-	ReservedTokens int64   `json:"reserved_tokens"`
+	RunCount    int     `json:"runs"`
+	Spent       float64 `json:"spent"`
+	Ceiling     float64 `json:"ceiling"`
+	OverCeiling bool    `json:"over_ceiling"`
+	Paused      bool    `json:"paused"`
+	// PausedBy is "ceiling", "operator", or "ceiling+operator": the owner(s)
+	// the next claim is actually obeying. Absent when nothing is paused.
+	PausedBy       string `json:"paused_by,omitempty"`
+	PauseReason    string `json:"pause_reason,omitempty"`
+	InputTokens    int64  `json:"input_tokens"`
+	OutputTokens   int64  `json:"output_tokens"`
+	ReservedTokens int64  `json:"reserved_tokens"`
 	// UnpricedRuns counts today's runs that consumed tokens and still cost
 	// nothing: a free local model, or a model nobody priced. Both are legitimate
 	// and only one is a mistake, so the ledger reports the count instead of
@@ -212,6 +225,12 @@ func TodaySpend(ctx context.Context, db *sql.DB, clock Clock) (SpendStatus, erro
 	return st, nil
 }
 
+// ErrInvalidCeiling marks a ceiling the store refused as a value, not a write
+// that failed. The HTTP layer answers 400 for this and 500 for everything that
+// reaches the database and fails: a locked or broken store is the board's
+// problem, not the operator's typo.
+var ErrInvalidCeiling = errors.New("invalid daily spend ceiling")
+
 // SetDailySpendCeiling writes the day's limit and re-evaluates the pause in the
 // same transaction, so raising the ceiling above today's spend resumes the board
 // immediately and lowering it below today's spend stops it immediately.
@@ -224,10 +243,10 @@ func TodaySpend(ctx context.Context, db *sql.DB, clock Clock) (SpendStatus, erro
 // not touched here at all.
 func SetDailySpendCeiling(ctx context.Context, db *sql.DB, clock Clock, ceiling float64) (SpendStatus, error) {
 	if math.IsNaN(ceiling) || math.IsInf(ceiling, 0) {
-		return SpendStatus{}, fmt.Errorf("daily spend ceiling %v is not a number", ceiling)
+		return SpendStatus{}, fmt.Errorf("%w: %v is not a number", ErrInvalidCeiling, ceiling)
 	}
 	if ceiling < 0 {
-		return SpendStatus{}, fmt.Errorf("daily spend ceiling %v is negative (0 means unlimited)", ceiling)
+		return SpendStatus{}, fmt.Errorf("%w: %v is negative (0 means unlimited)", ErrInvalidCeiling, ceiling)
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -301,7 +320,7 @@ func reconcileCeiling(ctx context.Context, q spendTx, clock Clock) (paused bool,
 			return false, "", fmt.Errorf("record the spend pause: %w", err)
 		}
 		if err := AppendEvent(ctx, q, clock, "system", "board", "board", "paused",
-			map[string]any{"source": pauseBySpendCeiling, "reason": pauseReason(ceiling, st.Spent, day),
+			map[string]any{"source": eventSourceSpendCeiling, "reason": pauseReason(ceiling, st.Spent, day),
 				"spent": st.Spent, "ceiling": ceiling, "day": day}); err != nil {
 			return false, "", err
 		}
@@ -314,7 +333,7 @@ func reconcileCeiling(ctx context.Context, q spendTx, clock Clock) (paused bool,
 			`DELETE FROM config WHERE key=?`, configCeilingPaused); err != nil {
 			return false, "", fmt.Errorf("clear the spend pause: %w", err)
 		}
-		payload := map[string]any{"source": pauseBySpendCeiling, "spent": st.Spent,
+		payload := map[string]any{"source": eventSourceSpendCeiling, "spent": st.Spent,
 			"ceiling": ceiling, "day": day, "was": mine}
 		if operator != "" {
 			// The ceiling's projection cleared, but the board is still refusing
@@ -361,10 +380,15 @@ func pauseState(ctx context.Context, db *sql.DB, clock Clock) (paused bool, reas
 // copied from the board's own pause message is still an operator's stop.
 func effectivePause(over bool, operatorReason string, ceiling, spent float64, day string) (paused bool, reason, by string) {
 	switch {
+	case operatorReason != "" && over:
+		// Both owners are holding: the operator's text is the reason a person
+		// reads, but paused_by must say the ceiling also reaches so clearing
+		// the operator key is not expected to resume anything.
+		return true, operatorReason, pauseByBoth
 	case operatorReason != "":
 		return true, operatorReason, pauseByOperator
 	case over:
-		return true, pauseReason(ceiling, spent, day), pauseBySpendCeiling
+		return true, pauseReason(ceiling, spent, day), pauseByCeiling
 	default:
 		return false, "", ""
 	}

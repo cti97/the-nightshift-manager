@@ -82,6 +82,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /runs/{id}/start", s.nodeAuth(http.HandlerFunc(s.handleStartRun)))
 	mux.Handle("POST /runs/{id}/report", s.nodeAuth(http.HandlerFunc(s.handleReport)))
 	mux.Handle("GET /admin/why/{id}", s.adminAuth(http.HandlerFunc(s.handleWhy)))
+	mux.Handle("GET /admin/corrupt-rows", s.adminAuth(http.HandlerFunc(s.handleCorruptRows)))
 	return mux
 }
 
@@ -245,6 +246,26 @@ func (s *Server) handleWhy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, ex)
+}
+
+// handleCorruptRows is A2: the enumerable list of cells the claim path cannot
+// decode. The log line is deduplicated per process and rotations lose it, so
+// this is the durable answer to "what is broken" that does not require sqlite3
+// or asking /why item by item.
+//
+// It is a GET and it only reads; repairing, mutating or deleting is the
+// operator's job. A list, not a map: an empty board is [] so a caller can tell
+// "nothing is corrupt" from "the route did not answer".
+func (s *Server) handleCorruptRows(w http.ResponseWriter, r *http.Request) {
+	rows, err := ListCorruptRows(r.Context(), s.db)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "corrupt", err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []CorruptRow{}
+	}
+	WriteJSON(w, http.StatusOK, rows)
 }
 
 func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
@@ -412,7 +433,15 @@ func (s *Server) handleSetSpendCeiling(w http.ResponseWriter, r *http.Request) {
 	}
 	st, err := SetDailySpendCeiling(r.Context(), s.db, s.clock, *req.Ceiling)
 	if err != nil {
-		WriteError(w, http.StatusBadRequest, "set_ceiling", err.Error())
+		// A ceiling the store refused as a VALUE is the operator's mistake
+		// (400). Anything that reached the database and failed — a locked or
+		// broken store, a failed transaction — is the board's (500). Both keep
+		// the same envelope; only the status and the sentence differ.
+		if errors.Is(err, ErrInvalidCeiling) {
+			WriteError(w, http.StatusBadRequest, "set_ceiling", err.Error())
+		} else {
+			WriteError(w, http.StatusInternalServerError, "set_ceiling", err.Error())
+		}
 		return
 	}
 	WriteJSON(w, http.StatusOK, st)

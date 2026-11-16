@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -1056,4 +1057,36 @@ func TestWhyComposesAPauseWithAPlacementFailure(t *testing.T) {
 	if !strings.Contains(ex.BlockedReason, "not issuing work") {
 		t.Fatalf("blocked_reason = %q, want the pause named as well", ex.BlockedReason)
 	}
+}
+
+// A3: a validation failure is the operator's mistake (400); a store failure is
+// the board's (500). Both keep the same JSON error envelope, because a client
+// decodes one shape regardless of which layer refused.
+func TestSetCeilingValidationIs400AndStorageFailureIs500(t *testing.T) {
+	srv, clock := newServer(t)
+	h := srv.Handler()
+	ctx := context.Background()
+
+	// The sentinel is what makes the handler's mapping possible; without it the
+	// two error classes are indistinguishable strings.
+	if _, err := SetDailySpendCeiling(ctx, srv.db, clock, -1); !errors.Is(err, ErrInvalidCeiling) {
+		t.Fatalf("negative ceiling error = %v, want ErrInvalidCeiling", err)
+	}
+
+	rec := doJSON(t, h, "PUT", "/admin/spend/ceiling", testAdminToken, map[string]any{"ceiling": -1})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("negative ceiling = %d, want 400 (body %s)", rec.Code, rec.Body)
+	}
+	assertErrorCode(t, rec, "set_ceiling")
+
+	// A closed pool is a storage failure that reaches the store and fails. It
+	// must not read as "your ceiling was wrong".
+	if err := srv.db.Close(); err != nil {
+		t.Fatalf("close the board: %v", err)
+	}
+	rec = doJSON(t, h, "PUT", "/admin/spend/ceiling", testAdminToken, map[string]any{"ceiling": 1})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("ceiling write against a failed store = %d, want 500 (body %s)", rec.Code, rec.Body)
+	}
+	assertErrorCode(t, rec, "set_ceiling")
 }

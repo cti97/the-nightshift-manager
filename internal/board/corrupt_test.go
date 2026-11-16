@@ -4,9 +4,11 @@ package board
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -233,14 +235,59 @@ func TestClaimFailsClosedOnACorruptSpendCeiling(t *testing.T) {
 	}
 }
 
-// The skip is scoped to the claim path. /why exists to explain a board; when a
-// candidate row cannot be read, swallowing it would hide a corrupt row from the
-// one endpoint whose job is to surface exactly that. It keeps answering 500 and
-// names the column.
-func TestWhyStillFailsLoudlyOnACorruptCandidateRow(t *testing.T) {
+// A4 replaced the old "one corrupt candidate makes /why a 500" contract: a
+// board-wide outage of the explainer is worse than a degraded answer. With one
+// corrupt node and one healthy node, the item is still explained and placed,
+// and the corrupt row is named in warnings rather than silently removed from
+// the candidate set.
+func TestWhyDegradesOnACorruptCandidateAndStillExplainsTheItem(t *testing.T) {
 	srv, clock := newServer(t)
 	ctx := context.Background()
-	node := SeedNodeForTest(t, srv.db, clock, "a", "executor", "agentic")
+	SeedNodeForTest(t, srv.db, clock, "healthy", "executor", "agentic")
+	corrupt := SeedNodeForTest(t, srv.db, clock, "corrupt", "executor", "agentic")
+	SeedEndpointForTest(t, srv.db, clock, "local", "host", 0, "tools")
+	itemID, err := CreateItem(ctx, srv.db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	if _, err := srv.db.ExecContext(ctx, `UPDATE nodes SET provides_live='not-json' WHERE id=?`, corrupt); err != nil {
+		t.Fatalf("corrupt provides_live: %v", err)
+	}
+
+	rec := do(t, srv.Handler(), "GET", "/admin/why/"+itemID, testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("why on a corrupt candidate row = %d, want a degraded 200 (body %s)", rec.Code, rec.Body)
+	}
+	var ex Explanation
+	if err := json.Unmarshal(rec.Body.Bytes(), &ex); err != nil {
+		t.Fatalf("decode why body: %v", err)
+	}
+	if !ex.Placed {
+		t.Fatal("explanation says the item is unplaceable although the healthy node still provides agentic")
+	}
+	if len(ex.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want exactly the one corrupt candidate row", ex.Warnings)
+	}
+	w := ex.Warnings[0]
+	if w.Table != "nodes" || w.RowID != corrupt || w.Column != "provides_live" {
+		t.Fatalf("warning = %+v, want nodes/%s provides_live", w, corrupt)
+	}
+	if !strings.Contains(w.Reason, "decode capability list") {
+		t.Fatalf("warning reason = %q, want the claim path's own decode error", w.Reason)
+	}
+	if !strings.Contains(rec.Body.String(), corrupt) || !strings.Contains(rec.Body.String(), "provides_live") {
+		t.Fatalf("why body does not name the skipped row and column: %s", rec.Body)
+	}
+}
+
+// The other half of A4: when the corrupt row is the only candidate, the answer
+// must not imply the item simply has no candidate. It says placed:false (never
+// placed:true on the strength of a row that was skipped) and names the corruption
+// in blocked_reason as well as in warnings.
+func TestWhyWithOnlyACorruptCandidateNamesItInsteadOfJustSayingNoCandidate(t *testing.T) {
+	srv, clock := newServer(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, srv.db, clock, "only", "executor", "agentic")
 	SeedEndpointForTest(t, srv.db, clock, "local", "host", 0, "tools")
 	itemID, err := CreateItem(ctx, srv.db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}})
 	if err != nil {
@@ -251,12 +298,144 @@ func TestWhyStillFailsLoudlyOnACorruptCandidateRow(t *testing.T) {
 	}
 
 	rec := do(t, srv.Handler(), "GET", "/admin/why/"+itemID, testAdminToken)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("why on a corrupt candidate row = %d, want 500 (body %s)", rec.Code, rec.Body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("why with only a corrupt candidate = %d, want a degraded 200 (body %s)", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), "provides_live") {
-		t.Fatalf("why error %s does not name the offending column", rec.Body)
+	var ex Explanation
+	if err := json.Unmarshal(rec.Body.Bytes(), &ex); err != nil {
+		t.Fatalf("decode why body: %v", err)
 	}
+	if ex.Placed {
+		t.Fatal("explanation says placed:true although the only candidate was skipped as corrupt")
+	}
+	if len(ex.Warnings) != 1 || ex.Warnings[0].RowID != node || ex.Warnings[0].Column != "provides_live" {
+		t.Fatalf("warnings = %+v, want the corrupt node's provides_live row", ex.Warnings)
+	}
+	if !strings.Contains(ex.BlockedReason, "corrupt candidate row") ||
+		!strings.Contains(ex.BlockedReason, node) ||
+		!strings.Contains(ex.BlockedReason, "provides_live") {
+		t.Fatalf("blocked_reason = %q, want the skipped corrupt row named alongside the placement failure", ex.BlockedReason)
+	}
+	if !strings.Contains(ex.BlockedReason, "no eligible candidate") {
+		t.Fatalf("blocked_reason = %q, want the placement failure kept", ex.BlockedReason)
+	}
+}
+
+// A2: corrupt rows must be enumerable without log retention or sqlite3. The
+// route lists every cell the claim path decodes, one entry per column, and it
+// is read-only: the cells, the row counts and the event log are unchanged after
+// the call.
+func TestCorruptRowsEndpointEnumeratesKnownColumnsAndDoesNotMutate(t *testing.T) {
+	srv, clock := newServer(t)
+	ctx := context.Background()
+	h := srv.Handler()
+
+	node := SeedNodeForTest(t, srv.db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, srv.db, clock, "local", "host", 0, "tools")
+	SeedEndpointForTest(t, srv.db, clock, "spare", "host", 1, "tools")
+	itemID, err := CreateItem(ctx, srv.db, clock, CreateItemRequest{Title: "corrupt", Brief: "b", Needs: []string{"agentic"}})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	if _, err := CreateItem(ctx, srv.db, clock, CreateItemRequest{Title: "healthy", Brief: "b", Needs: []string{"agentic"}}); err != nil {
+		t.Fatalf("CreateItem (healthy): %v", err)
+	}
+
+	for _, tc := range []struct {
+		stmt string
+		args []any
+	}{
+		{`UPDATE work_items SET needs='{"not":"a list"}' WHERE id=?`, []any{itemID}},
+		{`UPDATE nodes SET provides_live='not-json', reach_classes='[1,2]' WHERE id=?`, []any{node}},
+		{`UPDATE models SET provides='{"x":1}', features='nope' WHERE id='m-local'`, nil},
+	} {
+		if _, err := srv.db.ExecContext(ctx, tc.stmt, tc.args...); err != nil {
+			t.Fatalf("corrupt a cell: %v", err)
+		}
+	}
+
+	before := snapshotCorruptCells(t, srv.db, itemID, node)
+
+	rec := do(t, h, "GET", "/admin/corrupt-rows", testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("corrupt-rows = %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+	var got []CorruptRow
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode corrupt-rows: %v (body %s)", err, rec.Body)
+	}
+
+	want := []struct{ table, row, column string }{
+		{"work_items", itemID, "needs"},
+		{"nodes", node, "provides_live"},
+		{"nodes", node, "reach_classes"},
+		{"models", "m-local", "provides"},
+		{"models", "m-local", "features"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("corrupt rows = %+v, want %d entries (one per corrupt column); valid rows must be absent", got, len(want))
+	}
+	for i, w := range want {
+		if got[i].Table != w.table || got[i].RowID != w.row || got[i].Column != w.column {
+			t.Fatalf("entry %d = %+v, want %s/%s column %s", i, got[i], w.table, w.row, w.column)
+		}
+		if !strings.Contains(got[i].Reason, "decode capability list") {
+			t.Fatalf("entry %d reason = %q, want the claim path's own decode error", i, got[i].Reason)
+		}
+	}
+
+	// Read-only means read-only: the cells and the audit spine are unchanged.
+	after := snapshotCorruptCells(t, srv.db, itemID, node)
+	if before != after {
+		t.Fatalf("corrupt-rows mutated the board:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// The empty case is an empty list, not null and not an error: "nothing is
+// corrupt" is an answer the operator runs the route to get.
+func TestCorruptRowsEndpointIsAnEmptyListWhenNothingIsCorrupt(t *testing.T) {
+	srv, clock := newServer(t)
+	SeedNodeForTest(t, srv.db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, srv.db, clock, "local", "host", 0, "tools")
+
+	rec := do(t, srv.Handler(), "GET", "/admin/corrupt-rows", testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("corrupt-rows = %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != "[]" {
+		t.Fatalf("corrupt-rows body = %q, want []", body)
+	}
+}
+
+// The route is an operator tool: it names corrupt cells and the operator
+// repairs them, so it must not answer without the admin credential.
+func TestCorruptRowsEndpointRequiresAdminToken(t *testing.T) {
+	srv, _ := newServer(t)
+	rec := do(t, srv.Handler(), "GET", "/admin/corrupt-rows", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("corrupt-rows without a token = %d, want 401", rec.Code)
+	}
+}
+
+// snapshotCorruptCells renders the five corruptible cells plus the audit-log
+// size, so a test can prove the enumeration route read and did not write.
+func snapshotCorruptCells(t *testing.T, db *sql.DB, itemID, nodeID string) string {
+	t.Helper()
+	var needs, live, reach, provides, features string
+	if err := db.QueryRow(`SELECT needs FROM work_items WHERE id=?`, itemID).Scan(&needs); err != nil {
+		t.Fatalf("read needs: %v", err)
+	}
+	if err := db.QueryRow(`SELECT provides_live, reach_classes FROM nodes WHERE id=?`, nodeID).Scan(&live, &reach); err != nil {
+		t.Fatalf("read node cells: %v", err)
+	}
+	if err := db.QueryRow(`SELECT provides, features FROM models WHERE id='m-local'`).Scan(&provides, &features); err != nil {
+		t.Fatalf("read model cells: %v", err)
+	}
+	var events int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&events); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	return needs + "|" + live + "|" + reach + "|" + provides + "|" + features + "|" + strconv.Itoa(events)
 }
 
 // The empty-but-healthy edge: when the only queued item is the corrupt one, the

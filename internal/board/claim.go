@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -60,7 +61,7 @@ type ClaimModel struct {
 // that is asking, because capability eligibility is per node (spec §9).
 //
 // A candidate row whose capability cells cannot be decoded is SKIPPED and
-// reported (see reportSkippedRow), not returned as an error. This loader feeds
+// reported (see reportCorruptRow), not returned as an error. This loader feeds
 // the claim path, and one malformed provides_live/features cell on one row must
 // not 500 every node's claim. Skipping a candidate is safe in one direction
 // only, and that is the direction that matters: it can remove a placement
@@ -68,10 +69,11 @@ type ClaimModel struct {
 //
 // These filters repeat rules Eligible enforces. That is intentional: here they
 // are a prefilter so Claim does not scan rows it would discard, while the rule
-// itself lives in one place. /why uses LoadAllCandidates for the rows this
-// loader removes.
+// itself lives in one place. /why uses the unfiltered loader below for the rows
+// this loader removes.
 func LoadCandidates(ctx context.Context, db *sql.DB) ([]Candidate, error) {
-	return loadCandidates(ctx, db, true, true)
+	cands, _, err := loadCandidates(ctx, db, true, corruptSkipAndLog)
+	return cands, err
 }
 
 // LoadAllCandidates is LoadCandidates without the availability prefilter: every
@@ -81,15 +83,42 @@ func LoadCandidates(ctx context.Context, db *sql.DB) ([]Candidate, error) {
 // cannot name — "your only gpu node is offline" is exactly the answer an
 // operator asks /why for.
 //
-// It is also STRICT about decode failures, unlike LoadCandidates. Swallowing a
-// corrupt row here would hide it from the one endpoint whose job is to explain
-// the board, at the moment the operator needs the explanation; /why answers 500
-// naming the row and column instead.
+// It is also STRICT about decode failures, unlike LoadCandidates: this loader
+// is the exact set with no explanation attached, so a corrupt cell is returned
+// as an error naming the row and column. Explain does NOT use it — A4 made the
+// explainer degrade instead of 500, through loadAllCandidatesDegraded below.
 func LoadAllCandidates(ctx context.Context, db *sql.DB) ([]Candidate, error) {
-	return loadCandidates(ctx, db, false, false)
+	cands, _, err := loadCandidates(ctx, db, false, corruptFatal)
+	return cands, err
 }
 
-func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly, skipCorrupt bool) ([]Candidate, error) {
+// loadAllCandidatesDegraded is /why's loader (A4): the same unfiltered set as
+// LoadAllCandidates, but a corrupt candidate row is removed from the candidate
+// slice and returned as a CorruptRow instead of aborting the call. One bad
+// provides_live cell must not make the explainer useless for every item on the
+// board; the caller answers for the requested item and surfaces the skipped
+// rows as warnings.
+//
+// Skipping here is safe in the same one-way sense as Claim: it can remove a
+// placement option, never add one. The warnings are what keep the removal from
+// being silent.
+func loadAllCandidatesDegraded(ctx context.Context, db *sql.DB) ([]Candidate, []CorruptRow, error) {
+	return loadCandidates(ctx, db, false, corruptCollect)
+}
+
+// corruptPolicy says what a loader does with a candidate row it cannot decode.
+// It is an enum rather than a bool because "skip and log" and "skip and return
+// to the caller" are different answers to the same event, and a bool named
+// skipCorrupt would hide the third (fatal) case at the call site.
+type corruptPolicy int
+
+const (
+	corruptFatal      corruptPolicy = iota // return an error naming the row and column
+	corruptSkipAndLog                      // the claim path: report once, keep loading
+	corruptCollect                         // /why: return the rows to the caller as warnings
+)
+
+func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly bool, policy corruptPolicy) ([]Candidate, []CorruptRow, error) {
 	query := `
 		SELECT n.id, n.name, n.role, n.provides_live, n.reach_classes, n.concurrency,
 		       n.status, n.agent_version,
@@ -104,11 +133,13 @@ func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly, skipCorrupt 
 	}
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 
 	var out []Candidate
+	var corrupt []CorruptRow
+	seenCorrupt := map[CorruptRow]struct{}{}
 	for rows.Next() {
 		var c Candidate
 		var live, reach, provides, features string
@@ -133,36 +164,51 @@ func loadCandidates(ctx context.Context, db *sql.DB, placeableOnly, skipCorrupt 
 			&c.Model.ID, &c.Model.ModelID, &provides, &features, &c.Model.ContextWindow,
 			&c.Model.CostInPerMtok, &c.Model.Enabled,
 		); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if err := c.decodeLists(live, reach, provides, features); err != nil {
-			if !skipCorrupt {
-				return nil, err
+		if cr := c.decodeLists(live, reach, provides, features); cr != nil {
+			switch policy {
+			case corruptFatal:
+				// The strict loader keeps its old error text: "nodes/<id>
+				// column provides_live: decode ...". Callers distinguish this
+				// from sql.ErrNoRows by errors.Is; nothing wraps ErrNoRows here.
+				return nil, nil, errors.New(cr.message())
+			case corruptSkipAndLog:
+				reportCorruptRow(*cr)
+			case corruptCollect:
+				// The cross join repeats the same node/model row once per
+				// endpoint × model, so the same corrupt cell would otherwise
+				// appear several times. A warning list that repeats itself makes
+				// an operator count corruptions that are one cell.
+				if _, ok := seenCorrupt[*cr]; !ok {
+					seenCorrupt[*cr] = struct{}{}
+					corrupt = append(corrupt, *cr)
+				}
 			}
-			reportSkippedRow("%v", err)
 			continue
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	return out, corrupt, rows.Err()
 }
 
-// decodeLists decodes the four capability cells on one candidate row. The error
-// names the row and the column, because both the skip report and /why's 500 are
-// only actionable with that pair.
-func (c *Candidate) decodeLists(live, reach, provides, features string) error {
+// decodeLists decodes the four capability cells on one candidate row. A failure
+// is returned as the CorruptRow the log report, /why's warnings and
+// /admin/corrupt-rows all speak, so the row and column cannot be described
+// three different ways.
+func (c *Candidate) decodeLists(live, reach, provides, features string) *CorruptRow {
 	var err error
 	if c.Node.ProvidesLive, err = decodeList(live); err != nil {
-		return fmt.Errorf("nodes/%s column provides_live: %w", c.Node.ID, err)
+		return &CorruptRow{Table: "nodes", RowID: c.Node.ID, Column: "provides_live", Reason: err.Error()}
 	}
 	if c.Node.ReachClasses, err = decodeList(reach); err != nil {
-		return fmt.Errorf("nodes/%s column reach_classes: %w", c.Node.ID, err)
+		return &CorruptRow{Table: "nodes", RowID: c.Node.ID, Column: "reach_classes", Reason: err.Error()}
 	}
 	if c.Model.Provides, err = decodeList(provides); err != nil {
-		return fmt.Errorf("models/%s column provides: %w", c.Model.ID, err)
+		return &CorruptRow{Table: "models", RowID: c.Model.ID, Column: "provides", Reason: err.Error()}
 	}
 	if c.Model.Features, err = decodeList(features); err != nil {
-		return fmt.Errorf("models/%s column features: %w", c.Model.ID, err)
+		return &CorruptRow{Table: "models", RowID: c.Model.ID, Column: "features", Reason: err.Error()}
 	}
 	return nil
 }
@@ -311,10 +357,10 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 			// queued, not failed or cancelled — the board has no authority to
 			// destroy work whose contents it could not read, and a manual SQL
 			// typo is repairable. It is therefore skipped forever until the
-			// operator fixes it; the report names the row and column, and /why
-			// keeps answering 500 naming the column too, so the stale row is
-			// discoverable without depending on log retention.
-			reportSkippedRow("work_items/%s column needs: %v", r.id, err)
+			// operator fixes it; the report names the row and column, /why
+			// keeps answering 500 naming the column too, and GET
+			// /admin/corrupt-rows lists it without depending on log retention.
+			reportCorruptRow(CorruptRow{Table: "work_items", RowID: r.id, Column: "needs", Reason: err.Error()})
 			continue
 		}
 		item := WorkItem{ID: r.id, Title: r.title, Needs: needs, Status: r.status, Attempt: r.attempt}
