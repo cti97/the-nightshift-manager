@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -118,8 +119,8 @@ func TestApprovalRequestRoundTrips(t *testing.T) {
 }
 
 // parkOneRun is the fixture the escalation tests share: a started run on a
-// claimed item, with a parked request already accepted. It returns the item id
-// and the run id; the caller decides what the request said.
+// claimed item. It returns the item id, the run id and the node id; the caller
+// decides what the request says, and whether it is escalated at all.
 func parkOneRun(t *testing.T, db *sql.DB, clock *FixedClock) (itemID, runID, nodeID string) {
 	t.Helper()
 	ctx := context.Background()
@@ -313,6 +314,239 @@ func TestAVanishedRowCannotBeEscalated(t *testing.T) {
 	}
 	if events != 0 {
 		t.Fatalf("escalated events = %d after a refused escalation, want 0", events)
+	}
+}
+
+// parkEscalated is the fixture the decision tests share: one item parked with
+// the given action, and the item id returned.
+func parkEscalated(t *testing.T, db *sql.DB, clock *FixedClock, action string) (itemID, node string) {
+	t.Helper()
+	itemID, runID, node := parkOneRun(t, db, clock)
+	if err := Escalate(context.Background(), db, clock, runID, node, ApprovalRequest{
+		Action: action, Reason: "the run needs it", Options: []string{"yes", "no"},
+	}); err != nil {
+		t.Fatalf("Escalate: %v", err)
+	}
+	return itemID, node
+}
+
+// TestApprovalRequeuesWithTheActionItGranted is D3 and the second half of D5:
+// the grant names the action it allows, the item goes back to queued with its
+// spent attempt unchanged, and the request it answers is cleared.
+func TestApprovalRequeuesWithTheActionItGranted(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	itemID, _ := parkEscalated(t, db, clock, "delete /var/cache/app")
+
+	res, err := Decide(context.Background(), db, clock, itemID, Approve, "go ahead, the cache is regenerable")
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if res.Status != "queued" {
+		t.Fatalf("result status = %q, want queued", res.Status)
+	}
+
+	var status string
+	var rawGrant, rawRequest sql.NullString
+	var attempt int
+	if err := db.QueryRow(
+		`SELECT status, approval_granted, approval_request, attempt FROM work_items WHERE id=?`,
+		itemID).Scan(&status, &rawGrant, &rawRequest, &attempt); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("item status = %q, want queued", status)
+	}
+	if !rawGrant.Valid {
+		t.Fatal("approval_granted is NULL after an approval; the next run has nothing to honour")
+	}
+	var grant ApprovalGrant
+	if err := json.Unmarshal([]byte(rawGrant.String), &grant); err != nil {
+		t.Fatalf("decode grant: %v", err)
+	}
+	if grant.Action != "delete /var/cache/app" {
+		t.Fatalf("grant action = %q, want the action the request named", grant.Action)
+	}
+	if grant.Note != "go ahead, the cache is regenerable" || grant.DecidedAt != clock.Now() {
+		t.Fatalf("grant = %+v, want the operator's note at %d", grant, clock.Now())
+	}
+	if rawRequest.Valid {
+		t.Fatalf("approval_request = %q on a queued item, want NULL: the question was answered", rawRequest.String)
+	}
+	if attempt != 1 {
+		t.Fatalf("attempt = %d after a re-queue, want 1: the decision does not charge or refund (D5)", attempt)
+	}
+
+	var approved, denied int
+	if err := db.QueryRow(
+		`SELECT count(*) FILTER (WHERE type='approved'), count(*) FILTER (WHERE type='denied')
+		   FROM events WHERE entity='work_item' AND entity_id=?`, itemID).Scan(&approved, &denied); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if approved != 1 || denied != 0 {
+		t.Fatalf("approved=%d denied=%d, want exactly one approved event", approved, denied)
+	}
+}
+
+// TestDenialCancelsWithTheDecidersNote is D7: a decline is a cancellation that
+// says who declined and why, not a failure. Nothing went wrong with the run.
+func TestDenialCancelsWithTheDecidersNote(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	itemID, _ := parkEscalated(t, db, clock, "delete /var/cache/app")
+
+	res, err := Decide(context.Background(), db, clock, itemID, Deny, "that cache is not regenerable")
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if res.Status != "cancelled" {
+		t.Fatalf("result status = %q, want cancelled", res.Status)
+	}
+
+	var status string
+	var reason, grant, request sql.NullString
+	if err := db.QueryRow(
+		`SELECT status, blocked_reason, approval_granted, approval_request FROM work_items WHERE id=?`,
+		itemID).Scan(&status, &reason, &grant, &request); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if status != "cancelled" {
+		t.Fatalf("item status = %q, want cancelled", status)
+	}
+	if !reason.Valid || !strings.Contains(reason.String, "declined") {
+		t.Fatalf("blocked_reason = %v, want it to say the item was declined", reason)
+	}
+	if !strings.Contains(reason.String, "that cache is not regenerable") {
+		t.Fatalf("blocked_reason = %q, want the decider's note in it", reason.String)
+	}
+	if grant.Valid {
+		t.Fatalf("approval_granted = %q on a denied item, want NULL", grant.String)
+	}
+	if request.Valid {
+		t.Fatalf("approval_request = %q on a denied item, want NULL", request.String)
+	}
+
+	var approved, denied int
+	if err := db.QueryRow(
+		`SELECT count(*) FILTER (WHERE type='approved'), count(*) FILTER (WHERE type='denied')
+		   FROM events WHERE entity='work_item' AND entity_id=?`, itemID).Scan(&approved, &denied); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if denied != 1 || approved != 0 {
+		t.Fatalf("approved=%d denied=%d, want exactly one denied event", approved, denied)
+	}
+}
+
+// TestASecondDecisionIsRefused is D4: a decision is one-way and first-wins. The
+// second is a conflict, the first stands, and the audit spine has one decision
+// rather than two contradictory ones.
+func TestASecondDecisionIsRefused(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	itemID, _ := parkEscalated(t, db, clock, "delete /var/cache/app")
+
+	if _, err := Decide(context.Background(), db, clock, itemID, Approve, "yes"); err != nil {
+		t.Fatalf("first decision: %v", err)
+	}
+
+	_, err := Decide(context.Background(), db, clock, itemID, Deny, "no, changed my mind")
+	if err == nil {
+		t.Fatal("a second decision was accepted; the first must stand")
+	}
+	if !errors.Is(err, ErrNotParked) {
+		t.Fatalf("error = %v, want ErrNotParked so the route can answer 409", err)
+	}
+
+	var status, reason string
+	var grant sql.NullString
+	if err := db.QueryRow(`SELECT status, COALESCE(blocked_reason,''), approval_granted FROM work_items WHERE id=?`, itemID).
+		Scan(&status, &reason, &grant); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if status != "queued" || reason != "" || !grant.Valid {
+		t.Fatalf("item = status %q, reason %q, grant valid %v; want the first decision intact", status, reason, grant.Valid)
+	}
+
+	var approved, denied int
+	if err := db.QueryRow(
+		`SELECT count(*) FILTER (WHERE type='approved'), count(*) FILTER (WHERE type='denied')
+		   FROM events WHERE entity='work_item' AND entity_id=?`, itemID).Scan(&approved, &denied); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if approved != 1 || denied != 0 {
+		t.Fatalf("approved=%d denied=%d, want one decision event and no contradiction", approved, denied)
+	}
+}
+
+// TestAnApprovedItemCanBeClaimedAgain follows the whole loop through the claim
+// path: the requeued item is claimed as a new run, with a new run ordinal, and
+// the grant travels on the payload where the executor will read it (D3, D5).
+func TestAnApprovedItemCanBeClaimedAgain(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	itemID, node := parkEscalated(t, db, clock, "delete /var/cache/app")
+
+	if _, err := Decide(context.Background(), db, clock, itemID, Approve, "yes"); err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	claimed, err := Claim(context.Background(), db, clock, node, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim = %d items, err %v", len(claimed), err)
+	}
+	got := claimed[0]
+	if got.Item.ID != itemID {
+		t.Fatalf("claimed %s, want the approved item %s", got.Item.ID, itemID)
+	}
+	if got.Item.ApprovalGranted == nil {
+		t.Fatal("the claim payload carries no grant; the executor cannot honour the decision")
+	}
+	if got.Item.ApprovalGranted.Action != "delete /var/cache/app" {
+		t.Fatalf("grant on the payload = %q, want the approved action", got.Item.ApprovalGranted.Action)
+	}
+	if got.Item.Attempt != 2 {
+		t.Fatalf("item attempt = %d after the second claim, want 2: the claim charges, not the decision", got.Item.Attempt)
+	}
+	// runs.attempt is the claim ordinal and is unique per item; the re-run is a
+	// second attempt of the item, not a reuse of the first run's row.
+	var ordinal int
+	if err := db.QueryRow(`SELECT attempt FROM runs WHERE id=?`, got.RunID).Scan(&ordinal); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if ordinal != 2 {
+		t.Fatalf("run ordinal = %d, want 2", ordinal)
+	}
+}
+
+// TestARequestlessRowCanBeDeniedButNotApproved is the nullable column's other
+// edge: without a readable action there is nothing for an approval to name, so
+// approve is refused rather than writing a grant that matches nothing. Deny
+// still works, because the operator's reason needs no action to name — and a
+// queue an operator cannot clear is worse than one they can only decline.
+func TestARequestlessRowCanBeDeniedButNotApproved(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	itemID, _ := parkEscalated(t, db, clock, "delete /var/cache/app")
+	if _, err := db.Exec(`UPDATE work_items SET approval_request=NULL WHERE id=?`, itemID); err != nil {
+		t.Fatalf("clear request: %v", err)
+	}
+
+	if _, err := Decide(context.Background(), db, clock, itemID, Approve, "yes"); !errors.Is(err, ErrNoRequest) {
+		t.Fatalf("approve without a request = %v, want ErrNoRequest", err)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, itemID).Scan(&status); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if status != "needs_approval" {
+		t.Fatalf("status = %q after a refused approval, want needs_approval (nothing written)", status)
+	}
+
+	if _, err := Decide(context.Background(), db, clock, itemID, Deny, "the request is unreadable, start over"); err != nil {
+		t.Fatalf("deny with no request: %v", err)
+	}
+	var reason string
+	if err := db.QueryRow(`SELECT status, blocked_reason FROM work_items WHERE id=?`, itemID).
+		Scan(&status, &reason); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if status != "cancelled" || !strings.Contains(reason, "start over") {
+		t.Fatalf("item = %q with reason %q, want a cancellation naming the note", status, reason)
 	}
 }
 

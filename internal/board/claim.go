@@ -317,7 +317,7 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 	}
 
 	rows, err := conn.QueryContext(ctx,
-		`SELECT id,title,brief,needs,status,attempt FROM work_items
+		`SELECT id,title,brief,needs,status,attempt,approval_granted FROM work_items
 		  WHERE status='queued' ORDER BY priority DESC, created_at ASC LIMIT 50`)
 	if err != nil {
 		return nil, err
@@ -326,6 +326,7 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 	type row struct {
 		id, title, brief, needs, status string
 		attempt                         int
+		grant                           sql.NullString
 	}
 	var queued []row
 	for rows.Next() {
@@ -334,7 +335,7 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 		// storage class in a NOT NULL column is a write-path breach, and
 		// skipping the row would hide it. The repairable cell-level case is the
 		// JSON decode below, which is skipped and reported.
-		if err := rows.Scan(&r.id, &r.title, &r.brief, &r.needs, &r.status, &r.attempt); err != nil {
+		if err := rows.Scan(&r.id, &r.title, &r.brief, &r.needs, &r.status, &r.attempt, &r.grant); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -364,6 +365,20 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 			continue
 		}
 		item := WorkItem{ID: r.id, Title: r.title, Needs: needs, Status: r.status, Attempt: r.attempt}
+
+		// A corrupt grant is reported and left nil, not fatal and not guessed.
+		// The run then escalates again rather than acting on a permission
+		// nobody can read: same one-way rule as the needs cell above, except
+		// that dropping the grant can only make the board ask a human, never
+		// authorise something.
+		if r.grant.Valid && r.grant.String != "" {
+			var g ApprovalGrant
+			if err := json.Unmarshal([]byte(r.grant.String), &g); err != nil {
+				reportCorruptRow(CorruptRow{Table: "work_items", RowID: r.id, Column: "approval_granted", Reason: err.Error()})
+			} else {
+				item.ApprovalGranted = &g
+			}
+		}
 
 		d := Place(item, mine)
 		if !d.OK {

@@ -85,6 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /admin/why/{id}", s.adminAuth(http.HandlerFunc(s.handleWhy)))
 	mux.Handle("GET /admin/corrupt-rows", s.adminAuth(http.HandlerFunc(s.handleCorruptRows)))
 	mux.Handle("GET /admin/approvals", s.adminAuth(http.HandlerFunc(s.handleApprovals)))
+	mux.Handle("POST /admin/approvals/{id}", s.adminAuth(http.HandlerFunc(s.handleDecision)))
 	return mux
 }
 
@@ -227,6 +228,41 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, res)
+}
+
+// DecisionRequest is the body of POST /admin/approvals/{id}: two decisions and
+// a note that is recorded with the decision and, on a denial, becomes the
+// item's blocked_reason (D7).
+type DecisionRequest struct {
+	Decision string `json:"decision"` // "approve" | "deny"
+	Note     string `json:"note"`
+}
+
+// handleDecision answers a parked item. The one-way rule (D4) is a 409: a
+// second decision is a conflict, not an overwrite, and the first one stands.
+// A 404 means the id is not on the board at all; a 400 means the body did not
+// name a decision, which is a malformed request rather than a lost race.
+func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
+	var req DecisionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	if req.Decision != Approve && req.Decision != Deny {
+		WriteError(w, http.StatusBadRequest, "decision", fmt.Sprintf("decision %q is neither approve nor deny", req.Decision))
+		return
+	}
+	res, err := Decide(r.Context(), s.db, s.clock, r.PathValue("id"), req.Decision, req.Note)
+	switch {
+	case err == nil:
+		WriteJSON(w, http.StatusOK, res)
+	case errors.Is(err, ErrNotParked), errors.Is(err, ErrNoRequest):
+		WriteError(w, http.StatusConflict, "decision", err.Error())
+	case errors.Is(err, sql.ErrNoRows):
+		WriteError(w, http.StatusNotFound, "not_found", err.Error())
+	default:
+		WriteError(w, http.StatusInternalServerError, "decision", err.Error())
+	}
 }
 
 // handleApprovals is the approvals queue (M3 Task 3). JSON for now; Task 7's

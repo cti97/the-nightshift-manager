@@ -95,6 +95,159 @@ func ListApprovals(ctx context.Context, db *sql.DB) ([]Approval, error) {
 	return out, rows.Err()
 }
 
+// ApprovalGrant is what a decision leaves on the item: the action the human
+// allowed, their note, and when (D3). The action is stored, not just "granted",
+// so the executor can refuse to read a permission for one action as permission
+// for another — an approval to delete the cache must not authorise a key
+// rotation.
+type ApprovalGrant struct {
+	Action    string `json:"action"`
+	Note      string `json:"note"`
+	DecidedAt int64  `json:"decided_at"`
+}
+
+// The two decisions a human can make about a parked item (D4). Strings, not a
+// bool: the wire carries them, and "approve"/"deny" reads the same in an event
+// payload as it does in the form that produced it.
+const (
+	Approve = "approve"
+	Deny    = "deny"
+)
+
+var (
+	// ErrNotParked is a decision on an item that is not waiting: never parked,
+	// already decided, or settled by something else. D4 makes a second decision
+	// a conflict, not a silent overwrite, and the handler answers 409 for this.
+	ErrNotParked = errors.New("work item is not waiting for a decision")
+	// ErrNoRequest is an approval of a parked row whose request cannot be read
+	// — parked before migration 4, or hand-edited. A denial is still possible:
+	// the operator's note is the reason, and it needs no action to name.
+	ErrNoRequest = errors.New("parked item has no readable approval request")
+)
+
+// DecisionResult is what the route returns: which item moved, and where it
+// went. The caller already knows both, but the answer makes the one-way rule
+// visible — a second decision would answer differently.
+type DecisionResult struct {
+	ItemID string `json:"item_id"`
+	Status string `json:"status"`
+}
+
+// Decide answers a parked item: approve requeues it carrying the grant, deny
+// cancels it with the operator's reason (D4, D7). One transaction, one event,
+// and the row is re-read and re-guarded inside it — a second decision finds the
+// item no longer parked and is refused rather than overwriting the first.
+//
+// The decision does not touch `attempt` (D5): the next run charges its own.
+func Decide(ctx context.Context, db *sql.DB, clock Clock, itemID, decision, note string) (DecisionResult, error) {
+	if decision != Approve && decision != Deny {
+		return DecisionResult{}, fmt.Errorf("decision %q is neither approve nor deny", decision)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return DecisionResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }() // a commit makes it a no-op
+
+	var status string
+	var rawRequest sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT status, approval_request FROM work_items WHERE id=?`, itemID).
+		Scan(&status, &rawRequest); err != nil {
+		return DecisionResult{}, fmt.Errorf("work item %s: %w", itemID, err)
+	}
+	if status != "needs_approval" {
+		return DecisionResult{}, fmt.Errorf("%w: %s is %q", ErrNotParked, itemID, status)
+	}
+
+	var req ApprovalRequest
+	readable := false
+	if rawRequest.Valid && rawRequest.String != "" {
+		if err := json.Unmarshal([]byte(rawRequest.String), &req); err == nil && req.Action != "" {
+			readable = true
+		}
+	}
+
+	now := clock.Now()
+	var nextStatus, event string
+	var payload map[string]any
+	if decision == Approve {
+		if !readable {
+			return DecisionResult{}, fmt.Errorf("%w: %s; an approval has to name the action it allows, so deny it or repair the row", ErrNoRequest, itemID)
+		}
+		grant, err := json.Marshal(ApprovalGrant{Action: req.Action, Note: note, DecidedAt: now})
+		if err != nil {
+			return DecisionResult{}, fmt.Errorf("marshal approval grant: %w", err)
+		}
+		// approval_request is cleared: the question has been answered, and the
+		// grant now records what was allowed. Leaving the request behind would
+		// put a stale action on a queued item for /why and the page to misread.
+		res, err := tx.ExecContext(ctx,
+			`UPDATE work_items
+			    SET status='queued', approval_granted=?, approval_request=NULL,
+			        claimed_by=NULL, lease_expires_at=NULL, updated_at=?
+			  WHERE id=? AND status='needs_approval'`,
+			string(grant), now, itemID)
+		if err != nil {
+			return DecisionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return DecisionResult{}, err
+		}
+		if n != 1 {
+			return DecisionResult{}, fmt.Errorf("%w: %s was decided by someone else", ErrNotParked, itemID)
+		}
+		nextStatus, event = "queued", "approved"
+		payload = map[string]any{"action": req.Action, "note": note}
+	} else {
+		// D7: a decline is a cancellation with a reason, not a failure. Nothing
+		// went wrong; a human said no, and the reason says so for the operator
+		// who reads the item a week later.
+		reason := declineReason(note)
+		res, err := tx.ExecContext(ctx,
+			`UPDATE work_items
+			    SET status='cancelled', blocked_reason=?, approval_request=NULL,
+			        claimed_by=NULL, lease_expires_at=NULL, updated_at=?
+			  WHERE id=? AND status='needs_approval'`,
+			reason, now, itemID)
+		if err != nil {
+			return DecisionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return DecisionResult{}, err
+		}
+		if n != 1 {
+			return DecisionResult{}, fmt.Errorf("%w: %s was decided by someone else", ErrNotParked, itemID)
+		}
+		nextStatus, event = "cancelled", "denied"
+		payload = map[string]any{"action": req.Action, "note": note, "reason": reason}
+	}
+
+	// The actor is "admin": the board authenticates one operator credential and
+	// has no name for its holder. The note is where a name would go if the
+	// deployment ever grows more than one.
+	if err := AppendEvent(ctx, tx, clock, "admin", "work_item", itemID, event, payload); err != nil {
+		return DecisionResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DecisionResult{}, err
+	}
+	return DecisionResult{ItemID: itemID, Status: nextStatus}, nil
+}
+
+// declineReason is the sentence D7 puts in blocked_reason: declined, by whom,
+// and in their words. A decision with no note still says who declined, because
+// "cancelled" alone is the one thing the operator already knew.
+func declineReason(note string) string {
+	if note == "" {
+		return "declined by admin"
+	}
+	return "declined by admin: " + note
+}
+
 // Escalate parks a run's item for a human and closes the run, in one
 // transaction (spec §11; M3 D1, D5, D6).
 //

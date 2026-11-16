@@ -100,6 +100,38 @@ func (f *approvalsFixture) list(t *testing.T, bearer string) (*httptest.Response
 	return rec, got
 }
 
+// TestDecisionRouteAnswersConflicts walks the status codes a caller meets on
+// the decision route: 200 for the decision, 409 for the second one (D4), 404
+// for an id that is not on the board, and 400 for a body that names no
+// decision. The distinction matters to the CLI: 409 means "someone got there
+// first", 404 means "wrong id", and 400 means "fix the command".
+func TestDecisionRouteAnswersConflicts(t *testing.T) {
+	f := newApprovalsFixture(t)
+	id := f.create(t, "waiting", 0)
+	f.parkNext(t, "delete the cache")
+
+	post := func(path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+testAdminToken)
+		rec := httptest.NewRecorder()
+		f.srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := post("/admin/approvals/"+id, `{"decision":"later"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown decision = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+	}
+	if rec := post("/admin/approvals/"+id, `{"decision":"approve","note":"yes"}`); rec.Code != http.StatusOK {
+		t.Fatalf("approve = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	if rec := post("/admin/approvals/"+id, `{"decision":"deny","note":"no"}`); rec.Code != http.StatusConflict {
+		t.Fatalf("second decision = %d, want 409 (body %s)", rec.Code, rec.Body.String())
+	}
+	if rec := post("/admin/approvals/no-such-item", `{"decision":"approve"}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown item = %d, want 404 (body %s)", rec.Code, rec.Body.String())
+	}
+}
+
 // TestApprovalsListIsOldestFirst pins that the queue is ordered by when the
 // item was created, not by when it escalated and not by row order. The three
 // created_at values are rewritten so that creation order, insertion order and

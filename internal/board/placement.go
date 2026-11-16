@@ -51,6 +51,13 @@ type WorkItem struct {
 	Needs   []string `json:"needs"`
 	Status  string   `json:"status"`
 	Attempt int      `json:"attempt"`
+
+	// ApprovalGranted is the decision that let this run proceed, when there is
+	// one. It travels on the claim payload so the executor can compare the
+	// action it is about to request against the action a human allowed (M3 D3):
+	// a grant for one action is not a grant for another, and the node has no
+	// other route to the row.
+	ApprovalGranted *ApprovalGrant `json:"approval_granted,omitempty"`
 }
 
 // EndpointConnection is the endpoint configuration a claiming node needs to
