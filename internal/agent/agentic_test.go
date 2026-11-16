@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1017,6 +1018,27 @@ func TestAgenticExecutorUsesTheRegistryWhenNoTestConstructorIsSet(t *testing.T) 
 	}
 }
 
+// TestAgenticExecutorRefusesATypedNilProvider pins the executor's side of B1.
+// Its constructor seam can bypass Registry.New, so it applies the same rule: a
+// nil *Stub in a Provider interface is not a nil interface, and letting it
+// through would move the panic from construction to the first provider call.
+func TestAgenticExecutorRefusesATypedNilProvider(t *testing.T) {
+	exec := &AgenticExecutor{
+		SandboxRoot: t.TempDir(),
+		newProvider: func(provider.Config) (provider.Provider, error) {
+			return (*provider.Stub)(nil), nil
+		},
+	}
+
+	_, err := exec.Run(context.Background(), claimedItem("run-1", "do it", "agentic"))
+	if err == nil {
+		t.Fatal("Run succeeded with a typed-nil provider")
+	}
+	if !strings.Contains(err.Error(), "no provider") {
+		t.Fatalf("error = %q, want the typed-nil provider named as a construction failure", err)
+	}
+}
+
 // TestAgenticExecutorFailsARunThatSettlesOverTheBudget is the token cap's
 // post-settle half: a response can report more than the estimate reserved, and
 // if it calls finish the run would otherwise end in success with a silent
@@ -1048,6 +1070,88 @@ func TestAgenticExecutorFailsARunThatSettlesOverTheBudget(t *testing.T) {
 	}
 	if got := p.callCount(); got != 1 {
 		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+// TestTokenMeterRefusesAReservationThatOverflows pins the clamp's other half.
+// `if reservation < 1 { reservation = 1 }` exists because a zero reservation
+// would be a free request; but an absurd EstimateTokens plus MaxTokens could
+// WRAP negative and produce exactly that one-token reservation, so the clamp
+// converted an overflow into a budget bypass. The check itself must not
+// overflow: both operands are clamped non-negative before any arithmetic.
+func TestTokenMeterRefusesAReservationThatOverflows(t *testing.T) {
+	m := &tokenMeter{limit: 1000}
+	for _, tc := range []struct {
+		name            string
+		estimate, reply int
+	}{
+		{"estimate plus reply wraps", math.MaxInt - 100, 200},
+		{"both operands at the maximum", math.MaxInt, math.MaxInt},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := m.reserve(tc.estimate, tc.reply)
+			if !errors.Is(err, ErrTokenBudget) {
+				t.Fatalf("reserve(%d, %d) = %v, want ErrTokenBudget; a wrapped reservation becomes one token and slips under the cap",
+					tc.estimate, tc.reply, err)
+			}
+			if m.reserved != 0 {
+				t.Fatalf("reserved = %d after a refused reservation, want 0", m.reserved)
+			}
+		})
+	}
+
+	// The one-token floor is still what a genuinely empty request gets.
+	if err := m.reserve(0, 0); err != nil {
+		t.Fatalf("reserve(0, 0) = %v; an empty request still reserves the floor", err)
+	}
+	if m.reserved != 1 {
+		t.Fatalf("reserved = %d for an empty request, want the one-token floor", m.reserved)
+	}
+}
+
+// TestToolResultOverTheCapKeepsTheToolError pins B5. A failing shell that
+// prints more than 64 KiB used to collapse to "over the cap" alone: the
+// executor had already appended "exit status 1" to the content it then threw
+// away, so the model was told its command was too loud and never that it
+// failed. Both facts must survive, and the message itself must stay small.
+func TestToolResultOverTheCapKeepsTheToolError(t *testing.T) {
+	atCap := strings.Repeat("x", maxToolOutputBytes)
+	out := atCap + "x" // one byte over
+	terr := errors.New("agent: shell: exit status 1")
+
+	// At the cap exactly, the content is still sent whole: the limit is a
+	// ceiling, not an off-by-one.
+	if got := toolResultContent(ToolShell, atCap, nil); len(got) != maxToolOutputBytes {
+		t.Fatalf("tool result at the cap is %d bytes, want it passed through unchanged", len(got))
+	}
+
+	got := toolResultContent(ToolShell, out, terr)
+	if len(got) > maxToolOutputBytes {
+		t.Fatalf("refusal is %d bytes; it must not smuggle the output it refuses", len(got))
+	}
+	for _, want := range []string{"cap", "exit status 1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("tool result %q does not carry %q; the model must learn both that the output was refused and that the tool failed", got, want)
+		}
+	}
+	if strings.Contains(got, strings.Repeat("x", 256)) {
+		t.Fatalf("tool result carries the refused output: %q", got)
+	}
+
+	// A pathological error text is bounded too, or the "small" refusal becomes
+	// the same context bomb by another route.
+	huge := toolResultContent(ToolShell, out, errors.New(strings.Repeat("e", maxToolOutputBytes)))
+	if len(huge) > 4<<10 {
+		t.Fatalf("refusal is %d bytes with a huge error text, want it bounded", len(huge))
+	}
+
+	// With no error there is nothing to add, and the old advice still stands.
+	noErr := toolResultContent(ToolShell, out, nil)
+	if !strings.Contains(noErr, "cap") || !strings.Contains(noErr, "parts") {
+		t.Fatalf("tool result = %q, want the cap and how to proceed", noErr)
+	}
+	if strings.Contains(noErr, "failed") {
+		t.Fatalf("tool result = %q claims a failure that did not happen", noErr)
 	}
 }
 

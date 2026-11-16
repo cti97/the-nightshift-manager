@@ -571,27 +571,28 @@ func runListDir(ctx context.Context, sb *Sandbox, raw json.RawMessage) (string, 
 	if info, statErr := sb.Stat(clean); statErr == nil && !info.IsDir() {
 		return "", fmt.Errorf("%w: %q is a %s, not a directory", ErrPathRefused, name, modeName(info.Mode()))
 	}
-	entries, err := sb.ListDir(clean)
+	// The bound belongs here, where the output cap is decided: the sandbox
+	// streams the directory and keeps only the entries this tool can show, so a
+	// huge directory costs O(maxListEntries) memory rather than one DirEntry per
+	// file. It still returns the exact total, which the header and the
+	// truncation note need.
+	entries, total, err := sb.ListDir(clean, maxListEntries)
 	if err != nil {
 		return "", err
 	}
 
 	var b strings.Builder
 	noun := "entries"
-	if len(entries) == 1 {
+	if total == 1 {
 		noun = "entry"
 	}
-	fmt.Fprintf(&b, "%d %s in %s\n", len(entries), noun, clean)
-	shown := len(entries)
-	if shown > maxListEntries {
-		shown = maxListEntries
-	}
-	for _, entry := range entries[:shown] {
+	fmt.Fprintf(&b, "%d %s in %s\n", total, noun, clean)
+	for _, entry := range entries {
 		b.WriteString(renderDirEntry(entry))
 		b.WriteByte('\n')
 	}
-	if len(entries) > shown {
-		fmt.Fprintf(&b, "... truncated at %d entries; %d more are not shown\n", shown, len(entries)-shown)
+	if total > len(entries) {
+		fmt.Fprintf(&b, "... truncated at %d entries; %d more are not shown\n", len(entries), total-len(entries))
 	}
 	return b.String(), nil
 }

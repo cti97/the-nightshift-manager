@@ -211,6 +211,44 @@ func TestRegistryNewRejectsConstructorWhoseNameDisagrees(t *testing.T) {
 	}
 }
 
+// nilAdapter is a Provider whose methods are promoted from an embedded *Stub.
+// A nil *nilAdapter stored in a Provider interface is not a nil interface, and
+// the first promoted method call dereferences the nil receiver.
+type nilAdapter struct{ *Stub }
+
+func typedNilCtor(Config) (Provider, error) { return (*nilAdapter)(nil), nil }
+
+func TestRegistryNewRefusesATypedNilProvider(t *testing.T) {
+	// A constructor that returns a typed nil pointer is the one nil a plain
+	// p == nil check cannot see. New must refuse it, not hand it to a caller
+	// whose first Name() call panics — a crash inside a claim is a much worse
+	// place to learn that a constructor is broken.
+	r := &Registry{}
+	r.Register("typednil", typedNilCtor)
+
+	var (
+		p   Provider
+		err error
+	)
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("New(typednil) panicked: %v; a typed-nil provider must be refused at construction", recovered)
+			}
+		}()
+		p, err = r.New(Config{Provider: "typednil"})
+	}()
+	if err == nil {
+		t.Fatalf("New(typednil) = %v, nil; want a refusal naming the typed-nil provider", p)
+	}
+	if p != nil {
+		t.Fatalf("New(typednil) returned a provider alongside its error: %v", p)
+	}
+	if !strings.Contains(err.Error(), "typednil") {
+		t.Fatalf("error %q does not name the provider whose constructor returned a typed nil", err)
+	}
+}
+
 func TestRegistryCarriesTheEndpointReachToTheProvider(t *testing.T) {
 	// The endpoint row is where the declared reach lives; a provider built from
 	// it must still refuse a request whose own Reach says host. This is the

@@ -423,11 +423,15 @@ func PatchModel(ctx context.Context, db *sql.DB, clock Clock, id string, req Pat
 	if req.ContextWindow != nil && *req.ContextWindow < 0 {
 		return ModelView{}, errors.New("context_window must not be negative")
 	}
-	if req.CostInPerMtok != nil && *req.CostInPerMtok < 0 {
-		return ModelView{}, errors.New("cost_in_per_mtok must not be negative")
+	if req.CostInPerMtok != nil {
+		if err := checkPrice("cost_in_per_mtok", *req.CostInPerMtok); err != nil {
+			return ModelView{}, err
+		}
 	}
-	if req.CostOutPerMtok != nil && *req.CostOutPerMtok < 0 {
-		return ModelView{}, errors.New("cost_out_per_mtok must not be negative")
+	if req.CostOutPerMtok != nil {
+		if err := checkPrice("cost_out_per_mtok", *req.CostOutPerMtok); err != nil {
+			return ModelView{}, err
+		}
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -636,18 +640,16 @@ func ListEndpoints(ctx context.Context, db *sql.DB) ([]EndpointView, error) {
 
 // checkModelNumbers refuses the values that would make a model win or lose the
 // placement auction for a reason nobody intended: a negative cost always sorts
-// first, and a negative context window can never satisfy a tokens: need.
+// first, and a negative context window can never satisfy a tokens: need. The
+// price rule itself lives in checkPrice, shared with the report path.
 func checkModelNumbers(contextWindow int, costIn, costOut float64) error {
 	if contextWindow < 0 {
 		return errors.New("context_window must not be negative")
 	}
-	if costIn < 0 {
-		return errors.New("cost_in_per_mtok must not be negative")
+	if err := checkPrice("cost_in_per_mtok", costIn); err != nil {
+		return err
 	}
-	if costOut < 0 {
-		return errors.New("cost_out_per_mtok must not be negative")
-	}
-	return nil
+	return checkPrice("cost_out_per_mtok", costOut)
 }
 
 // enabledInt stores a Go bool in models.enabled, which is INTEGER. Written

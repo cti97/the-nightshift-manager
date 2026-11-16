@@ -31,8 +31,9 @@ const (
 	secondsPerDay = 86400
 
 	// configDailySpendCeiling holds the day's limit in the same unit as
-	// runs.cost_estimate. Absent or "0" means unlimited, which is the default:
-	// an un-configured board runs.
+	// runs.cost_estimate. Absent or a parseable "0" means unlimited, which is
+	// the default: an un-configured board runs. A row that exists but cannot be
+	// parsed — including an empty one — is an error, not unlimited (readCeiling).
 	configDailySpendCeiling = "daily_spend_ceiling"
 
 	// configBoardPaused is the OPERATOR's pause: spec §5 lists it as an
@@ -129,9 +130,56 @@ func SpendDay(now int64) (start int64, label string) {
 //
 // Tokens are converted to float before multiplying so an extreme count cannot
 // overflow the integer addition.
-func RunCost(tokensIn, tokensOut, reservedTokens int, costInPerMtok, costOutPerMtok float64) float64 {
+//
+// The prices and the result must be finite. A NaN price is the dangerous case:
+// `cost < 0` is false for it (which is how it got stored), the NaN it puts in
+// cost_estimate makes ceilingReached false, and `cost_estimate = 0` is false for
+// it too, so unpriced_runs cannot see it either. ±Inf is the same class of
+// non-amount: +Inf makes the day's total infinity, and -Inf makes
+// `spent >= ceiling` false forever. Refusing here is the last line before a
+// number enters the ledger: the model write path refuses these values, but a
+// row can predate that guard or arrive by raw SQL.
+//
+// An error means "do not price this run", never "price it at zero": zero is a
+// legitimate price (a free local model), and quietly turning corruption into a
+// free run is the failure this function exists to stop.
+func RunCost(tokensIn, tokensOut, reservedTokens int, costInPerMtok, costOutPerMtok float64) (float64, error) {
+	if err := checkPrice("cost_in_per_mtok", costInPerMtok); err != nil {
+		return 0, err
+	}
+	if err := checkPrice("cost_out_per_mtok", costOutPerMtok); err != nil {
+		return 0, err
+	}
 	in := float64(tokensIn) + float64(reservedTokens)
-	return (in*costInPerMtok + float64(tokensOut)*costOutPerMtok) / 1e6
+	cost := (in*costInPerMtok + float64(tokensOut)*costOutPerMtok) / 1e6
+	// Two finite prices can still multiply into infinity when the token counts
+	// and the prices are both extreme; the ledger only accepts a finite amount.
+	if math.IsNaN(cost) || math.IsInf(cost, 0) {
+		return 0, fmt.Errorf("run cost is not a finite amount (got %v); refusing to put it in the ledger", cost)
+	}
+	return cost, nil
+}
+
+// checkPrice is the one rule a model's per-Mtok price must satisfy: a finite,
+// non-negative float. It is shared by the model write path — refusals belong
+// where the operator typed the value, answered as a 400 — and by RunCost (via
+// Report), because the write path is not the last line: a row can predate the
+// guard or be written by raw SQL, the same layering as checkReach in the
+// provider package.
+//
+// Negatives are refused because a negative price makes spend fall (and wins
+// placement's cost ordering); NaN and ±Inf because they are not amounts. NaN is
+// the one the old `v < 0` test could not see.
+func checkPrice(name string, v float64) error {
+	switch {
+	case math.IsNaN(v):
+		return fmt.Errorf("%s must be a finite number (got NaN)", name)
+	case math.IsInf(v, 0):
+		return fmt.Errorf("%s must be a finite number (got %v)", name, v)
+	case v < 0:
+		return fmt.Errorf("%s must not be negative", name)
+	}
+	return nil
 }
 
 // ModelSpend is one model's share of today's ledger: the wire name its runs
@@ -491,10 +539,18 @@ func spendByModel(ctx context.Context, db *sql.DB, dayStart int64) ([]ModelSpend
 // the key, which is loud and local — the config row is writable only by this
 // package and by hand, so a broken value is a bug or a raw-SQL edit, and both
 // want to be seen.
+//
+// a row that EXISTS with an empty or whitespace value is a broken value, not a
+// missing one: parsing it as 0 would turn a raw-SQL `INSERT ... VALUES
+// ('daily_spend_ceiling',”)` into "unlimited" — the one fail-open left in a
+// function built to fail closed.
 func readCeiling(ctx context.Context, q spendReader) (float64, error) {
-	raw, err := readConfigValue(ctx, q, configDailySpendCeiling)
+	raw, present, err := readConfigValuePresent(ctx, q, configDailySpendCeiling)
 	if err != nil {
 		return 0, err
+	}
+	if !present {
+		return 0, nil
 	}
 	return parseAmount(configDailySpendCeiling, raw)
 }
@@ -502,7 +558,7 @@ func readCeiling(ctx context.Context, q spendReader) (float64, error) {
 func parseAmount(key, raw string) (float64, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return 0, nil
+		return 0, fmt.Errorf("config %s is present but empty; 0 means unlimited and deleting the key restores the default", key)
 	}
 	v, err := strconv.ParseFloat(raw, 64)
 	if err != nil {
@@ -517,13 +573,21 @@ func parseAmount(key, raw string) (float64, error) {
 // readConfigValue reads one config row. Absent is the empty string: every key
 // this file reads spells its "not configured" state that way.
 func readConfigValue(ctx context.Context, q spendReader, key string) (string, error) {
+	raw, _, err := readConfigValuePresent(ctx, q, key)
+	return raw, err
+}
+
+// readConfigValuePresent distinguishes absent from empty, which most callers do
+// not need (a pause is "any non-empty value") but readCeiling does: an empty
+// ceiling row is an error while a missing one is the default.
+func readConfigValuePresent(ctx context.Context, q spendReader, key string) (value string, present bool, err error) {
 	var raw string
-	err := q.QueryRowContext(ctx, `SELECT value FROM config WHERE key=?`, key).Scan(&raw)
+	err = q.QueryRowContext(ctx, `SELECT value FROM config WHERE key=?`, key).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
+		return "", false, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read config %s: %w", key, err)
+		return "", false, fmt.Errorf("read config %s: %w", key, err)
 	}
-	return raw, nil
+	return raw, true, nil
 }

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"reflect"
 	"strings"
 )
 
@@ -146,6 +147,27 @@ type Provider interface {
 	Complete(ctx context.Context, req Request) (Response, error)
 	EstimateTokens(req Request) int
 	Probe(ctx context.Context) (Health, error)
+}
+
+// IsNil reports whether p is absent, including the case a plain `p == nil`
+// comparison cannot see: a constructor that returns a typed nil pointer (a nil
+// *SomeAdapter) stores a NON-nil interface value, and the first method call on
+// it dereferences a nil receiver. Construction is where that must be refused,
+// not the claim whose adapter panics.
+//
+// It lives here rather than in each constructor caller so both construction
+// paths — Registry.New and the executor's test seam — share one rule.
+func IsNil(p Provider) bool {
+	if p == nil {
+		return true
+	}
+	v := reflect.ValueOf(p)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
 }
 
 // ErrEgressRefused is returned when a request requires a local endpoint and the

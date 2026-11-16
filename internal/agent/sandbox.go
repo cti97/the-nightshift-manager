@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -297,29 +298,94 @@ func (s *Sandbox) Stat(name string) (os.FileInfo, error) {
 	return info, nil
 }
 
-// ListDir lists one directory inside the run directory, sorted by name.
-func (s *Sandbox) ListDir(name string) ([]os.DirEntry, error) {
+// dirReadBatch is how many directory entries one ListDir call reads at a time.
+// The listing is streamed, not read whole: the tool caps its OUTPUT at 500
+// entries, and the memory this method holds must be bounded by the same kind of
+// number rather than by the directory's size.
+const dirReadBatch = 256
+
+// dirEntryMaxHeap holds the `limit` smallest names seen so far. The root is the
+// LARGEST kept entry, which is the one a newly seen smaller name replaces.
+// A max-heap is what makes "the first 500 by name" a bounded-memory question
+// instead of "read everything, sort, slice".
+type dirEntryMaxHeap []os.DirEntry
+
+func (h dirEntryMaxHeap) Len() int           { return len(h) }
+func (h dirEntryMaxHeap) Less(i, j int) bool { return h[i].Name() > h[j].Name() }
+func (h dirEntryMaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *dirEntryMaxHeap) Push(x any)        { *h = append(*h, x.(os.DirEntry)) }
+func (h *dirEntryMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	entry := old[n-1]
+	*h = old[:n-1]
+	return entry
+}
+
+// ListDir lists one directory inside the run directory: at most limit entries,
+// the smallest by name, sorted, plus the total number of entries that were
+// there. A bound is a parameter because the number belongs to the caller's
+// output policy (list_dir's 500-entry cap), not to the filesystem layer; a
+// limit of zero or less returns no entries but still counts them.
+//
+// The directory is read in dirReadBatch-sized batches and only the kept window
+// is retained, so memory is O(limit + dirReadBatch) whatever the directory's
+// size. os.File.ReadDir(-1) would make it O(entries) — the old behaviour, where
+// the output was bounded but the memory was not. The full count is still exact:
+// every entry is visited, none is stored unless it is one of the smallest
+// `limit` so far.
+func (s *Sandbox) ListDir(name string, limit int) ([]os.DirEntry, int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
-		return nil, ErrSandboxClosed
+		return nil, 0, ErrSandboxClosed
 	}
 	clean, err := confinedPath(name)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	f, err := s.root.Open(clean)
 	if err != nil {
-		return nil, fmt.Errorf("sandbox: list %q: %w", name, err)
+		return nil, 0, fmt.Errorf("sandbox: list %q: %w", name, err)
 	}
 	defer f.Close()
 
-	entries, err := f.ReadDir(-1)
-	if err != nil {
-		return nil, fmt.Errorf("sandbox: list %q: %w", name, err)
+	capacity := limit
+	if capacity < 0 {
+		capacity = 0
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	return entries, nil
+	kept := make(dirEntryMaxHeap, 0, capacity)
+	total := 0
+	for {
+		batch, readErr := f.ReadDir(dirReadBatch)
+		for _, entry := range batch {
+			total++
+			if limit <= 0 {
+				continue
+			}
+			if len(kept) < limit {
+				heap.Push(&kept, entry)
+				continue
+			}
+			if entry.Name() < kept[0].Name() {
+				heap.Pop(&kept)
+				heap.Push(&kept, entry)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, 0, fmt.Errorf("sandbox: list %q: %w", name, readErr)
+		}
+		if len(batch) == 0 {
+			// ReadDir with n > 0 promises an error rather than an empty, nil
+			// batch; this guards a future implementation that does not.
+			break
+		}
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].Name() < kept[j].Name() })
+	return kept, total, nil
 }
 
 // Command builds a command that runs inside the sandbox: the run directory as

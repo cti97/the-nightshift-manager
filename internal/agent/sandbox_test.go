@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,7 +79,7 @@ func TestSandboxCannotReachTheHomeDirectory(t *testing.T) {
 	if err := sb.WriteFile(key, []byte("x"), 0o600); err == nil {
 		t.Fatalf("WriteFile(%q) succeeded; the tool layer must refuse paths outside the run directory", key)
 	}
-	if _, err := sb.ListDir(key); err == nil {
+	if _, _, err := sb.ListDir(key, 100); err == nil {
 		t.Fatalf("ListDir(%q) succeeded; the tool layer must refuse paths outside the run directory", key)
 	}
 
@@ -88,7 +89,7 @@ func TestSandboxCannotReachTheHomeDirectory(t *testing.T) {
 	if err := os.Symlink(home, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	if _, err := sb.ListDir("home-link"); err == nil {
+	if _, _, err := sb.ListDir("home-link", 100); err == nil {
 		t.Fatal("ListDir through a symlink to the home directory succeeded")
 	}
 
@@ -183,11 +184,11 @@ func TestSandboxPathCannotEscape(t *testing.T) {
 		if err := sb.WriteFile(name, []byte("pwned"), 0o600); err == nil {
 			t.Errorf("WriteFile(%q) succeeded; want a refusal", name)
 		}
-		if _, err := sb.ListDir(name); err == nil {
+		if _, _, err := sb.ListDir(name, 100); err == nil {
 			t.Errorf("ListDir(%q) succeeded; want a refusal", name)
 		}
 	}
-	if _, err := sb.ListDir("."); err != nil {
+	if _, _, err := sb.ListDir(".", 100); err != nil {
 		t.Fatalf("ListDir(%q): %v; the run directory itself must be listable", sb.Dir(), err)
 	}
 	// Nothing was written through the escape hatch.
@@ -450,7 +451,7 @@ func TestSandboxReadWriteListRoundTrip(t *testing.T) {
 	if err != nil || string(data) != "hello" {
 		t.Fatalf("ReadFile = %q, %v", data, err)
 	}
-	entries, err := sb.ListDir("a/b")
+	entries, _, err := sb.ListDir("a/b", 100)
 	if err != nil {
 		t.Fatalf("ListDir: %v", err)
 	}
@@ -464,7 +465,7 @@ func TestSandboxReadWriteListRoundTrip(t *testing.T) {
 	if err := sb.WriteFile("top.txt", []byte("t"), 0o600); err != nil {
 		t.Fatalf("WriteFile top: %v", err)
 	}
-	entries, err = sb.ListDir(".")
+	entries, _, err = sb.ListDir(".", 100)
 	if err != nil {
 		t.Fatalf("ListDir(.): %v", err)
 	}
@@ -478,8 +479,55 @@ func TestSandboxReadWriteListRoundTrip(t *testing.T) {
 			t.Fatalf("ListDir(.) = %v, want it to contain %q", names, want)
 		}
 	}
-	if _, err := sb.ListDir("does-not-exist"); err == nil {
+	if _, _, err := sb.ListDir("does-not-exist", 100); err == nil {
 		t.Fatal("ListDir of a missing directory succeeded")
+	}
+}
+
+// TestListDirBoundsWhatItMaterialises pins B6. list_dir's output was capped at
+// 500 entries but the sandbox returned every entry first, so a directory with a
+// million files was a million os.DirEntry values in memory before the first
+// line was rendered. The sandbox now takes a bound and streams the directory in
+// batches, keeping only the smallest `limit` names plus a running total.
+func TestListDirBoundsWhatItMaterialises(t *testing.T) {
+	sb := newTestSandbox(t, SandboxConfig{})
+	const limit = 500
+	const extra = 2_000
+	for i := 0; i < extra; i++ {
+		if err := os.WriteFile(filepath.Join(sb.Dir(), fmt.Sprintf("e%05d", i)), nil, 0o644); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+	}
+
+	entries, total, err := sb.ListDir(".", limit)
+	if err != nil {
+		t.Fatalf("ListDir: %v", err)
+	}
+	if total != extra+1 { // + the sandbox's own "tmp"
+		t.Fatalf("ListDir counted %d entries, want %d", total, extra+1)
+	}
+	if len(entries) != limit {
+		t.Fatalf("ListDir returned %d entries, want exactly %d: the listing must be bounded at the source, not after materialising", len(entries), limit)
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i-1].Name() > entries[i].Name() {
+			t.Fatalf("entries[%d]=%q > entries[%d]=%q; a bounded listing still sorts", i-1, entries[i-1].Name(), i, entries[i].Name())
+		}
+	}
+	if first, last := entries[0].Name(), entries[len(entries)-1].Name(); first != "e00000" || last != "e00499" {
+		t.Fatalf("bounded listing runs %q..%q, want the 500 smallest names e00000..e00499", first, last)
+	}
+
+	// A directory smaller than the bound is returned whole, with its true count.
+	if err := os.RemoveAll(filepath.Join(sb.Dir(), "e00001")); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	entries, total, err = sb.ListDir(".", 10_000)
+	if err != nil {
+		t.Fatalf("ListDir with a large bound: %v", err)
+	}
+	if total != extra || len(entries) != total {
+		t.Fatalf("ListDir = %d entries of %d, want all %d below the bound", len(entries), total, extra)
 	}
 }
 

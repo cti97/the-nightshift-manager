@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -60,6 +61,12 @@ const (
 	// refuses to append the output and tells the model so, instead of sending
 	// it (Task 11's hand-off 2).
 	maxToolOutputBytes = 64 << 10
+
+	// maxToolErrorBytes bounds the tool's error text carried by that refusal.
+	// The error is a fact the model needs ("exit status 1", a timeout), but an
+	// unbounded error string would turn the small refusal into the same context
+	// bomb it exists to prevent.
+	maxToolErrorBytes = 2 << 10
 )
 
 // ErrStepCap and ErrTokenBudget are the two ways a run can end without a finish
@@ -351,7 +358,10 @@ func (e *AgenticExecutor) providerFor(item board.ClaimedItem) (provider.Provider
 	if err != nil {
 		return nil, "", fmt.Errorf("agent: endpoint %q: %w", ep.Name, err)
 	}
-	if p == nil {
+	if provider.IsNil(p) {
+		// The registry guards this too; the test seam does not go through it,
+		// and one rule for "a constructor returned nothing" is better than two
+		// spellings that can disagree (a typed nil is not `p == nil`).
 		return nil, "", fmt.Errorf("agent: endpoint %q: provider constructor returned no provider", ep.Name)
 	}
 	return p, item.Model.ModelID, nil
@@ -495,7 +505,26 @@ type tokenMeter struct {
 }
 
 func (m *tokenMeter) reserve(estimatedPrompt, maxOutput int) error {
-	reservation := estimatedPrompt + maxOutput
+	// Both operands are clamped non-negative before any arithmetic. The
+	// subtraction below is then safe: maxOutput >= 0 means MaxInt-maxOutput is
+	// the smallest it can be, so this check cannot itself wrap.
+	if estimatedPrompt < 0 {
+		estimatedPrompt = 0
+	}
+	if maxOutput < 0 {
+		maxOutput = 0
+	}
+	var reservation int
+	if estimatedPrompt > math.MaxInt-maxOutput {
+		// An absurd estimate plus the reply cap would wrap negative, and the
+		// `reservation < 1` floor below would turn that overflow into a
+		// one-token reservation — a budget bypass in the one function that must
+		// not have one. The saturated value is necessarily over any sane
+		// remaining budget, so it is refused below like any other overrun.
+		reservation = math.MaxInt
+	} else {
+		reservation = estimatedPrompt + maxOutput
+	}
 	if reservation < 1 {
 		reservation = 1
 	}
@@ -584,6 +613,12 @@ func unknownToolMessage(name string) string {
 // carries the output AND the error: a compiler's stderr and "exit status 1" are
 // one fact, and showing only the error throws away the diagnostics. finish
 // never reaches this function — it is the loop's control signal.
+//
+// An oversized result is refused whole, because half a file is worse than a
+// pointer to it. But the refusal still carries the ERROR: a failing shell that
+// printed 64 KiB used to be reduced to "over the cap", so the model was told
+// its command was too loud and never told it had failed — it would retry or,
+// worse, report the work as done. Two facts are cheap; losing one is not.
 func toolResultContent(name, out string, err error) string {
 	content := out
 	if err != nil {
@@ -597,9 +632,25 @@ func toolResultContent(name, out string, err error) string {
 		content = fmt.Sprintf("agent: %s returned no output", name)
 	}
 	if len(content) > maxToolOutputBytes {
-		return fmt.Sprintf(
-			"agent: %s produced %d bytes of output, which is over the %d-byte tool-output cap, so it was not put into the conversation: it would spend the run's context on text you cannot read. Read the file in parts, list a narrower directory, or use shell to extract only what you need.",
+		msg := fmt.Sprintf(
+			"agent: %s returned %d bytes (output plus error), which is over the %d-byte tool-output cap, so it was not put into the conversation: it would spend the run's context on text you cannot read. Read the file in parts, list a narrower directory, or use shell to extract only what you need.",
 			name, len(content), maxToolOutputBytes)
+		if err != nil {
+			msg += " The tool also failed: " + boundedToolError(err)
+		}
+		return msg
 	}
 	return content
+}
+
+// boundedToolError keeps the error text short enough to travel alongside the
+// over-cap refusal without re-creating the size problem by another route.
+func boundedToolError(err error) string {
+	text := err.Error()
+	if len(text) <= maxToolErrorBytes {
+		return text
+	}
+	// Cutting at a byte boundary can split a UTF-8 sequence; ToValidUTF8 drops
+	// the fragment, so the model never receives an invalid string.
+	return strings.ToValidUTF8(text[:maxToolErrorBytes], "") + "..."
 }

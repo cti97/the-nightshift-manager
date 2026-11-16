@@ -113,7 +113,13 @@ func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, 
 	// been spent, or the number the dashboard showed yesterday would move
 	// underneath the operator and a typo'd price would retroactively trip the
 	// ceiling. See RunCost for how reserved tokens are priced.
-	cost := RunCost(req.TokensIn, req.TokensOut, req.ReservedTokens, costIn, costOut)
+	cost, err := RunCost(req.TokensIn, req.TokensOut, req.ReservedTokens, costIn, costOut)
+	if err != nil {
+		// The run is left live and unpriced rather than settled with a number
+		// the ledger cannot add up. Report fails closed here; pricing at zero
+		// would silently make a corrupt model free for the rest of the day.
+		return ReportResult{}, fmt.Errorf("run %s: %w", runID, err)
+	}
 
 	// Both writes carry the live-status predicate and both check their row
 	// count. The read above and these writes are separate statements, so a

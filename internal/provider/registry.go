@@ -126,8 +126,12 @@ func (r *Registry) New(cfg Config) (Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("provider %q: %w", cfg.Provider, err)
 	}
-	if p == nil {
-		return nil, fmt.Errorf("provider %q: constructor returned no provider", cfg.Provider)
+	if IsNil(p) {
+		// Not `p == nil`: a constructor that returns a typed nil pointer stores
+		// a non-nil interface, and every later method call panics. Refusing
+		// here moves that crash from the first claim to construction, where the
+		// constructor and the endpoint are still in scope.
+		return nil, fmt.Errorf("provider %q: constructor returned a nil provider", cfg.Provider)
 	}
 	// A provider's Name is what dispatch and the endpoint row believe they are
 	// talking to. A copy-pasted Name() that disagrees with its registration key

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -268,6 +269,36 @@ func TestCeilingOfZeroMeansUnlimited(t *testing.T) {
 	}
 }
 
+// TestPresentButEmptyCeilingIsAnError pins the one fail-open left in a function
+// built to fail closed. "Absent" means unlimited — an unconfigured board runs —
+// but a row that EXISTS with an empty or whitespace value is a broken value, not
+// a missing one. Before this, parseAmount trimmed it to "" and returned 0, so a
+// raw-SQL `INSERT ... VALUES ('daily_spend_ceiling',”)` silently disabled the
+// ceiling: the exact typo readCeiling's doc says must be an error.
+func TestPresentButEmptyCeilingIsAnError(t *testing.T) {
+	for _, raw := range []string{"", " ", "\t \n"} {
+		t.Run(fmt.Sprintf("%q", raw), func(t *testing.T) {
+			db, clock := newTestDB(t)
+			node, _ := seedClaimableBoard(t, db, clock)
+			if _, err := db.Exec(`INSERT INTO config(key,value) VALUES (?,?)`,
+				configDailySpendCeiling, raw); err != nil {
+				t.Fatalf("seed a broken ceiling row: %v", err)
+			}
+
+			if _, err := TodaySpend(context.Background(), db, clock); err == nil {
+				t.Fatal("TodaySpend treated a present-but-empty ceiling as unlimited")
+			}
+			got, err := Claim(context.Background(), db, clock, node, 1)
+			if err == nil {
+				t.Fatalf("Claim issued %d items under an empty ceiling; the safety mechanism is off", len(got))
+			}
+			if !strings.Contains(err.Error(), configDailySpendCeiling) {
+				t.Fatalf("Claim error = %q, want it to name %q", err, configDailySpendCeiling)
+			}
+		})
+	}
+}
+
 // ---- the design point: the ledger is the truth, not a counter ------------
 
 // TestSpendIsComputedFromRunsNotACounter is the task's headline invariant. A
@@ -366,6 +397,86 @@ func TestReportPricesARunFromTheModelCosts(t *testing.T) {
 	}
 }
 
+// TestReportRefusesToPriceWithANonFiniteModelPrice is the second half of the
+// non-finite-price guard. The model write path refuses to create this row, but
+// a row can predate that guard or arrive by raw SQL, and report time is the
+// last point before a number enters the ledger.
+//
+// Before this guard the write path stored the row and the report then failed by
+// accident, with an error that named neither the price nor the model: ±Inf at
+// the audit payload's JSON encoder, NaN at the NOT NULL cost column (SQLite
+// stores NaN as NULL). The run stayed live and unsettleable, and the operator
+// was pointed at the event writer. The ledger never actually held NaN only
+// because of that storage accident; RunCost is where the rule now lives, so the
+// next storage layer does not have to be lucky. -Inf is the worst of the three:
+// ceilingReached is `spent >= ceiling`, so a negative infinity never reaches a
+// ceiling and the board issues work all day.
+func TestReportRefusesToPriceWithANonFiniteModelPrice(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		price float64
+	}{
+		{"+Inf input price", math.Inf(1)},
+		{"-Inf input price", math.Inf(-1)},
+		{"+Inf output price", math.Inf(1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, clock := newTestDB(t)
+			ctx := context.Background()
+			node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+			seedPricedEndpointForTest(t, db, clock, "priced", 3, 15, "tools")
+			mustCreateItem(t, db, clock, "priced work")
+
+			got := mustClaim(t, db, clock, node, 1)
+			if len(got) != 1 {
+				t.Fatalf("claimed %d items, want 1", len(got))
+			}
+			runID := got[0].RunID
+			if err := StartRun(ctx, db, clock, runID, node); err != nil {
+				t.Fatalf("StartRun: %v", err)
+			}
+
+			// Raw SQL, because CreateModel and PatchModel now refuse this. The
+			// point is a row the guards did not write.
+			column := "cost_in_per_mtok"
+			if strings.Contains(tc.name, "output") {
+				column = "cost_out_per_mtok"
+			}
+			if _, err := db.Exec(`UPDATE models SET `+column+`=?`, tc.price); err != nil {
+				t.Fatalf("seed a non-finite price: %v", err)
+			}
+
+			_, err := Report(ctx, db, clock, runID, node, ReportRequest{
+				Status: "ok", TokensIn: 1_000_000, TokensOut: 1_000_000,
+			})
+			if err == nil {
+				t.Fatal("Report settled a run against a non-finite model price; the ledger now carries infinity")
+			}
+			// And it must NAME the cause. Before the guard it was an accidental
+			// refusal from the audit payload's JSON encoder ("marshal event
+			// payload: json: unsupported value: +Inf"), which sent the operator
+			// looking at the event writer, not at the model's price.
+			if !strings.Contains(err.Error(), "finite") || !strings.Contains(err.Error(), column) {
+				t.Fatalf("error = %q, want a refusal naming the non-finite model price (%s)", err, column)
+			}
+
+			// Failed closed: the run is still live and no cost was frozen.
+			var status string
+			var cost sql.NullFloat64
+			if err := db.QueryRow(`SELECT status, cost_estimate FROM runs WHERE id=?`, runID).
+				Scan(&status, &cost); err != nil {
+				t.Fatalf("read the run after the refused report: %v", err)
+			}
+			if status != "running" {
+				t.Fatalf("run status = %q after a refused report, want it still running", status)
+			}
+			if cost.Valid && (math.IsNaN(cost.Float64) || math.IsInf(cost.Float64, 0)) {
+				t.Fatalf("cost_estimate = %v was frozen from a non-finite price", cost.Float64)
+			}
+		})
+	}
+}
+
 // TestCostEstimateIsFrozenAtReportTime pins the second self-review question.
 // Frozen, not recomputed: a price edit must not rewrite what a day already
 // cost, or an operator fixing a typo would retroactively trip the ceiling and
@@ -457,10 +568,50 @@ func TestRunCostPricing(t *testing.T) {
 		{"no tokens costs nothing", 0, 0, 0, 75, 75, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := RunCost(tc.in, tc.out, tc.reserved, tc.costIn, tc.costOut); got != tc.want {
+			got, err := RunCost(tc.in, tc.out, tc.reserved, tc.costIn, tc.costOut)
+			if err != nil {
+				t.Fatalf("RunCost(%d, %d, %d, %v, %v): %v", tc.in, tc.out, tc.reserved, tc.costIn, tc.costOut, err)
+			}
+			if got != tc.want {
 				t.Fatalf("RunCost = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRunCostRejectsCorruptPrices pins the pricing half of B2. The write path
+// refuses these prices too, but the ledger's own function must not depend on
+// every future writer remembering that: it is the last place before a number
+// becomes spend. A NaN price used to produce a NaN cost with no error, and an
+// Inf price an infinite one; a negative price silently REDUCED the day's spend.
+func TestRunCostRejectsCorruptPrices(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		costIn  float64
+		costOut float64
+		want    string
+	}{
+		{"NaN input price", math.NaN(), 1, "cost_in_per_mtok"},
+		{"NaN output price", 1, math.NaN(), "cost_out_per_mtok"},
+		{"+Inf input price", math.Inf(1), 1, "finite"},
+		{"-Inf output price", 1, math.Inf(-1), "finite"},
+		{"negative input price", -1, 1, "negative"},
+		{"negative output price", 1, -1, "negative"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cost, err := RunCost(1_000_000, 1_000_000, 0, tc.costIn, tc.costOut)
+			if err == nil {
+				t.Fatalf("RunCost(..., %v, %v) = %v, nil; a corrupt price must not reach the ledger", tc.costIn, tc.costOut, cost)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to name %q", err, tc.want)
+			}
+		})
+	}
+
+	// Two finite values whose product overflows are not an amount either.
+	if cost, err := RunCost(math.MaxInt, math.MaxInt, 0, 1e300, 1e300); err == nil {
+		t.Fatalf("RunCost with an overflowing result = %v, nil; +Inf is not a ledger amount", cost)
 	}
 }
 

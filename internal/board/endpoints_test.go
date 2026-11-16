@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -536,6 +537,32 @@ func TestCreateModelRejectsNegativeNumbers(t *testing.T) {
 	}
 }
 
+func TestCreateModelRejectsNonFiniteNumbers(t *testing.T) {
+	// A NaN price is not negative, so the old "< 0" check let it through. Once
+	// stored it would price runs as NaN (or NULL), and ceilingReached would be
+	// false forever while unpriced_runs stayed blind. An infinite price is the
+	// same class of corrupt number: the ledger becomes infinity.
+	db, clock := newTestDB(t)
+	ep := endpointFixture(t, db, clock)
+
+	cases := map[string]CreateModelRequest{
+		"NaN input price":  {EndpointID: ep.ID, ModelID: "m1", CostInPerMtok: math.NaN()},
+		"NaN output price": {EndpointID: ep.ID, ModelID: "m2", CostOutPerMtok: math.NaN()},
+		"+Inf input price": {EndpointID: ep.ID, ModelID: "m3", CostInPerMtok: math.Inf(1)},
+		"-Inf output":      {EndpointID: ep.ID, ModelID: "m4", CostOutPerMtok: math.Inf(-1)},
+	}
+	for name, req := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := CreateModel(context.Background(), db, clock, req); err == nil {
+				t.Fatalf("CreateModel(%+v) accepted a non-finite price", req)
+			}
+		})
+	}
+	if n := countRows(t, db, "models"); n != 0 {
+		t.Fatalf("%d model rows, want 0: a refused price must not be stored", n)
+	}
+}
+
 func TestCreateModelRejectsDuplicateOnTheSameEndpoint(t *testing.T) {
 	db, clock := newTestDB(t)
 	ep := endpointFixture(t, db, clock)
@@ -765,6 +792,38 @@ func TestPatchModelRejectsNegativeNumbers(t *testing.T) {
 	}
 	if after := mustGetModel(t, db, "m1"); after.CostInPerMtok != 1 {
 		t.Fatalf("cost = %v after a rejected PATCH, want 1", after.CostInPerMtok)
+	}
+}
+
+func TestPatchModelRejectsNonFiniteNumbers(t *testing.T) {
+	// The PATCH path validates inline rather than through checkModelNumbers, so
+	// it needs the same finite rule. A NaN or infinite price written here is
+	// just as invisible as one written at creation, and the run that prices
+	// against it comes later.
+	db, clock := newTestDB(t)
+	ep := endpointFixture(t, db, clock)
+	m := mustCreateModel(t, db, clock, CreateModelRequest{
+		EndpointID: ep.ID, ModelID: "m1", CostInPerMtok: 1, CostOutPerMtok: 2,
+	})
+
+	for _, tc := range []struct {
+		name string
+		req  PatchModelRequest
+	}{
+		{"NaN input price", PatchModelRequest{CostInPerMtok: floatPtr(math.NaN())}},
+		{"NaN output price", PatchModelRequest{CostOutPerMtok: floatPtr(math.NaN())}},
+		{"+Inf input price", PatchModelRequest{CostInPerMtok: floatPtr(math.Inf(1))}},
+		{"-Inf output price", PatchModelRequest{CostOutPerMtok: floatPtr(math.Inf(-1))}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := PatchModel(context.Background(), db, clock, m.ID, tc.req); err == nil {
+				t.Fatalf("PATCH(%+v) accepted a non-finite price", tc.req)
+			}
+		})
+	}
+	after := mustGetModel(t, db, "m1")
+	if after.CostInPerMtok != 1 || after.CostOutPerMtok != 2 {
+		t.Fatalf("stored prices = %v/%v after rejected PATCHes, want 1/2", after.CostInPerMtok, after.CostOutPerMtok)
 	}
 }
 
