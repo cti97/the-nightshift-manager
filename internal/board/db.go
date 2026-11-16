@@ -43,10 +43,10 @@ var migrations = []migration{
 	// watches tables; the version below follows from the list.
 	//
 	// Upgrade note: nothing here backfills runs.cost_estimate. A run settled by
-	// a binary from before pricing (schema version 1) carries 0, so upgrading
-	// mid-day makes that day's earlier spend invisible until UTC midnight. That
-	// is the frozen-ledger rule working as designed — history is not recomputed —
-	// not a migration bug.
+	// a binary from before pricing (schema version 1 or 2 — pricing shipped with
+	// version 3) carries 0, so upgrading mid-day makes that day's earlier spend
+	// invisible until UTC midnight. That is the frozen-ledger rule working as
+	// designed — history is not recomputed — not a migration bug.
 	{version: 3, script: schema3},
 }
 

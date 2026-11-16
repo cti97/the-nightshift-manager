@@ -149,9 +149,9 @@ func TestWhySaysATerminalItemIsFinished(t *testing.T) {
 				t.Fatal("why has no blocked_reason for a terminal item")
 			}
 			// The placement verdict survives: the one candidate is eligible, so
-			// the answer still names the node and model it would have used.
-			if !strings.Contains(ex.Reason, "on a via local-model") {
-				t.Fatalf("reason = %q, want the placement it would have received named", ex.Reason)
+			// the answer still names the node and model it would use today.
+			if !strings.Contains(ex.Reason, "placement against today's board") || !strings.Contains(ex.Reason, "on a via local-model") {
+				t.Fatalf("reason = %q, want today's placement named", ex.Reason)
 			}
 
 			// The wire is what an operator reads, so assert the field that used
@@ -197,7 +197,7 @@ func TestWhyKeepsThePlacementExplanationForAnUnplaceableTerminalItem(t *testing.
 	if ex.Placed {
 		t.Fatal("why says placed:true for a finished item with no online candidate")
 	}
-	if !strings.Contains(ex.Reason, "even if it were still open it could not be placed") {
+	if !strings.Contains(ex.Reason, "even against today's board it could not be placed") {
 		t.Fatalf("reason = %q, want the placement failure kept alongside the finished status", ex.Reason)
 	}
 	if len(ex.Rejects) == 0 || !strings.Contains(ex.Rejects[0].Why, "offline") {

@@ -261,13 +261,14 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	// started after this point does not receive the token in its environment.
 	// It is NOT what scrubs the sandbox: Sandbox.Command builds its children's
 	// environment from a fixed list (sandboxEnv), so a command the shell tool
-	// starts never inherits this process's environment whether or not the
-	// variable was unset. The Unsetenv and the sandbox are independent layers.
-	// It also does NOT hide the token from the process table:
-	// /proc/<pid>/environ reports the exec-time environment block and
-	// unsetenv(3) only edits the in-process environ, so on Linux a process the
-	// kernel permits to read us can still see it (and ps e where permitted).
-	// This is defense in depth, not the sandbox.
+	// starts gets a constructed environment rather than this process's, whether
+	// or not the variable was unset. The one value sandboxEnv reads from the
+	// parent is the Windows SystemRoot path, which is not a credential. The
+	// Unsetenv and the sandbox are independent layers. It also does NOT hide the
+	// token from the process table: /proc/<pid>/environ reports the exec-time
+	// environment block and unsetenv(3) only edits the in-process environ, so on
+	// Linux a process the kernel permits to read us can still see it (and ps e
+	// where permitted). This is defense in depth, not the sandbox.
 	_ = os.Unsetenv("NSM_NODE_TOKEN")
 
 	return agent.Config{

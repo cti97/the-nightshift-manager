@@ -56,9 +56,12 @@ type Explanation struct {
 // corruptCandidatesClause is the blocked_reason half of an A4 warning. It names
 // the corruption inline so an operator reading only blocked_reason is not told
 // "no eligible candidate" while a candidate was actually skipped; Warnings
-// carries every row in full. When the item still places, blocked_reason stays
-// empty: the answer is not degraded in its verdict, only in the set of options
-// behind it, and the warning list already says so.
+// carries every row in full. When an OPEN item still places, blocked_reason
+// stays empty: the answer is not degraded in its verdict, only in the set of
+// options behind it, and the warning list already says so. A terminal item
+// always carries a blocked_reason (it is finished), so the clause is appended
+// there too, even when placement would have succeeded: a finished status does
+// not make a skipped candidate less broken.
 func corruptCandidatesClause(rows []CorruptRow) string {
 	switch len(rows) {
 	case 0:
@@ -89,13 +92,16 @@ func terminalStatus(status string) bool {
 // a caller must act on — the item is finished and cannot be claimed — and keeps
 // the placement explanation, because an operator may still want to know whether
 // it would have placed. The two facts are separated by punctuation, not merged:
-// "already done" must not be readable as "done, and also placeable".
+// "already done" must not be readable as "done, and also placeable". The
+// placement shown is computed against the board as it is now (Explain's own
+// premise), not as it was when the item ran, and the wording says "today's
+// board" so the tense cannot imply otherwise.
 func terminalReason(itemID, status string, d Decision) string {
 	reason := fmt.Sprintf("item %s is already %s, so it is finished and cannot be claimed", itemID, status)
 	if d.OK {
-		return reason + "; the placement it would have received: " + d.Reason
+		return reason + "; placement against today's board would give it: " + d.Reason
 	}
-	return reason + "; even if it were still open it could not be placed: " + d.Reason
+	return reason + "; even against today's board it could not be placed: " + d.Reason
 }
 
 // Explain answers for one item by re-running placement against the board as it
@@ -152,13 +158,17 @@ func Explain(ctx context.Context, db *sql.DB, clock Clock, itemID string) (Expla
 		ex.Reason = d.Reason
 		if !d.OK {
 			ex.BlockedReason = d.Reason
-			if clause := corruptCandidatesClause(warnings); clause != "" {
-				// Compose, do not replace: the placement failure and the skipped
-				// candidates are two facts. Saying only "no eligible candidate"
-				// would send the operator looking for a capability hole when the
-				// row that could have served the item is sitting there corrupt.
-				ex.BlockedReason += "; " + clause
-			}
+		}
+	}
+	// Compose, do not replace: a placement failure (or a finished status) and
+	// the skipped candidates are two facts. Saying only "no eligible candidate"
+	// would send the operator looking for a capability hole when the row that
+	// could have served the item is sitting there corrupt. This runs after BOTH
+	// branches: A4's note belongs in a terminal item's blocked_reason too, and
+	// dropping it there was C13's regression.
+	if ex.BlockedReason != "" {
+		if clause := corruptCandidatesClause(warnings); clause != "" {
+			ex.BlockedReason += "; " + clause
 		}
 	}
 

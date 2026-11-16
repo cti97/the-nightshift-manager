@@ -54,13 +54,15 @@ const (
 	// to `sqlite3` and survives a restart, and rewritten or deleted by
 	// reconcileCeiling whenever the projection changes.
 	//
-	// The VALUE is the reason as of the report that tripped the ceiling. Nothing
-	// reads its text to decide anything: the key's presence is the projection,
-	// paused_by is derived from the ledger, and the reason /why and the spend
-	// view serve is recomputed from today's spend by effectivePause. The stored
-	// sentence therefore describes the trip, not the current total, and can
-	// differ from what is served — it is also the "was" recorded on the resume
-	// event. It is not a second status, and the two must not be compared.
+	// The VALUE is the reason as of the evaluation that tripped the ceiling — a
+	// claim's gate or an admin SetDailySpendCeiling write, because
+	// reconcileCeiling runs in both. Nothing reads its text to decide anything:
+	// the key's presence is the projection, paused_by is derived from the ledger,
+	// and the reason /why and the spend view serve is recomputed from today's
+	// spend by effectivePause. The stored sentence therefore describes the trip,
+	// not the current total, and can differ from what is served — it is also the
+	// "was" recorded on the resume event. It is not a second status, and the two
+	// must not be compared.
 	configCeilingPaused = "spend_ceiling_paused"
 
 	// pauseByCeiling / pauseByOperator / pauseByBoth are the paused_by
@@ -396,12 +398,13 @@ func reconcileCeiling(ctx context.Context, q spendTx, clock Clock) (paused bool,
 			return false, "", err
 		}
 	case over:
-		// Already recorded. The stored reason is the report that tripped it, and
-		// it stays as the trip record and the presence marker: rewriting it every
-		// claim would make the record follow the total instead of the trip.
-		// effectivePause does not read it — the reason /why serves is recomputed
-		// from today's spend — so the stored sentence and the served one can
-		// disagree, by design rather than by drift.
+		// Already recorded. The stored reason is the evaluation that tripped it
+		// (a claim's gate or an admin ceiling write), and it stays as the trip
+		// record and the presence marker: rewriting it every claim would make the
+		// record follow the total instead of the trip. effectivePause does not
+		// read it — the reason /why serves is recomputed from today's spend — so
+		// the stored sentence and the served one can disagree, by design rather
+		// than by drift.
 	case mine != "":
 		if _, err := q.ExecContext(ctx,
 			`DELETE FROM config WHERE key=?`, configCeilingPaused); err != nil {

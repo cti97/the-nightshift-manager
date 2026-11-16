@@ -386,9 +386,9 @@ func TestAgenticExecutorCountsToolOutputBeforeTheNextRequest(t *testing.T) {
 // model produces.
 func TestAgenticExecutorNeverReportsSuccessWithoutFinish(t *testing.T) {
 	p := &testProvider{name: "acme", complete: func(call int, _ provider.Request) (provider.Response, error) {
-		// Stop deliberately says max_tokens: the seam documents no vocabulary
-		// for it and Task 5's note says not to branch on it, so a truncated
-		// reply is still a reply that did not call finish.
+		// Stop deliberately says max_tokens: the seam documents Stop as the
+		// adapter's own diagnostic vocabulary, never a decision input, so a
+		// truncated reply is still a reply that did not call finish.
 		return provider.Response{Content: "I am thinking about it.", Stop: "max_tokens", Usage: finishUsage()}, nil
 	}}
 	exec := newAgentic(t, p)

@@ -321,6 +321,78 @@ func TestWhyWithOnlyACorruptCandidateNamesItInsteadOfJustSayingNoCandidate(t *te
 	}
 }
 
+// A4 x C13: a terminal item must still carry the skipped-row note in
+// blocked_reason. The C13 terminal branch briefly replaced the placement failure
+// with "already done" and dropped corruptCandidatesClause, so an operator
+// reading only blocked_reason saw "no eligible candidate" while a corrupt row
+// sat behind it; warnings still carried the row, which is exactly the silent
+// drop A4 forbids. The healthy-candidate leg pins the other half: a terminal
+// item that would place still reports the row that was skipped.
+func TestWhyWithACorruptCandidateStillNamesItForATerminalItem(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		healthy      bool
+		wantPlaceErr bool
+	}{
+		{name: "only a corrupt candidate", wantPlaceErr: true},
+		{name: "a healthy candidate and a corrupt one", healthy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, clock := newServer(t)
+			ctx := context.Background()
+			if tc.healthy {
+				SeedNodeForTest(t, srv.db, clock, "healthy", "executor", "agentic")
+			}
+			corrupt := SeedNodeForTest(t, srv.db, clock, "corrupt", "executor", "agentic")
+			SeedEndpointForTest(t, srv.db, clock, "local", "host", 0, "tools")
+			itemID, err := CreateItem(ctx, srv.db, clock, CreateItemRequest{
+				Title: "t", Brief: "b", Needs: []string{"agentic"},
+			})
+			if err != nil {
+				t.Fatalf("CreateItem: %v", err)
+			}
+			if _, err := srv.db.ExecContext(ctx,
+				`UPDATE nodes SET provides_live='not-json' WHERE id=?`, corrupt); err != nil {
+				t.Fatalf("corrupt provides_live: %v", err)
+			}
+			if _, err := srv.db.ExecContext(ctx,
+				`UPDATE work_items SET status='done' WHERE id=?`, itemID); err != nil {
+				t.Fatalf("mark item done: %v", err)
+			}
+
+			rec := do(t, srv.Handler(), "GET", "/admin/why/"+itemID, testAdminToken)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("why for a terminal item with a corrupt candidate = %d, want 200 (body %s)", rec.Code, rec.Body)
+			}
+			var ex Explanation
+			if err := json.Unmarshal(rec.Body.Bytes(), &ex); err != nil {
+				t.Fatalf("decode why body: %v", err)
+			}
+			if ex.Placed {
+				t.Fatal("explanation says placed:true for a finished item")
+			}
+			if len(ex.Warnings) != 1 || ex.Warnings[0].RowID != corrupt || ex.Warnings[0].Column != "provides_live" {
+				t.Fatalf("warnings = %+v, want the corrupt node's provides_live row", ex.Warnings)
+			}
+			if !strings.Contains(ex.BlockedReason, "already done") {
+				t.Fatalf("blocked_reason = %q, want the finished status kept", ex.BlockedReason)
+			}
+			for _, want := range []string{"corrupt candidate row", corrupt, "provides_live"} {
+				if !strings.Contains(ex.BlockedReason, want) {
+					t.Fatalf("blocked_reason = %q, want it to name %q alongside the finished status", ex.BlockedReason, want)
+				}
+			}
+			if tc.wantPlaceErr {
+				if !strings.Contains(ex.BlockedReason, "no eligible candidate") {
+					t.Fatalf("blocked_reason = %q, want the placement failure kept", ex.BlockedReason)
+				}
+			} else if !strings.Contains(ex.BlockedReason, "placement against today's board") {
+				t.Fatalf("blocked_reason = %q, want the placement that would happen today kept", ex.BlockedReason)
+			}
+		})
+	}
+}
+
 // A2: corrupt rows must be enumerable without log retention or sqlite3. The
 // route lists every cell the claim path decodes, one entry per column, and it
 // is read-only: the cells, the row counts and the event log are unchanged after
