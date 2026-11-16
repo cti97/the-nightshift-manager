@@ -62,12 +62,14 @@ func mustWrite(t *testing.T, sb *Sandbox, name string, data []byte) {
 	}
 }
 
-// TestToolsAreTheSixAndHaveDescriptions is the brief's schema acceptance: a
-// closed set of six, stable order, every schema valid JSON, every tool carrying
+// TestToolsAreTheSevenAndHaveDescriptions is the brief's schema acceptance: a
+// closed set of seven, stable order, every schema valid JSON, every tool carrying
 // a description. A model with no description will misuse the tool; that is the
-// whole reason this is an assertion and not a comment.
-func TestToolsAreTheSixAndHaveDescriptions(t *testing.T) {
-	want := []string{ToolReadFile, ToolWriteFile, ToolListDir, ToolShell, ToolHTTPGet, ToolFinish}
+// whole reason this is an assertion and not a comment. M3 added
+// request_approval to the six: an escalation is not a capability, but it is still
+// a tool the model has to be told about.
+func TestToolsAreTheSevenAndHaveDescriptions(t *testing.T) {
+	want := []string{ToolReadFile, ToolWriteFile, ToolListDir, ToolShell, ToolHTTPGet, ToolRequestApproval, ToolFinish}
 	tools := Tools()
 	if len(tools) != len(want) {
 		t.Fatalf("Tools() has %d tools, want %d", len(tools), len(want))
@@ -1167,5 +1169,54 @@ func TestToolsTreatUnicodePathsAsNamesInsideTheRunDirectory(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(filepath.Dir(sb.Dir()), name)); err == nil {
 			t.Errorf("%q appeared outside the run directory", name)
 		}
+	}
+}
+
+// TestRequestApprovalValidatesTheQuestion is the tool-layer half of the board's
+// rule that an approval must name its action. A model that emits an empty action
+// or an empty choice gets a tool error and continues the run; it must not end the
+// run with a question nobody can answer.
+func TestRequestApprovalValidatesTheQuestion(t *testing.T) {
+	cases := []struct {
+		name string
+		args map[string]any
+		want string
+	}{
+		{"no action", map[string]any{"reason": "because"}, "needs both an action and a reason"},
+		{"blank action", map[string]any{"action": "   ", "reason": "because"}, "needs both an action and a reason"},
+		{"no reason", map[string]any{"action": "delete the cache"}, "needs both an action and a reason"},
+		{"blank option", map[string]any{"action": "a", "reason": "r", "options": []string{"ok", "  "}}, "option 2 is empty"},
+		{"too many options", map[string]any{"action": "a", "reason": "r",
+			"options": []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"}}, "limit is 10"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := callTool(t, context.Background(), nil, ToolRequestApproval, tc.args)
+			if err == nil {
+				t.Fatalf("request_approval accepted %v", tc.args)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to mention %q", err, tc.want)
+			}
+			var need *ApprovalNeeded
+			if errors.As(err, &need) {
+				t.Fatal("an invalid request ended the run; the model must get a tool error and continue")
+			}
+		})
+	}
+
+	// The valid case: values are trimmed and the run ends with the request.
+	_, err := callTool(t, context.Background(), nil, ToolRequestApproval, map[string]any{
+		"action": "  delete /var/cache/app ", "reason": " needs the disk ", "options": []string{" delete it "},
+	})
+	var need *ApprovalNeeded
+	if !errors.As(err, &need) {
+		t.Fatalf("valid request returned %v, want an ApprovalNeeded signal", err)
+	}
+	if need.Request.Action != "delete /var/cache/app" || need.Request.Reason != "needs the disk" {
+		t.Fatalf("request = %+v, want trimmed action and reason", need.Request)
+	}
+	if len(need.Request.Options) != 1 || need.Request.Options[0] != "delete it" {
+		t.Fatalf("options = %v, want the trimmed option", need.Request.Options)
 	}
 }

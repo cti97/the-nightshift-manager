@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,6 +134,144 @@ func finishResponse(id, summary string, usage provider.Usage) provider.Response 
 	return callResponse(id, ToolFinish, string(args), usage)
 }
 
+// --- request_approval -------------------------------------------------------
+
+// approvalResponse scripts one request_approval call.
+func approvalResponse(id, action, reason string, options ...string) provider.Response {
+	args, err := json.Marshal(map[string]any{"action": action, "reason": reason, "options": options})
+	if err != nil {
+		panic(err)
+	}
+	return callResponse(id, ToolRequestApproval, string(args), provider.Usage{In: 30, Out: 12})
+}
+
+// TestRequestApprovalEndsTheRunWithoutFurtherSteps is M3 Task 5's first half: the
+// tool is a control signal, not a tool result. The model is not told anything and
+// is not asked again — the run ends on the step that asked, and the provider is
+// never called a second time.
+func TestRequestApprovalEndsTheRunWithoutFurtherSteps(t *testing.T) {
+	p := &testProvider{name: "acme", complete: func(call int, _ provider.Request) (provider.Response, error) {
+		if call == 0 {
+			return approvalResponse("call-ask", "delete /var/cache/app", "it holds 40GB", "delete it", "keep it"), nil
+		}
+		return finishResponse("call-finish", "should never run", finishUsage()), nil
+	}}
+	exec := newAgentic(t, p)
+
+	res, err := exec.Run(context.Background(), claimedItem("run-1", "do it", "agentic"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := p.callCount(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1: the run ends on the step that asks, nothing is sent after it", got)
+	}
+	if res.Approval == nil {
+		t.Fatal("Result.Approval is nil; the request has no route to the board")
+	}
+	if res.Approval.Action != "delete /var/cache/app" || res.Approval.Reason != "it holds 40GB" {
+		t.Fatalf("Approval = %+v, want the action and reason the model gave", res.Approval)
+	}
+	if !slices.Equal(res.Approval.Options, []string{"delete it", "keep it"}) {
+		t.Fatalf("Approval options = %v, want the model's options in order", res.Approval.Options)
+	}
+	// The spend of this run is on the Result: the board prices it when it parks
+	// the item, and a run that stopped to ask still costs what it used.
+	if res.TokensIn != 30 || res.TokensOut != 12 {
+		t.Fatalf("tokens = (%d, %d), want (30, 12)", res.TokensIn, res.TokensOut)
+	}
+}
+
+// TestEscalationIsNotAProviderError: a run that stops to ask has not failed. Nil
+// is the contract the agent loop reads before deciding to report an error, so a
+// non-nil error here would mark the item failed and lose the question.
+func TestEscalationIsNotAProviderError(t *testing.T) {
+	stub := provider.NewStub([]provider.Response{approvalResponse("call-ask", "rotate the key", "the old one leaked")})
+	exec := newAgentic(t, stub)
+
+	res, err := exec.Run(context.Background(), claimedItem("run-1", "do it", "agentic"))
+	if err != nil {
+		t.Fatalf("Run returned %v, want nil: an escalation is a decision to ask, not a failure", err)
+	}
+	if res.Approval == nil {
+		t.Fatal("Result.Approval is nil on an escalated run")
+	}
+	for _, sentinel := range []error{ErrStepCap, ErrTokenBudget, ErrFinished} {
+		if errors.Is(err, sentinel) {
+			t.Fatalf("error wraps %v", sentinel)
+		}
+	}
+}
+
+// TestTheApprovalRequestReachesTheBoard is the end-to-end half: a real claim
+// transaction, the agent's escalation call over HTTP, and the approvals queue the
+// operator reads. The action and options must survive byte-for-byte, the run must
+// be escalated rather than failed, and the tokens must be in the run's row.
+func TestTheApprovalRequestReachesTheBoard(t *testing.T) {
+	f := newFixture(t)
+	exec := StubExecutor{OnRun: func(board.ClaimedItem) (Result, error) {
+		return Result{
+			Summary:  "stopped to ask",
+			TokensIn: 7, TokensOut: 3,
+			Approval: &board.ApprovalRequest{
+				Action:  "delete /var/cache/app",
+				Reason:  "the cache holds 40GB and the run needs the disk",
+				Options: []string{"delete it", "keep it"},
+			},
+		}, nil
+	}}
+
+	a := New(f.config(exec))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	startAgent(a, ctx)
+
+	waitFor(t, "item parked", func() bool { return f.itemStatus(t) == "needs_approval" })
+	cancel()
+
+	if got := f.runStatus(t); got != "escalated" {
+		t.Fatalf("run status = %q, want escalated: the run is closed, the item is parked", got)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, f.srv.URL+"/admin/approvals", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer admin")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /admin/approvals: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /admin/approvals = %d, want 200", resp.StatusCode)
+	}
+	var approvals []board.Approval
+	if err := json.NewDecoder(resp.Body).Decode(&approvals); err != nil {
+		t.Fatalf("decode approvals: %v", err)
+	}
+	if len(approvals) != 1 {
+		t.Fatalf("approvals = %+v, want the one parked item", approvals)
+	}
+	got := approvals[0]
+	if got.ItemID != f.itemID || got.Action != "delete /var/cache/app" {
+		t.Fatalf("approval = %+v, want item %s asking for the model's action", got, f.itemID)
+	}
+	if !slices.Equal(got.Options, []string{"delete it", "keep it"}) {
+		t.Fatalf("approval options = %v, want the model's options", got.Options)
+	}
+
+	// The run that stopped to ask still spent: the token counts travelled with
+	// the escalation and are on the row the ledger reads.
+	var in, out int
+	if err := f.db.QueryRow(`SELECT input_tokens, output_tokens FROM runs WHERE work_item_id=? ORDER BY attempt DESC LIMIT 1`, f.itemID).
+		Scan(&in, &out); err != nil {
+		t.Fatalf("read run tokens: %v", err)
+	}
+	if in != 7 || out != 3 {
+		t.Fatalf("run tokens = (%d, %d), want (7, 3): an escalated run is priced, not parked for free", in, out)
+	}
+}
+
 func listDirResponse(id string) provider.Response {
 	return callResponse(id, ToolListDir, `{}`, provider.Usage{In: 10, Out: 5})
 }
@@ -240,14 +379,14 @@ func TestAgenticExecutorSetsMaxTokensModelAndToolsOnEveryCall(t *testing.T) {
 		if strings.TrimSpace(req.System) == "" {
 			t.Fatalf("request %d has no system prompt", i)
 		}
-		if len(req.Tools) != 6 {
-			t.Fatalf("request %d carries %d tool definitions, want 6", i, len(req.Tools))
+		if len(req.Tools) != 7 {
+			t.Fatalf("request %d carries %d tool definitions, want 7", i, len(req.Tools))
 		}
 		names := map[string]bool{}
 		for _, tool := range req.Tools {
 			names[tool.Name] = true
 		}
-		for _, want := range []string{ToolReadFile, ToolWriteFile, ToolListDir, ToolShell, ToolHTTPGet, ToolFinish} {
+		for _, want := range []string{ToolReadFile, ToolWriteFile, ToolListDir, ToolShell, ToolHTTPGet, ToolRequestApproval, ToolFinish} {
 			if !names[want] {
 				t.Fatalf("request %d tool defs are missing %q", i, want)
 			}

@@ -113,6 +113,14 @@ func (c *Client) Start(ctx context.Context, runID string) error {
 	return c.post(ctx, runPath(runID, "start"), map[string]any{}, nil)
 }
 
+// Escalate asks the board to park the run's item for a human decision. It is not
+// a report: the board moves the item to needs_approval, closes the run as
+// escalated, releases the lease, and prices the run from the token counts in the
+// same body, so the day's ledger stays whole (M3 §11).
+func (c *Client) Escalate(ctx context.Context, runID string, req board.EscalationRequest) error {
+	return c.post(ctx, runPath(runID, "approval"), req, nil)
+}
+
 func (c *Client) Report(ctx context.Context, runID string, req board.ReportRequest) (board.ReportResult, error) {
 	var out board.ReportResult
 	err := c.post(ctx, runPath(runID, "report"), req, &out)

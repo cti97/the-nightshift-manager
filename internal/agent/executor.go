@@ -20,6 +20,12 @@ type Result struct {
 	TokensIn       int
 	TokensOut      int
 	ReservedTokens int
+
+	// Approval is set when the run ended by asking a human (M3). It is not a
+	// failure and not a summary: the caller escalates the item instead of
+	// reporting the run, and the token counts above are what the board prices
+	// into the day's ledger when it parks the item.
+	Approval *board.ApprovalRequest
 }
 
 // Executor does the work. It receives the whole claim payload, so the brief —

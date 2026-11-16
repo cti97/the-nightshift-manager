@@ -288,6 +288,14 @@ func (a *Agent) execute(ctx context.Context, it board.ClaimedItem) {
 		TokensOut:      res.TokensOut,
 		ReservedTokens: res.ReservedTokens,
 	}
+	// A run that ended by asking a human is parked, not reported: the board has
+	// its own transition for it, and reporting it as ok or error would settle the
+	// item and lose the question. The cost travels with the escalation, so the
+	// tokens this run spent are still charged to the day.
+	if res.Approval != nil {
+		a.escalate(ctx, it.RunID, res)
+		return
+	}
 	if runErr != nil {
 		req.Status = "error"
 		req.Error = runErr.Error()
@@ -316,6 +324,45 @@ func (a *Agent) report(ctx context.Context, runID string, req board.ReportReques
 		}
 		wait := a.reportWait(attempt)
 		a.logf("report run %s (attempt %d/%d): %v; retrying in %s", runID, attempt, a.reportTries, err, wait)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+// escalate posts the run's request_approval to the board, retrying like a report
+// because a lost escalation would leave the run live until its lease expired.
+// A run whose escalation cannot be delivered is left to the reaper rather than
+// reported as ok or failed: the work did not finish, and nothing went wrong with
+// it either.
+func (a *Agent) escalate(ctx context.Context, runID string, res Result) {
+	if res.Approval == nil {
+		return
+	}
+	req := board.EscalationRequest{
+		Action:         res.Approval.Action,
+		Reason:         res.Approval.Reason,
+		Options:        res.Approval.Options,
+		TokensIn:       res.TokensIn,
+		TokensOut:      res.TokensOut,
+		ReservedTokens: res.ReservedTokens,
+	}
+	for attempt := 1; ; attempt++ {
+		err := a.c.Escalate(ctx, runID, req)
+		if err == nil {
+			return
+		}
+		if ctx.Err() != nil { // shutdown, not a board failure
+			return
+		}
+		if attempt >= a.reportTries {
+			a.logf("escalate run %s: giving up after %d attempts: %v", runID, attempt, err)
+			return
+		}
+		wait := a.reportWait(attempt)
+		a.logf("escalate run %s (attempt %d/%d): %v; retrying in %s", runID, attempt, a.reportTries, err, wait)
 		select {
 		case <-ctx.Done():
 			return

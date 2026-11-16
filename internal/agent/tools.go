@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/cti97/the-nightshift-manager/internal/board"
 	"github.com/cti97/the-nightshift-manager/internal/provider"
 )
 
@@ -86,7 +87,12 @@ const (
 	ToolListDir   = "list_dir"
 	ToolShell     = "shell"
 	ToolHTTPGet   = "http_get"
-	ToolFinish    = "finish"
+	// ToolRequestApproval is not a capability. It stops the run and asks a human
+	// (M3): the item is parked, the lease is released, and a person decides
+	// before any more work happens. It is available to every run, because the
+	// need to ask is not something a capability list should be able to remove.
+	ToolRequestApproval = "request_approval"
+	ToolFinish          = "finish"
 )
 
 // Tool is one callable the model may ask for. Schema is the JSON Schema of the
@@ -109,6 +115,29 @@ var ErrFinished = errors.New("agent: the model ended the run")
 
 // IsFinish reports whether err is the finish tool's control signal.
 func IsFinish(err error) bool { return errors.Is(err, ErrFinished) }
+
+// ErrNeedsApproval is returned by request_approval. It is the second control
+// signal: the run does not fail, and the model is not told anything — the loop
+// stops, the item is parked, and a human answers (M3 §11). It is a sentinel for
+// the same reason ErrFinished is: a loop that fed this to the model would ask the
+// same question again on the next step, spending tokens to repeat itself.
+var ErrNeedsApproval = errors.New("agent: the model asked for a human decision")
+
+// ApprovalNeeded is ErrNeedsApproval carrying what was asked. The tool layer
+// never talks to a board, so the request leaves through the error and the
+// executor is the one that posts it; an error with a payload is the same shape
+// as finish's summary on the returned string.
+type ApprovalNeeded struct {
+	Request board.ApprovalRequest
+}
+
+func (a *ApprovalNeeded) Error() string {
+	return "agent: approval requested for " + strconv.Quote(a.Request.Action)
+}
+
+// Unwrap is what makes errors.Is(err, ErrNeedsApproval) true for a *ApprovalNeeded,
+// so the loop can test the sentinel and read the request with errors.As.
+func (a *ApprovalNeeded) Unwrap() error { return ErrNeedsApproval }
 
 // ErrPathRefused is returned when a path argument is inside the run directory
 // but not usable by the tool that was given it: a trailing separator where a
@@ -161,6 +190,16 @@ const (
 	// schema's maxLength because the schema counts characters and the check
 	// counts bytes; the check is the one that protects the database.
 	maxSummaryBytes = 16 << 10
+
+	// The approval request's bounds. They mirror the schema's maxLength, for the
+	// same reason as maxSummaryBytes: the schema is advice a model can ignore,
+	// and the check is what keeps a runaway answer off the approvals page. The
+	// action is one imperative sentence; the reason is the operator's paragraph;
+	// the options are alternatives, not a menu of everything.
+	maxApprovalActionBytes = 200
+	maxApprovalReasonBytes = 2000
+	maxApprovalOptions     = 10
+	maxApprovalOptionBytes = 200
 
 	// binaryProbeBytes is how much of a file the binary check sniffs. NUL bytes
 	// in the first block are file(1)'s own heuristic.
@@ -245,6 +284,37 @@ var (
   "additionalProperties": false
 }`)
 
+	requestApprovalSchema = json.RawMessage(`{
+  "description": "Stop this run and ask a human to decide before the next step. Use it when the action the work needs is one you must not take alone: deleting data, spending money, changing production, using a credential, anything irreversible. The run ENDS here — no later step runs, and the item waits until a person approves or denies the action. State the exact action, why it is needed, and the choices you see. A human approves that action specifically: your next run continues with the approval attached, or the item is cancelled with the person's reason. Do not use this to ask a question that a note in your summary could answer.",
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "The exact action you want permission for, in the imperative. Example: delete the 40GB cache at /var/cache/app"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "Why this action is needed and what happens if it is refused, in the operator's terms."
+    },
+    "options": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "description": "The choices you see, most preferred first. Optional: approve or deny always exists, these are the alternatives you would accept."
+    }
+  },
+  "required": ["action", "reason"],
+  "additionalProperties": false
+}`)
+
 	finishSchema = json.RawMessage(`{
   "description": "End the run and report its result. The summary is the only thing the operator will read about this run: write what you accomplished, where the artifacts are inside the run directory, what you verified, and what is unfinished or uncertain. Do not call this until the work is complete or you are certain it cannot be completed, and do not use it to ask a question.",
   "type": "object",
@@ -261,7 +331,8 @@ var (
 }`)
 )
 
-// Tools returns the closed set of six, in a stable order, for one run.
+// Tools returns the closed set of seven, in a stable order, for one run. Six do
+// work; request_approval stops the run and asks a human, and finish ends it.
 //
 // The slice is built per call rather than shared: a caller may sort, filter or
 // pass it to something that mutates it, and a package-level slice would make
@@ -273,6 +344,7 @@ func Tools() []Tool {
 		{Name: ToolListDir, Schema: listDirSchema, Run: runListDir},
 		{Name: ToolShell, Schema: shellSchema, Run: runShell},
 		{Name: ToolHTTPGet, Schema: httpGetSchema, Run: runHTTPGet},
+		{Name: ToolRequestApproval, Schema: requestApprovalSchema, Run: runRequestApproval},
 		{Name: ToolFinish, Schema: finishSchema, Run: runFinish},
 	}
 }
@@ -879,6 +951,61 @@ func parseGetURL(raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("agent: http_get: %q has no host", raw)
 	}
 	return target, nil
+}
+
+// --- request_approval -------------------------------------------------------
+
+// runRequestApproval validates the question and ends the run with it. The
+// returned string is empty: unlike finish, whose returned text is the summary,
+// the payload here is the request itself, and it travels on the error so the
+// executor can post it. Nothing is written to the model, because there is no
+// next step — the run is over.
+func runRequestApproval(ctx context.Context, _ *Sandbox, raw json.RawMessage) (string, error) {
+	if err := guardCtx(ctx, ToolRequestApproval); err != nil {
+		return "", err
+	}
+	var args struct {
+		Action  string   `json:"action"`
+		Reason  string   `json:"reason"`
+		Options []string `json:"options"`
+	}
+	if err := decodeToolArgs(raw, &args); err != nil {
+		return "", err
+	}
+
+	action := strings.TrimSpace(args.Action)
+	reason := strings.TrimSpace(args.Reason)
+	if action == "" || reason == "" {
+		return "", fmt.Errorf("agent: request_approval needs both an action and a reason: the action is what a human will approve, and the reason is why they should")
+	}
+	if len(action) > maxApprovalActionBytes {
+		return "", fmt.Errorf("agent: request_approval: the action is %d bytes and the limit is %d; state it in one imperative sentence, nothing was asked", len(action), maxApprovalActionBytes)
+	}
+	if len(reason) > maxApprovalReasonBytes {
+		return "", fmt.Errorf("agent: request_approval: the reason is %d bytes and the limit is %d; the operator reads it on the approvals page, nothing was asked", len(reason), maxApprovalReasonBytes)
+	}
+	if len(args.Options) > maxApprovalOptions {
+		return "", fmt.Errorf("agent: request_approval: %d options and the limit is %d; list the alternatives you would accept, nothing was asked", len(args.Options), maxApprovalOptions)
+	}
+
+	// A trimmed copy, never nil: an empty option list is stored and rendered as
+	// [] (ApprovalRequest marshals it that way), and an option that is only
+	// whitespace is not a choice.
+	options := make([]string, 0, len(args.Options))
+	for i, opt := range args.Options {
+		opt = strings.TrimSpace(opt)
+		if opt == "" {
+			return "", fmt.Errorf("agent: request_approval: option %d is empty; drop it or say what the choice is, nothing was asked", i+1)
+		}
+		if len(opt) > maxApprovalOptionBytes {
+			return "", fmt.Errorf("agent: request_approval: option %d is %d bytes and the limit is %d; nothing was asked", i+1, len(opt), maxApprovalOptionBytes)
+		}
+		options = append(options, opt)
+	}
+
+	return "", &ApprovalNeeded{Request: board.ApprovalRequest{
+		Action: action, Reason: reason, Options: options,
+	}}
 }
 
 // --- finish ----------------------------------------------------------------

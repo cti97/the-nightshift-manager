@@ -81,11 +81,13 @@ var (
 // defaultSystemPrompt is the standing instruction. It deliberately repeats the
 // finish contract: finish is the only way a run succeeds, and the summary is the
 // only thing the operator reads.
-const defaultSystemPrompt = `You are a worker executing one task on a board. You have a disposable run directory as your working directory and a closed set of tools: read_file, write_file, list_dir, shell, http_get and finish.
+const defaultSystemPrompt = `You are a worker executing one task on a board. You have a disposable run directory as your working directory and a closed set of tools: read_file, write_file, list_dir, shell, http_get, request_approval and finish.
 
 Work in small, verifiable steps. Use list_dir and read_file to understand what is already there, write artifacts inside the run directory, and use shell for commands. http_get is refused unless this task was placed with the network capability.
 
-When the work is complete — or when you are certain it cannot be completed — call finish with a summary. The summary is the only thing the operator will read about this run: say what you did, where the artifacts are inside the run directory, what you verified, and what remains unfinished or uncertain. Do not call finish to ask a question.`
+When the work is complete — or when you are certain it cannot be completed — call finish with a summary. The summary is the only thing the operator will read about this run: say what you did, where the artifacts are inside the run directory, what you verified, and what remains unfinished or uncertain. Do not call finish to ask a question.
+
+Call request_approval when the next step is one you must not take alone — deleting data, spending money, touching production, using a credential, anything irreversible. It ends this run and parks the task until a person approves that exact action or denies it; do not call it to ask a question a summary could answer, and do not take the action first.`
 
 const noToolCallNudge = "You did not call a tool. Continue the task with one of the tools, and call finish when the work is complete or you are certain it cannot be completed."
 
@@ -312,6 +314,18 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 				// operator-facing summary, and feeding ErrFinished back to the
 				// model would be an infinite loop (Task 11's hand-off 8).
 				return meter.result(out), nil
+			}
+			// request_approval is the other control signal (M3 §11). The run ends
+			// here: no further provider call is made, because there is no next
+			// step — a human decides first. The request leaves on the error, and
+			// the executor hands it to the caller, which parks the item. A run
+			// that stops to ask is not a failed run, so the error is nil.
+			var need *ApprovalNeeded
+			if errors.As(terr, &need) {
+				req := need.Request
+				res := meter.result(fmt.Sprintf("run stopped to ask for approval: %s", req.Action))
+				res.Approval = &req
+				return res, nil
 			}
 			// A cancelled context mid-tool is an interrupted run, not a tool
 			// error to show the model: return promptly so the agent does not
