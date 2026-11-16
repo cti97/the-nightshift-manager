@@ -81,6 +81,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /claim", s.nodeAuth(http.HandlerFunc(s.handleClaim)))
 	mux.Handle("POST /runs/{id}/start", s.nodeAuth(http.HandlerFunc(s.handleStartRun)))
 	mux.Handle("POST /runs/{id}/report", s.nodeAuth(http.HandlerFunc(s.handleReport)))
+	mux.Handle("POST /runs/{id}/approval", s.nodeAuth(http.HandlerFunc(s.handleEscalate)))
 	mux.Handle("GET /admin/why/{id}", s.adminAuth(http.HandlerFunc(s.handleWhy)))
 	mux.Handle("GET /admin/corrupt-rows", s.adminAuth(http.HandlerFunc(s.handleCorruptRows)))
 	return mux
@@ -225,6 +226,32 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, res)
+}
+
+// handleEscalate is the node's request_approval (spec §11). The run stops
+// here: the item is parked, the run closes, the lease is released, and the node
+// goes back to claiming. Nothing stays open while a human thinks, which is why
+// this is a transition and not a blocking call.
+//
+// A request with no action is a malformed body, not a conflict: the page would
+// list a question nobody can answer. Everything the board refuses — somebody
+// else's run, a run that already settled — is a 409, because the caller's view
+// of the world is stale and a retry of the same body will not fix it.
+func (s *Server) handleEscalate(w http.ResponseWriter, r *http.Request) {
+	var req ApprovalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	if req.Action == "" {
+		WriteError(w, http.StatusBadRequest, "approval", "an approval request must name the action it wants")
+		return
+	}
+	if err := Escalate(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r), req); err != nil {
+		WriteError(w, http.StatusConflict, "approval", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]string{"status": "needs_approval"})
 }
 
 // handleWhy is the operator's explanation endpoint. It returns the whole
