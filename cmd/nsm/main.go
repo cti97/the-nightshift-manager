@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -54,6 +57,12 @@ func run(args []string, out, errOut io.Writer) int {
 			return 2
 		}
 		return nodeRegister(args[2:], out, errOut)
+	case "approvals":
+		return approvalsList(args[1:], out, errOut)
+	case "approve":
+		return decideCommand(board.Approve, args[1:], out, errOut)
+	case "deny":
+		return decideCommand(board.Deny, args[1:], out, errOut)
 	default:
 		usage(errOut)
 		return 2
@@ -61,7 +70,7 @@ func run(args []string, out, errOut io.Writer) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: nsm <version|manager|agent|node> [args]")
+	fmt.Fprintln(w, "usage: nsm <version|manager|agent|node|approvals|approve|deny> [args]")
 }
 
 // managerTokens reads both credentials from the environment, for the same
@@ -307,4 +316,191 @@ func listFlag(name, value string) ([]string, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// adminToken reads the operator's credential from the environment. It is never a
+// flag: a secret on a command line is visible in ps and in shell history, which is
+// the rule the manager and the node already follow.
+func adminToken(errOut io.Writer) (string, bool) {
+	tok := os.Getenv("NSM_ADMIN_TOKEN")
+	if tok == "" {
+		fmt.Fprintln(errOut, "NSM_ADMIN_TOKEN is required (the admin credential; never pass it as a flag)")
+		return "", false
+	}
+	return tok, true
+}
+
+// adminCall performs one admin request and decodes the reply. Accept is JSON on
+// purpose: these commands are scripts with a person at the keyboard, and the
+// approvals page's HTML is for a browser.
+func adminCall(ctx context.Context, method, baseURL, path, token string, in, out any) error {
+	var body io.Reader
+	if in != nil {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(baseURL, "/")+path, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	client := &http.Client{Timeout: 35 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(msg)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// approvalsList is `nsm approvals`: the queue, for a terminal. An empty queue
+// prints [] rather than a blank line, so a script and a person both see that the
+// answer is "nothing", not "the command did nothing".
+func approvalsList(args []string, out, errOut io.Writer) int {
+	fs := flag.NewFlagSet("approvals", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	baseURL := fs.String("board", "http://127.0.0.1:8081", "board base URL")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	token, ok := adminToken(errOut)
+	if !ok {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	var list []board.Approval
+	if err := adminCall(ctx, http.MethodGet, *baseURL, "/admin/approvals", token, nil, &list); err != nil {
+		fmt.Fprintf(errOut, "approvals: %v\n", err)
+		return 1
+	}
+	if len(list) == 0 {
+		fmt.Fprintln(out, "[]")
+		return 0
+	}
+	fmt.Fprintf(out, "%d waiting\n", len(list))
+	for _, a := range list {
+		action := a.Action
+		if action == "" {
+			action = "(no action recorded)"
+		}
+		fmt.Fprintf(out, "%s  %s  (asked %s by %s)\n", a.ItemID, action, humanWait(a.RequestedAt), a.RequestedBy)
+		if a.Reason != "" {
+			fmt.Fprintf(out, "    why: %s\n", a.Reason)
+		}
+	}
+	return 0
+}
+
+// decideCommand is `nsm approve` and `nsm deny`. The note is optional for an
+// approval (and the command says so, because a decision without one is harder to
+// audit later) and required for a denial, where the note IS the reason recorded on
+// the cancelled item (D7).
+func decideCommand(decision string, args []string, out, errOut io.Writer) int {
+	name := decision
+	// The plan's syntax is `nsm approve <id> [--note]`, and flag.Parse stops at
+	// the first positional argument: without splitting the id out first, every
+	// flag after it is read as a second id and the command refuses its own
+	// documented form.
+	id, flags, err := splitIDAndFlags(args)
+	if err != nil {
+		fmt.Fprintln(errOut, err)
+		return 2
+	}
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	baseURL := fs.String("board", "http://127.0.0.1:8081", "board base URL")
+	note := fs.String("note", "", "note recorded with the decision (required for deny)")
+	if err := fs.Parse(flags); err != nil {
+		return 2
+	}
+	if id == "" {
+		fmt.Fprintf(errOut, "usage: nsm %s <item-id> [--note \"...\"]\n", name)
+		return 2
+	}
+	itemID := id
+	if decision == board.Deny && strings.TrimSpace(*note) == "" {
+		fmt.Fprintln(errOut, "--note is required for deny: it is the reason recorded on the item a week from now")
+		return 2
+	}
+	if decision == board.Approve && strings.TrimSpace(*note) == "" {
+		fmt.Fprintln(errOut, "warning: no --note given; a decision without a note is harder to audit later")
+	}
+	token, ok := adminToken(errOut)
+	if !ok {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	var res board.DecisionResult
+	err = adminCall(ctx, http.MethodPost, *baseURL, "/admin/approvals/"+url.PathEscape(itemID), token,
+		board.DecisionRequest{Decision: decision, Note: *note}, &res)
+	if err != nil {
+		fmt.Fprintf(errOut, "%s %s: %v\n", name, itemID, err)
+		return 1
+	}
+	fmt.Fprintf(out, "%s: %s -> %s\n", name, res.ItemID, res.Status)
+	return 0
+}
+
+// humanWait renders how long a request has waited, against THIS process's clock.
+// The board's own clock decides leases; this one decides what "7m" means to the
+// person reading a terminal, and they are allowed to be the same machine.
+func humanWait(requestedAt int64) string {
+	if requestedAt <= 0 {
+		return "at an unknown time"
+	}
+	d := time.Since(time.Unix(requestedAt, 0))
+	switch {
+	case d < time.Minute:
+		return "less than a minute ago"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh%dm ago", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		return fmt.Sprintf("%dd%dh ago", int(d.Hours())/24, int(d.Hours())%24)
+	}
+}
+
+// splitIDAndFlags separates the item id from the flags so that the documented
+// `nsm approve <id> --note "..."` form works: flag.Parse stops at the first
+// positional argument, so the id must come out before the flags are parsed. Both
+// flags this command has take a value, which is what makes the pairing below
+// unambiguous; a dash-prefixed value would have to be written as --flag=value.
+func splitIDAndFlags(args []string) (string, []string, error) {
+	var id string
+	flags := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
+			if !strings.Contains(a, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		if id != "" {
+			return "", nil, fmt.Errorf("unexpected argument %q: one item id is enough", a)
+		}
+		id = a
+	}
+	return id, flags, nil
 }

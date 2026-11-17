@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -344,5 +345,174 @@ func TestNodeRegisterRequiresEnrollToken(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "NSM_ENROLL_TOKEN") {
 		t.Fatalf("stderr = %q, want NSM_ENROLL_TOKEN named", errOut.String())
+	}
+}
+
+// parkedBoard is a real board with the admin server in front of it and one item
+// parked for the given action. It is the fixture the three CLI tests share.
+func parkedBoard(t *testing.T, action string) (srv *httptest.Server, itemID string) {
+	t.Helper()
+	db, clock := board.OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	node, _, err := board.RegisterNode(context.Background(), db, clock, board.RegisterRequest{
+		Name: "a", Role: "executor", ProvidesDeclared: []string{"agentic"},
+		ReachClasses: []string{"host", "lan", "wan"}, Concurrency: 1,
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := board.Heartbeat(context.Background(), db, clock, node, board.HeartbeatRequest{
+		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host", "lan", "wan"}, Protocol: board.ProtocolMax,
+	}); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	board.SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	itemID, err = board.CreateItem(context.Background(), db, clock, board.CreateItemRequest{
+		Title: "cache cleanup", Brief: "b", Needs: []string{"agentic"},
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	claimed, err := board.Claim(context.Background(), db, clock, node, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim = %d items, err %v", len(claimed), err)
+	}
+	if err := board.StartRun(context.Background(), db, clock, claimed[0].RunID, node); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := board.Escalate(context.Background(), db, clock, claimed[0].RunID, node,
+		board.ApprovalRequest{Action: action, Reason: "the run needs the disk"},
+		board.RunTokens{}); err != nil {
+		t.Fatalf("escalate: %v", err)
+	}
+
+	srv = httptest.NewServer(board.NewServer(db, clock, provider.NewRegistry(),
+		board.HashToken("admin-secret"), board.HashToken("enroll-secret")).Handler())
+	t.Cleanup(srv.Close)
+	return srv, itemID
+}
+
+// TestApprovalsCommandPrintsTheQueue: the terminal operator sees the id to copy,
+// the action, and how long it has waited. An empty queue prints [], so "nothing is
+// waiting" is an answer rather than a blank line a script cannot tell from a
+// failure.
+func TestApprovalsCommandPrintsTheQueue(t *testing.T) {
+	srv, itemID := parkedBoard(t, "delete /var/cache/app")
+	t.Setenv("NSM_ADMIN_TOKEN", "admin-secret")
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"approvals", "--board", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr %s)", code, errOut.String())
+	}
+	for _, want := range []string{itemID, "delete /var/cache/app", "the run needs the disk", "1 waiting"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("stdout = %q, want it to contain %q", out.String(), want)
+		}
+	}
+
+	// A second, empty board answers [].
+	empty, _ := board.OpenForTest(t, filepath.Join(t.TempDir(), "empty.db"))
+	emptySrv := httptest.NewServer(board.NewServer(empty, board.NewFixedClock(1),
+		provider.NewRegistry(), board.HashToken("admin-secret"), board.HashToken("enroll-secret")).Handler())
+	t.Cleanup(emptySrv.Close)
+	out.Reset()
+	if code := run([]string{"approvals", "--board", emptySrv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("empty board: exit = %d, want 0 (stderr %s)", code, errOut.String())
+	}
+	if got := strings.TrimSpace(out.String()); got != "[]" {
+		t.Fatalf("empty queue printed %q, want []", got)
+	}
+}
+
+// TestApproveWithoutANoteIsAcceptedButSaysSo: the decision goes through (the board
+// allows it), and the command says on stderr that a note would have made it
+// auditable. It does not silently pretend the note was required.
+func TestApproveWithoutANoteIsAcceptedButSaysSo(t *testing.T) {
+	srv, itemID := parkedBoard(t, "delete /var/cache/app")
+	t.Setenv("NSM_ADMIN_TOKEN", "admin-secret")
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"approve", itemID, "--board", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr %s)", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "harder to audit") {
+		t.Fatalf("stderr = %q, want the no-note warning", errOut.String())
+	}
+	if !strings.Contains(out.String(), "-> queued") {
+		t.Fatalf("stdout = %q, want the item reported as queued", out.String())
+	}
+}
+
+// TestDenyRequiresTheReason: a denial's note IS the reason recorded on the item
+// (D7), so the CLI refuses a denial that would leave "declined by admin" with no
+// account of why.
+func TestDenyRequiresTheReason(t *testing.T) {
+	srv, itemID := parkedBoard(t, "delete /var/cache/app")
+	t.Setenv("NSM_ADMIN_TOKEN", "admin-secret")
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"deny", itemID, "--board", srv.URL}, &out, &errOut); code != 2 {
+		t.Fatalf("deny without a note: exit = %d, want 2", code)
+	}
+	if !strings.Contains(errOut.String(), "--note is required") {
+		t.Fatalf("stderr = %q, want the note requirement", errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"deny", itemID, "--note", "that cache is not regenerable", "--board", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("deny with a note: exit = %d, want 0 (stderr %s)", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "-> cancelled") {
+		t.Fatalf("stdout = %q, want the item reported as cancelled", out.String())
+	}
+}
+
+// TestAdminTokenIsNeverAFlag: the credential comes from the environment. A --token
+// flag does not exist, so passing one fails the parse instead of putting a secret
+// in ps and the shell history.
+func TestAdminTokenIsNeverAFlag(t *testing.T) {
+	srv, itemID := parkedBoard(t, "delete /var/cache/app")
+	t.Setenv("NSM_ADMIN_TOKEN", "admin-secret")
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"approve", itemID, "--token", "admin-secret", "--board", srv.URL}, &out, &errOut); code != 2 {
+		t.Fatalf("--token: exit = %d, want 2 (a token flag must not exist)", code)
+	}
+
+	// And with the environment unset, every admin command refuses to run.
+	t.Setenv("NSM_ADMIN_TOKEN", "")
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"approvals", "--board", srv.URL}, &out, &errOut); code != 2 {
+		t.Fatalf("no NSM_ADMIN_TOKEN: exit = %d, want 2", code)
+	}
+	if !strings.Contains(errOut.String(), "NSM_ADMIN_TOKEN is required") {
+		t.Fatalf("stderr = %q, want the missing-credential message", errOut.String())
+	}
+}
+
+// TestApproveReportsTheBoardsRefusal: a 409 from a second decision must be an
+// error with the board's own message and a non-zero exit, never a printed
+// success — the operator's next move (go look at who decided first) depends on
+// knowing the decision did not land.
+func TestApproveReportsTheBoardsRefusal(t *testing.T) {
+	srv, itemID := parkedBoard(t, "delete /var/cache/app")
+	t.Setenv("NSM_ADMIN_TOKEN", "admin-secret")
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"approve", itemID, "--board", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("first approve: exit = %d, want 0 (stderr %s)", code, errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"deny", itemID, "--note", "changed my mind", "--board", srv.URL}, &out, &errOut); code != 1 {
+		t.Fatalf("second decision: exit = %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), "409") && !strings.Contains(errOut.String(), "not waiting") {
+		t.Fatalf("stderr = %q, want the board's refusal", errOut.String())
+	}
+	if out.String() != "" {
+		t.Fatalf("stdout = %q, want nothing: the decision did not land", out.String())
 	}
 }
