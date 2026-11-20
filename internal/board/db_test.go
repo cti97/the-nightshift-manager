@@ -127,12 +127,14 @@ func TestMigrationCreatesExpectedObjects(t *testing.T) {
 		"index idx_items_claimable",
 		"index idx_items_parked",
 		"index idx_runs_started_at",
+		"index idx_watches_due",
 		"table config",
 		"table endpoints",
 		"table events",
 		"table models",
 		"table nodes",
 		"table runs",
+		"table watches",
 		"table work_items",
 	}
 	if !slices.Equal(got, want) {
