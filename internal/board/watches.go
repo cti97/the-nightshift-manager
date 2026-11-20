@@ -601,3 +601,99 @@ func probeReason(prefix string, exit int, tail string) string {
 	}
 	return fmt.Sprintf("%s (probe exit %d: %s)", prefix, exit, tail)
 }
+
+// WatchPass counts what one scheduler pass did. Failed is a watch whose evaluation
+// returned an error (a row the board cannot read, a database failure); those are also
+// returned as the pass's error, because a count alone does not tell an operator which
+// row to look at.
+type WatchPass struct {
+	Fired   int `json:"fired"`
+	Skipped int `json:"skipped"`
+	Failed  int `json:"failed"`
+}
+
+// dueWatch is the scan's row: an id and the token it was due at. Nothing else is
+// read here — every decision is taken on rows re-read inside Fire's transaction,
+// because anything read in the scan can be stale by the time the write happens (the
+// reaper's rule, applied again).
+type dueWatch struct {
+	id       string
+	observed int64
+}
+
+// RunWatchesOnce is one scheduler pass: scan the due watches and fire each one.
+//
+// A watch that errors does not stop the pass. The scan order is stable, so returning
+// at the first failure would starve every watch behind it forever — the same reason
+// the reaper collects its errors and keeps going.
+func RunWatchesOnce(ctx context.Context, db *sql.DB, clock Clock) (WatchPass, error) {
+	now := clock.Now()
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, next_fire_at FROM watches
+		  WHERE enabled=1 AND next_fire_at IS NOT NULL AND next_fire_at <= ?
+		  ORDER BY next_fire_at, id`, now)
+	if err != nil {
+		return WatchPass{}, err
+	}
+	var due []dueWatch
+	for rows.Next() {
+		var d dueWatch
+		if err := rows.Scan(&d.id, &d.observed); err != nil {
+			rows.Close()
+			return WatchPass{}, err
+		}
+		due = append(due, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return WatchPass{}, err
+	}
+
+	var pass WatchPass
+	var errs []error
+	for _, d := range due {
+		if err := ctx.Err(); err != nil {
+			// Shutdown mid-pass: the remaining watches stay due and the next
+			// manager picks them up. Reporting it as a failure would blame the rows.
+			break
+		}
+		res, err := Fire(ctx, db, clock, d.id, d.observed)
+		if err != nil {
+			pass.Failed++
+			errs = append(errs, fmt.Errorf("watch %s: %w", d.id, err))
+			continue
+		}
+		if res.Fired {
+			pass.Fired++
+		} else {
+			pass.Skipped++
+		}
+	}
+	return pass, errors.Join(errs...)
+}
+
+// RunWatches ticks forever; cancel ctx to stop it. It runs on the manager, next to
+// the reaper: the reaper is about leases (30s) and this is about minutes, so the two
+// cadences are separate constants rather than one shared tick.
+//
+// A pass that did nothing logs nothing: a watch whose schedule is quiet is not news,
+// and a line per tick would bury the one pass that mattered. The watch list's
+// overdue state is what tells an operator the loop has stopped.
+func (s *Server) RunWatches(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			pass, err := RunWatchesOnce(ctx, s.db, s.clock)
+			if err != nil {
+				s.logf("watches: %v", err)
+			}
+			if pass.Fired > 0 || pass.Skipped > 0 {
+				s.logf("watches: fired %d, skipped %d, failed %d", pass.Fired, pass.Skipped, pass.Failed)
+			}
+		}
+	}
+}

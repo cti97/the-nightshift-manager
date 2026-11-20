@@ -1347,3 +1347,203 @@ func TestProbeOutputIsTruncated(t *testing.T) {
 		t.Fatalf("tail is only %d bytes; the cap should keep a useful amount", len(tail))
 	}
 }
+
+// TestTheSchedulerFiresEveryDueWatchInOnePass: one tick evaluates exactly the due
+// set — the due watch fires, the held one is recorded as a skip, and the one whose
+// slot is in the future is not touched at all.
+func TestTheSchedulerFiresEveryDueWatchInOnePass(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+
+	dueWatch, err := CreateWatch(ctx, db, clock, watchReq("due"))
+	if err != nil {
+		t.Fatalf("create due: %v", err)
+	}
+	heldWatch, err := CreateWatch(ctx, db, clock, watchReq("held"))
+	if err != nil {
+		t.Fatalf("create held: %v", err)
+	}
+	hold(t, db, clock, heldWatch.ID, clock.Now()+86400)
+
+	clock.Advance(300 * time.Second) // the two above are due; the third is created after
+
+	future, err := CreateWatch(ctx, db, clock, watchReq("future"))
+	if err != nil {
+		t.Fatalf("create future: %v", err)
+	}
+
+	pass, err := RunWatchesOnce(ctx, db, clock)
+	if err != nil {
+		t.Fatalf("RunWatchesOnce: %v", err)
+	}
+	if pass.Fired != 1 || pass.Skipped != 1 || pass.Failed != 0 {
+		t.Fatalf("pass = %+v, want one fire and one skip", pass)
+	}
+
+	var items int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if items != 1 {
+		t.Fatalf("items = %d, want only the due watch's", items)
+	}
+	if current, err := GetWatch(ctx, db, future.ID); err != nil {
+		t.Fatalf("GetWatch future: %v", err)
+	} else if current.LastFiredAt != nil || current.LastSkipAt != nil {
+		t.Fatalf("the future watch was evaluated: last_fired %v, last_skip %v", current.LastFiredAt, current.LastSkipAt)
+	}
+	if current, err := GetWatch(ctx, db, dueWatch.ID); err != nil {
+		t.Fatalf("GetWatch due: %v", err)
+	} else if current.LastFiredAt == nil {
+		t.Fatal("the due watch did not record a fire")
+	}
+}
+
+// TestOneBadWatchDoesNotStopThePass: a row the board cannot read is reported and
+// counted, and the watch behind it still fires. The corrupt row is due first, so an
+// implementation that returned at the first error would never reach the good one.
+func TestOneBadWatchDoesNotStopThePass(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+
+	// The corrupt watch is due now and sorts first (ORDER BY next_fire_at, id).
+	now := clock.Now()
+	if _, err := db.Exec(
+		`INSERT INTO watches (id,name,trigger,schedule,probe,template,dedupe_window,enabled,next_fire_at,created_at)
+		 VALUES ('a-corrupt','a-corrupt','interval','5m',NULL,'not json',3600,1,?,?)`,
+		now, now); err != nil {
+		t.Fatalf("insert corrupt watch: %v", err)
+	}
+	good, err := CreateWatch(ctx, db, clock, watchReq("good"))
+	if err != nil {
+		t.Fatalf("create good: %v", err)
+	}
+	clock.Advance(300 * time.Second)
+
+	pass, err := RunWatchesOnce(ctx, db, clock)
+	if err == nil {
+		t.Fatal("the pass reported no error for a watch whose template cannot be read")
+	}
+	if !strings.Contains(err.Error(), "a-corrupt") {
+		t.Fatalf("pass error = %q, want it to name the corrupt watch", err)
+	}
+	if pass.Failed != 1 || pass.Fired != 1 {
+		t.Fatalf("pass = %+v, want one failure and one fire", pass)
+	}
+	if current, err := GetWatch(ctx, db, good.ID); err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	} else if current.LastFiredAt == nil {
+		t.Fatal("the good watch behind the corrupt row never fired")
+	}
+}
+
+// TestAPausedBoardEmitsButDoesNotIssue is D9: the pause stops issuance, not
+// observation. A watch that became due while the board is paused still emits — the
+// event is history, and hiding it would make the pause rewrite what happened — and
+// the item simply waits, because Claim refuses while paused.
+func TestAPausedBoardEmitsButDoesNotIssue(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+
+	if _, err := CreateWatch(ctx, db, clock, watchReq("due")); err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO config (key,value) VALUES ('board_paused','1')`); err != nil {
+		t.Fatalf("pause the board: %v", err)
+	}
+	clock.Advance(300 * time.Second)
+
+	pass, err := RunWatchesOnce(ctx, db, clock)
+	if err != nil {
+		t.Fatalf("RunWatchesOnce: %v", err)
+	}
+	if pass.Fired != 1 {
+		t.Fatalf("pass = %+v, want the fire to happen while paused", pass)
+	}
+	var queued int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items WHERE status='queued'`).Scan(&queued); err != nil {
+		t.Fatalf("count queued: %v", err)
+	}
+	if queued != 1 {
+		t.Fatalf("queued = %d, want the emitted item waiting", queued)
+	}
+	claimed, err := Claim(ctx, db, clock, node, 1)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("Claim returned %d items on a paused board, want none", len(claimed))
+	}
+}
+
+// TestTheSchedulerDoesNotTouchParkedItems: M3's rule survives a full pass. A parked
+// item keeps its request, attempt and lease-free state while watches fire around it.
+func TestTheSchedulerDoesNotTouchParkedItems(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+
+	itemID, runID, nodeID := parkOneRun(t, db, clock)
+	if err := Escalate(ctx, db, clock, runID, nodeID, ApprovalRequest{
+		Action: "delete /var/cache/app", Reason: "needs the disk",
+	}, RunTokens{}); err != nil {
+		t.Fatalf("Escalate: %v", err)
+	}
+	if _, err := CreateWatch(ctx, db, clock, watchReq("due")); err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	clock.Advance(300 * time.Second)
+
+	if pass, err := RunWatchesOnce(ctx, db, clock); err != nil || pass.Fired != 1 {
+		t.Fatalf("pass = %+v, err %v; want one fire", pass, err)
+	}
+	var status, request string
+	var attempt int
+	if err := db.QueryRow(`SELECT status, COALESCE(approval_request,''), attempt FROM work_items WHERE id=?`, itemID).
+		Scan(&status, &request, &attempt); err != nil {
+		t.Fatalf("read parked item: %v", err)
+	}
+	if status != "needs_approval" || request == "" || attempt != 1 {
+		t.Fatalf("parked item = %q, request %q, attempt %d; the scheduler changed it", status, request, attempt)
+	}
+}
+
+// TestTheSchedulerLoopTicksAndStops: the ticker runs a pass without being asked and
+// returns when its context is cancelled. The pass itself is tested above; this pins
+// the loop's wiring, which is the part a test of RunWatchesOnce cannot see.
+func TestTheSchedulerLoopTicksAndStops(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	if _, err := CreateWatch(ctx, db, clock, watchReq("due")); err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	clock.Advance(300 * time.Second)
+
+	srv := NewServer(db, clock, nil, HashToken("admin"), HashToken("enroll"))
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); srv.RunWatches(runCtx, 10*time.Millisecond) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&n); err != nil {
+			t.Fatalf("count items: %v", err)
+		}
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the scheduler loop never fires the due watch")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("RunWatches did not return after its context was cancelled")
+	}
+}

@@ -28,6 +28,13 @@ import (
 // because the cadence is an operational choice.
 const reaperEvery = 30 * time.Second
 
+// watchEvery is how often the manager evaluates due watches (M4). It is finer than
+// the reaper's sweep because a cron schedule is minute-resolution: a 30s tick would
+// delay an every-minute watch by up to half a minute, and a 15s tick holds that to
+// 15 seconds. It cannot double-fire — a fire advances next_fire_at before the next
+// tick sees it.
+const watchEvery = 15 * time.Second
+
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 func run(args []string, out, errOut io.Writer) int {
@@ -125,6 +132,9 @@ func managerServe(args []string, errOut io.Writer) int {
 	// dies mid-run holds its item forever. It lives for the life of the process;
 	// a graceful shutdown path is a later task, so the context is not cancelled.
 	go srv.RunReaper(context.Background(), reaperEvery)
+	// Watches emit items; they never run them. Started here, not in the board
+	// package, so a test can drive RunWatchesOnce without a ticker.
+	go srv.RunWatches(context.Background(), watchEvery)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		fmt.Fprintf(errOut, "serve: %v\n", err)
 		return 1
