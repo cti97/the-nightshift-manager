@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cti97/the-nightshift-manager/internal/caps"
 )
@@ -417,6 +418,32 @@ func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observed
 		return FireResult{}, fmt.Errorf("watch %s: %w", watchID, err)
 	}
 
+	// A refusal that still consumes the slot (D6, D7): the watch was considered and
+	// did not fire, so the schedule advances and the reason is written on the row.
+	// No event — ten held slots would otherwise be ten entries saying the same thing,
+	// and the row already carries the answer (last_skip_at, last_skip_reason).
+	if reason := skipReason(w, now); reason != "" {
+		res, err := conn.ExecContext(ctx,
+			`UPDATE watches SET next_fire_at=?, last_skip_at=?, last_skip_reason=?
+			  WHERE id=? AND enabled=1 AND next_fire_at <= ?`,
+			next, now, reason, watchID, now)
+		if err != nil {
+			return FireResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return FireResult{}, err
+		}
+		if n != 1 {
+			return FireResult{Skipped: "the slot was already fired, or the watch is not due"}, nil
+		}
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return FireResult{}, err
+		}
+		committed = true
+		return FireResult{Skipped: reason}, nil
+	}
+
 	// Claim the slot before doing any work. The token check is the re-read above
 	// (a fire always advances next_fire_at, so a second caller holding the old token
 	// is refused there, with a message that says which refusal it was); BEGIN
@@ -482,4 +509,32 @@ func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observed
 	}
 	committed = true
 	return FireResult{Fired: true, ItemID: itemID}, nil
+}
+
+// skipReason is the first refusal that still consumes the slot (M4 D6): the
+// operator's hold, then the system's dedupe floor. Empty means the watch may fire.
+//
+// The order is part of the contract: "held by the operator" must win over
+// "deduped", or an operator who deliberately held a watch reads a reason about a
+// window they did not set and goes looking for the wrong thing.
+//
+// A hold and a window are different mechanisms with different owners (D6): the
+// window is the system's floor between emissions and is measured from the last
+// fire; the hold is a timestamp an operator set, and firing never clears it.
+func skipReason(w Watch, now int64) string {
+	if w.CooldownUntil != nil && *w.CooldownUntil > now {
+		return fmt.Sprintf("held by the operator until %s",
+			time.Unix(*w.CooldownUntil, 0).UTC().Format(time.RFC3339))
+	}
+	if w.DedupeWindow > 0 && w.LastFiredAt != nil {
+		// The window ends at last_fired + window; firing exactly at that second is
+		// allowed, because the window is "at least this much time between emissions",
+		// not "never at this instant".
+		if until := *w.LastFiredAt + int64(w.DedupeWindow); until > now {
+			return fmt.Sprintf("inside the %s dedupe window, which ends at %s",
+				time.Duration(w.DedupeWindow)*time.Second,
+				time.Unix(until, 0).UTC().Format(time.RFC3339))
+		}
+	}
+	return ""
 }

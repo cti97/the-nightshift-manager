@@ -902,3 +902,229 @@ func TestTwoFiresCannotBothEmitTheSameSlot(t *testing.T) {
 		t.Fatalf("items=%d fired events=%d after a concurrent race, want 1 and 1", items, events)
 	}
 }
+
+// watchEventCount is how many events the watch itself has written. A skip must not
+// change it: that is the property, and counting only "fired" would pass even if a
+// skip wrote a "skipped" event per tick.
+func watchEventCount(t *testing.T, db *sql.DB, watchID string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM events WHERE entity='watch' AND entity_id=?`, watchID).Scan(&n); err != nil {
+		t.Fatalf("count watch events: %v", err)
+	}
+	return n
+}
+
+// hold sets a cooldown on a watch and returns nothing; it is fixture sugar for the
+// skip tests.
+func hold(t *testing.T, db *sql.DB, clock *FixedClock, id string, until int64) {
+	t.Helper()
+	if _, err := PatchWatch(context.Background(), db, clock, id, PatchWatchRequest{CooldownUntil: &until}); err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+}
+
+// TestACooldownSkipsTheFireAndSaysSo: a held watch does not emit, says who is
+// holding it and until when, and still advances its schedule so the scheduler is
+// not re-asking every tick.
+func TestACooldownSkipsTheFireAndSaysSo(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	until := clock.Now() + 3600
+	hold(t, db, clock, w.ID, until)
+	before := watchEventCount(t, db, w.ID)
+
+	at := due(t, clock, w)
+	res, err := Fire(ctx, db, clock, w.ID, at)
+	if err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+	if res.Fired {
+		t.Fatalf("Fire = %+v for a held watch, want a skip", res)
+	}
+	if !strings.Contains(res.Skipped, "held by the operator") || !strings.Contains(res.Skipped, "2023-11-14T23:13:20Z") {
+		t.Fatalf("skip reason = %q, want the hold and its expiry", res.Skipped)
+	}
+
+	after, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if after.NextFireAt == nil || *after.NextFireAt <= at {
+		t.Fatalf("next_fire_at = %s after a skip, want it past the slot %s", deref(after.NextFireAt), stamp(at))
+	}
+	if after.LastSkipAt == nil || *after.LastSkipAt != clock.Now() {
+		t.Fatalf("last_skip_at = %s, want %s", deref(after.LastSkipAt), stamp(clock.Now()))
+	}
+	if !strings.Contains(after.LastSkipReason, "held by the operator") {
+		t.Fatalf("last_skip_reason = %q, want the reason stored on the row", after.LastSkipReason)
+	}
+	if after.LastFiredAt != nil {
+		t.Fatalf("last_fired_at = %s after a skip, want nil", deref(after.LastFiredAt))
+	}
+
+	var items int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if items != 0 {
+		t.Fatalf("items = %d after a held slot, want nothing emitted", items)
+	}
+	if after := watchEventCount(t, db, w.ID); after != before {
+		t.Fatalf("watch events went from %d to %d across a skip, want no event", before, after)
+	}
+}
+
+// TestADedupeWindowSkipsAFireInsideTheWindow: the second emission inside the
+// window waits, and the reason says which window and when it ends.
+func TestADedupeWindowSkipsAFireInsideTheWindow(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	first, err := Fire(ctx, db, clock, w.ID, due(t, clock, w))
+	if err != nil || !first.Fired {
+		t.Fatalf("first Fire = %+v, err %v", first, err)
+	}
+
+	next, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	at := due(t, clock, next) // five minutes later, inside the one-hour window
+	res, err := Fire(ctx, db, clock, w.ID, at)
+	if err != nil {
+		t.Fatalf("second Fire: %v", err)
+	}
+	if res.Fired {
+		t.Fatalf("second Fire = %+v inside the dedupe window, want a skip", res)
+	}
+	if !strings.Contains(res.Skipped, "dedupe window") {
+		t.Fatalf("skip reason = %q, want the dedupe window", res.Skipped)
+	}
+
+	var items int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if items != 1 {
+		t.Fatalf("items = %d, want only the first fire's", items)
+	}
+}
+
+// TestTheWindowDoesNotSkipAFireAfterIt fires exactly at the window's last second:
+// the window is "at least this much time between emissions", so the boundary itself
+// is allowed. `until >= now` would refuse it, which is why the test lands there.
+func TestTheWindowDoesNotSkipAFireAfterIt(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	first, err := Fire(ctx, db, clock, w.ID, due(t, clock, w))
+	if err != nil || !first.Fired {
+		t.Fatalf("first Fire = %+v, err %v", first, err)
+	}
+	firedAt := clock.Now()
+
+	// Jump to exactly last_fired + dedupe_window.
+	clock.Advance(time.Duration(firedAt+3600-clock.Now()) * time.Second)
+	current, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if clock.Now() != firedAt+3600 {
+		t.Fatalf("the fixture is at %s, want the window boundary %s", stamp(clock.Now()), stamp(firedAt+3600))
+	}
+	at := due(t, clock, current)
+	res, err := Fire(ctx, db, clock, w.ID, at)
+	if err != nil {
+		t.Fatalf("second Fire: %v", err)
+	}
+	if !res.Fired {
+		t.Fatalf("second Fire = %+v at the window boundary, want a fire", res)
+	}
+}
+
+// TestTheSkipReasonNamesTheFirstRefusal: held AND inside the window, the reason is
+// the hold — the operator's decision outranks the system's floor, or they read
+// about a window they did not set.
+func TestTheSkipReasonNamesTheFirstRefusal(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	if first, err := Fire(ctx, db, clock, w.ID, due(t, clock, w)); err != nil || !first.Fired {
+		t.Fatalf("first Fire = %+v, err %v", first, err)
+	}
+	hold(t, db, clock, w.ID, clock.Now()+7200)
+
+	current, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	res, err := Fire(ctx, db, clock, w.ID, due(t, clock, current))
+	if err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+	if !strings.Contains(res.Skipped, "held by the operator") {
+		t.Fatalf("skip reason = %q, want the hold named first", res.Skipped)
+	}
+	if strings.Contains(res.Skipped, "dedupe") {
+		t.Fatalf("skip reason = %q mentions the window as well; the first refusal has to win", res.Skipped)
+	}
+}
+
+// TestASkipWritesNoEventPerTick: ten held slots are ten row updates, not ten
+// entries in the audit spine. The board's answer to "why is it quiet" is the row.
+func TestASkipWritesNoEventPerTick(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	hold(t, db, clock, w.ID, clock.Now()+86400)
+	before := watchEventCount(t, db, w.ID)
+
+	for i := 0; i < 10; i++ {
+		current, err := GetWatch(ctx, db, w.ID)
+		if err != nil {
+			t.Fatalf("GetWatch: %v", err)
+		}
+		res, err := Fire(ctx, db, clock, w.ID, due(t, clock, current))
+		if err != nil {
+			t.Fatalf("Fire %d: %v", i, err)
+		}
+		if res.Fired {
+			t.Fatalf("Fire %d = %+v for a held watch, want a skip", i, res)
+		}
+	}
+
+	var items int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if items != 0 {
+		t.Fatalf("items = %d after ten held slots, want none", items)
+	}
+	if after := watchEventCount(t, db, w.ID); after != before {
+		t.Fatalf("watch events went from %d to %d across ten skips, want none", before, after)
+	}
+	final, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if final.LastSkipAt == nil || !strings.Contains(final.LastSkipReason, "held") {
+		t.Fatalf("last_skip = %s / %q, want the last skip recorded", deref(final.LastSkipAt), final.LastSkipReason)
+	}
+}
