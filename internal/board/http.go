@@ -86,6 +86,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /admin/corrupt-rows", s.adminAuth(http.HandlerFunc(s.handleCorruptRows)))
 	mux.Handle("GET /admin/approvals", s.adminAuth(http.HandlerFunc(s.handleApprovals)))
 	mux.Handle("POST /admin/approvals/{id}", s.adminAuth(http.HandlerFunc(s.handleDecision)))
+	mux.Handle("POST /admin/watches", s.adminAuth(http.HandlerFunc(s.handleCreateWatch)))
+	mux.Handle("GET /admin/watches", s.adminAuth(http.HandlerFunc(s.handleListWatches)))
+	mux.Handle("GET /admin/watches/{id}", s.adminAuth(http.HandlerFunc(s.handleGetWatch)))
+	mux.Handle("PATCH /admin/watches/{id}", s.adminAuth(http.HandlerFunc(s.handlePatchWatch)))
 	return mux
 }
 
@@ -670,3 +674,78 @@ func Errorf(format string, a ...any) string { return fmt.Sprintf(format, a...) }
 
 // logf is the background loops' only way to speak; handlers answer in JSON.
 func (s *Server) logf(format string, a ...any) { log.Printf(format, a...) }
+
+// handleCreateWatch is POST /admin/watches. A watch is an admin object twice over:
+// it decides what work appears on the board, and its probe runs code on the
+// manager (M4 D8). The route is adminAuth for both reasons.
+func (s *Server) handleCreateWatch(w http.ResponseWriter, r *http.Request) {
+	var req CreateWatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	watch, err := CreateWatch(r.Context(), s.db, s.clock, req)
+	switch {
+	case err == nil:
+		WriteJSON(w, http.StatusCreated, watch)
+	case errors.Is(err, ErrWatchExists):
+		WriteError(w, http.StatusConflict, "watch_exists", err.Error())
+	default:
+		// Every other refusal in CreateWatch happens before the first write: the
+		// trigger, the schedule, the probe and the template are checked in that
+		// order, so a 400 here is a bad request in the ordinary case.
+		WriteError(w, http.StatusBadRequest, "create_watch", err.Error())
+	}
+}
+
+// handleListWatches is GET /admin/watches: oldest first, [] when there are none.
+func (s *Server) handleListWatches(w http.ResponseWriter, r *http.Request) {
+	watches, err := ListWatches(r.Context(), s.db)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "watches", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, watches)
+}
+
+// handleGetWatch is GET /admin/watches/{id}. Task 8 hangs the derived state
+// sentence off this read; the row itself is what it answers today.
+func (s *Server) handleGetWatch(w http.ResponseWriter, r *http.Request) {
+	watch, err := GetWatch(r.Context(), s.db, r.PathValue("id"))
+	switch {
+	case err == nil:
+		WriteJSON(w, http.StatusOK, watch)
+	case errors.Is(err, sql.ErrNoRows):
+		WriteError(w, http.StatusNotFound, "not_found", err.Error())
+	default:
+		WriteError(w, http.StatusInternalServerError, "watch", err.Error())
+	}
+}
+
+// handlePatchWatch is the operator's two levers: enable/disable and hold. The
+// request's pointers are what make "leave it alone" distinct from "clear it", so
+// the handler refuses a body that names neither rather than treating it as a no-op.
+func (s *Server) handlePatchWatch(w http.ResponseWriter, r *http.Request) {
+	var req PatchWatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	if req.Enabled == nil && req.CooldownUntil == nil {
+		WriteError(w, http.StatusBadRequest, "patch_watch", "nothing to change: send enabled, cooldown_until, or both")
+		return
+	}
+	if req.CooldownUntil != nil && *req.CooldownUntil < 0 {
+		WriteError(w, http.StatusBadRequest, "patch_watch", "cooldown_until is negative; 0 clears the hold")
+		return
+	}
+	watch, err := PatchWatch(r.Context(), s.db, s.clock, r.PathValue("id"), req)
+	switch {
+	case err == nil:
+		WriteJSON(w, http.StatusOK, watch)
+	case errors.Is(err, sql.ErrNoRows):
+		WriteError(w, http.StatusNotFound, "not_found", err.Error())
+	default:
+		WriteError(w, http.StatusBadRequest, "patch_watch", err.Error())
+	}
+}
