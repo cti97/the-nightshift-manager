@@ -418,15 +418,19 @@ func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observed
 		return FireResult{}, fmt.Errorf("watch %s: %w", watchID, err)
 	}
 
-	// A refusal that still consumes the slot (D6, D7): the watch was considered and
-	// did not fire, so the schedule advances and the reason is written on the row.
-	// No event — ten held slots would otherwise be ten entries saying the same thing,
-	// and the row already carries the answer (last_skip_at, last_skip_reason).
-	if reason := skipReason(w, now); reason != "" {
+	// skip consumes a slot the watch did not fire (D7): the schedule advances and the
+	// reason is written on the row. No event — ten held slots would otherwise be ten
+	// entries saying the same thing, and the row already carries the answer.
+	//
+	// result is what the probe observed, when one ran: a refused fire still records
+	// the observation (it is why the condition's edge is where it is), while a hold
+	// records nothing because nothing was observed.
+	skip := func(reason string, result *bool) (FireResult, error) {
 		res, err := conn.ExecContext(ctx,
-			`UPDATE watches SET next_fire_at=?, last_skip_at=?, last_skip_reason=?
+			`UPDATE watches SET next_fire_at=?, last_skip_at=?, last_skip_reason=?,
+			        last_result=COALESCE(?, last_result)
 			  WHERE id=? AND enabled=1 AND next_fire_at <= ?`,
-			next, now, reason, watchID, now)
+			next, now, reason, boolOrNil(result), watchID, now)
 		if err != nil {
 			return FireResult{}, err
 		}
@@ -444,6 +448,38 @@ func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observed
 		return FireResult{Skipped: reason}, nil
 	}
 
+	// The operator's hold, then the system's window (D6).
+	if reason := skipReason(w, now); reason != "" {
+		return skip(reason, nil)
+	}
+
+	// The probe (D5, D8). A condition watch fires on the false→true transition and
+	// only there; last_result holds the previous observation, so a manager restart
+	// cannot re-fire a condition that was already true. An interval or cron watch
+	// uses its probe as a gate: true proceeds to the fire, false is a skip.
+	var observed *bool
+	if w.Probe != "" {
+		exit, tail, timedOut := runWatchProbe(ctx, w.Probe, watchProbeTimeout)
+		if timedOut {
+			// The observation did not happen, so nothing is recorded: treating a timeout
+			// as "false" would make a condition fire spuriously on the tick after a slow
+			// probe, and treat an outage as a state change.
+			return skip(fmt.Sprintf("the probe did not finish within %s; the observation did not happen", watchProbeTimeout), nil)
+		}
+		v := exit == 0
+		observed = &v
+		if w.Trigger == TriggerCondition {
+			if !v {
+				return skip(probeReason("the condition is false", exit, tail), observed)
+			}
+			if w.LastResult != nil && *w.LastResult {
+				return skip("the condition is already true; a condition fires on the transition, not on every check", observed)
+			}
+		} else if !v {
+			return skip(probeReason("the probe reported false", exit, tail), observed)
+		}
+	}
+
 	// Claim the slot before doing any work. The token check is the re-read above
 	// (a fire always advances next_fire_at, so a second caller holding the old token
 	// is refused there, with a message that says which refusal it was); BEGIN
@@ -459,9 +495,9 @@ func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observed
 	// re-read, and these two guards, neither could be reached. An unreachable guard
 	// is a mutation nobody can catch, which is worse than no guard.
 	res, err := conn.ExecContext(ctx,
-		`UPDATE watches SET last_fired_at=?, next_fire_at=?
+		`UPDATE watches SET last_fired_at=?, next_fire_at=?, last_result=COALESCE(?, last_result)
 		  WHERE id=? AND enabled=1 AND next_fire_at <= ?`,
-		now, next, watchID, now)
+		now, next, boolOrNil(observed), watchID, now)
 	if err != nil {
 		return FireResult{}, err
 	}
@@ -500,7 +536,7 @@ func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observed
 	if err := AppendEvent(ctx, conn, clock, "watch:"+w.ID, "watch", w.ID, "fired",
 		map[string]any{
 			"item": itemID, "trigger": w.Trigger, "schedule": w.Schedule,
-			"next_fire_at": next,
+			"next_fire_at": next, "observed": observed,
 		}); err != nil {
 		return FireResult{}, err
 	}
@@ -537,4 +573,31 @@ func skipReason(w Watch, now int64) string {
 		}
 	}
 	return ""
+}
+
+// boolOrNil renders an optional observation as the value a COALESCE can use: nil
+// leaves the stored result alone, 1/0 records it.
+func boolOrNil(v *bool) any {
+	if v == nil {
+		return nil
+	}
+	if *v {
+		return 1
+	}
+	return 0
+}
+
+// probeReason is a skip reason that carries the probe's own evidence: its exit code
+// and the tail of what it printed. The tail is bounded in runes so the message stays
+// readable and stays valid UTF-8.
+func probeReason(prefix string, exit int, tail string) string {
+	tail = strings.TrimSpace(tail)
+	if tail == "" {
+		return fmt.Sprintf("%s (probe exit %d)", prefix, exit)
+	}
+	runes := []rune(tail)
+	if len(runes) > 200 {
+		tail = string(runes[:200]) + "…"
+	}
+	return fmt.Sprintf("%s (probe exit %d: %s)", prefix, exit, tail)
 }

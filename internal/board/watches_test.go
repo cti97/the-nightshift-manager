@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestMigrationFiveAddsTheWatchesTable upgrades a real version-4 board and checks
@@ -1126,5 +1128,222 @@ func TestASkipWritesNoEventPerTick(t *testing.T) {
 	}
 	if final.LastSkipAt == nil || !strings.Contains(final.LastSkipReason, "held") {
 		t.Fatalf("last_skip = %s / %q, want the last skip recorded", deref(final.LastSkipAt), final.LastSkipReason)
+	}
+}
+
+// conditionWatch builds a condition watch whose probe tests for a flag file, which
+// the tests create and remove to move the condition between false and true.
+func conditionWatch(t *testing.T, db *sql.DB, clock *FixedClock, flag string) Watch {
+	t.Helper()
+	req := watchReq("condition")
+	req.Trigger, req.Schedule, req.Probe = TriggerCondition, "", "test -f "+flag
+	// The dedupe floor is tested on its own (Task 5) and applies to every trigger by
+	// D6's order — a probe that flaps at a threshold should not emit on every flip.
+	// Zero here so the edge rule is what this test observes.
+	noWindow := 0
+	req.DedupeWindow = &noWindow
+	w, err := CreateWatch(context.Background(), db, clock, req)
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	return w
+}
+
+// fireAgain re-reads the watch and fires it at its current slot. A condition watch's
+// slot is "now" every time, so this is the next tick's evaluation.
+func fireAgain(t *testing.T, db *sql.DB, clock *FixedClock, id string) FireResult {
+	t.Helper()
+	current, err := GetWatch(context.Background(), db, id)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	res, err := Fire(context.Background(), db, clock, id, due(t, clock, current))
+	if err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+	return res
+}
+
+// TestAConditionFiresOnTheRisingEdgeOnly is D5: three checks of a true condition
+// produce one item, and only a false→true transition produces the next.
+func TestAConditionFiresOnTheRisingEdgeOnly(t *testing.T) {
+	dir := t.TempDir()
+	flag := filepath.Join(dir, "flag")
+	db, clock := OpenForTest(t, filepath.Join(dir, "board.db"))
+	w := conditionWatch(t, db, clock, flag)
+
+	isFalse := fireAgain(t, db, clock, w.ID)
+	if isFalse.Fired {
+		t.Fatalf("first check = %+v with no flag, want a skip", isFalse)
+	}
+	if !strings.Contains(isFalse.Skipped, "condition is false") {
+		t.Fatalf("first check skipped with %q, want the condition named", isFalse.Skipped)
+	}
+	afterFalse, err := GetWatch(context.Background(), db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if afterFalse.LastResult == nil || *afterFalse.LastResult {
+		t.Fatalf("last_result = %v after a false probe, want false", afterFalse.LastResult)
+	}
+
+	if err := os.WriteFile(flag, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write flag: %v", err)
+	}
+	rising := fireAgain(t, db, clock, w.ID)
+	if !rising.Fired {
+		t.Fatalf("rising edge = %+v, want a fire", rising)
+	}
+
+	for i := 0; i < 2; i++ {
+		still := fireAgain(t, db, clock, w.ID)
+		if still.Fired {
+			t.Fatalf("check %d of a still-true condition fired again", i+1)
+		}
+		if !strings.Contains(still.Skipped, "already true") {
+			t.Fatalf("still-true skip = %q, want the transition rule named", still.Skipped)
+		}
+	}
+
+	if err := os.Remove(flag); err != nil {
+		t.Fatalf("remove flag: %v", err)
+	}
+	falling := fireAgain(t, db, clock, w.ID)
+	if falling.Fired {
+		t.Fatal("a falling edge fired")
+	}
+	if err := os.WriteFile(flag, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write flag again: %v", err)
+	}
+	second := fireAgain(t, db, clock, w.ID)
+	if !second.Fired {
+		t.Fatalf("second rising edge = %+v, want a fire", second)
+	}
+
+	var items int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if items != 2 {
+		t.Fatalf("items = %d for two rising edges and four checks, want 2", items)
+	}
+}
+
+// TestAConditionSurvivesARestart: the edge lives in the row, so a fresh manager that
+// has never seen this watch still refuses to re-fire a condition that was already
+// true. Simulated by writing last_result the way a previous process would have.
+func TestAConditionSurvivesARestart(t *testing.T) {
+	dir := t.TempDir()
+	flag := filepath.Join(dir, "flag")
+	if err := os.WriteFile(flag, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write flag: %v", err)
+	}
+	db, clock := OpenForTest(t, filepath.Join(dir, "board.db"))
+	w := conditionWatch(t, db, clock, flag)
+	if _, err := db.Exec(`UPDATE watches SET last_result=1 WHERE id=?`, w.ID); err != nil {
+		t.Fatalf("seed last_result: %v", err)
+	}
+
+	res := fireAgain(t, db, clock, w.ID)
+	if res.Fired {
+		t.Fatalf("a condition already true in the row fired after a restart: %+v", res)
+	}
+	var items int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if items != 0 {
+		t.Fatalf("items = %d, want none", items)
+	}
+}
+
+// TestAFailedProbeDoesNotFire: an interval watch's probe is a gate, and a failing
+// gate says why — the exit code and the command's own words.
+func TestAFailedProbeDoesNotFire(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	req := watchReq("disk")
+	req.Probe = "echo boom >&2; exit 3"
+	w, err := CreateWatch(context.Background(), db, clock, req)
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+
+	res := fireAgain(t, db, clock, w.ID)
+	if res.Fired {
+		t.Fatalf("Fire = %+v with a failing probe, want a skip", res)
+	}
+	if !strings.Contains(res.Skipped, "exit 3") || !strings.Contains(res.Skipped, "boom") {
+		t.Fatalf("skip = %q, want the exit code and the probe's output", res.Skipped)
+	}
+	after, err := GetWatch(context.Background(), db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if after.LastResult == nil || *after.LastResult {
+		t.Fatalf("last_result = %v after a failed probe, want false", after.LastResult)
+	}
+	var items int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if items != 0 {
+		t.Fatalf("items = %d, want none", items)
+	}
+}
+
+// TestAProbeTimeoutIsNotAFalseObservation: a timeout is not an observation, so it
+// must not move a condition's edge — otherwise a slow probe would look like the
+// condition going false and then true again, firing a second item.
+func TestAProbeTimeoutIsNotAFalseObservation(t *testing.T) {
+	old := watchProbeTimeout
+	watchProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { watchProbeTimeout = old })
+
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	req := watchReq("slow")
+	req.Trigger, req.Schedule, req.Probe = TriggerCondition, "", "sleep 2; true"
+	w, err := CreateWatch(context.Background(), db, clock, req)
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE watches SET last_result=1 WHERE id=?`, w.ID); err != nil {
+		t.Fatalf("seed last_result: %v", err)
+	}
+
+	res := fireAgain(t, db, clock, w.ID)
+	if res.Fired {
+		t.Fatalf("Fire = %+v with a timing-out probe, want a skip", res)
+	}
+	if !strings.Contains(res.Skipped, "did not finish") {
+		t.Fatalf("skip = %q, want the timeout named", res.Skipped)
+	}
+	after, err := GetWatch(context.Background(), db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if after.LastResult == nil || !*after.LastResult {
+		t.Fatalf("last_result = %v after a timeout, want the previous true observation untouched", after.LastResult)
+	}
+}
+
+// TestProbeOutputIsTruncated: the tail is bounded, and the cut keeps it valid UTF-8
+// because it ends up in JSON. The probe emits multi-byte runes so a byte cut would
+// land mid-rune.
+func TestProbeOutputIsTruncated(t *testing.T) {
+	exit, tail, timedOut := runWatchProbe(context.Background(), "yes 'é' | head -c 9000", 5*time.Second)
+	if timedOut {
+		t.Fatal("the probe timed out")
+	}
+	if exit != 0 {
+		t.Fatalf("exit = %d, want 0", exit)
+	}
+	if len(tail) > watchProbeTail {
+		t.Fatalf("tail is %d bytes, want at most %d", len(tail), watchProbeTail)
+	}
+	if !utf8.ValidString(tail) {
+		t.Fatal("the tail is not valid UTF-8; a byte-boundary cut split a rune")
+	}
+	if len(tail) < 1000 {
+		t.Fatalf("tail is only %d bytes; the cap should keep a useful amount", len(tail))
 	}
 }
