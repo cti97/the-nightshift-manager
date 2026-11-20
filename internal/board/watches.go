@@ -343,3 +343,143 @@ func boolInt(b bool) int {
 	}
 	return 0
 }
+
+// FireResult is what one evaluation did. Fired is false for a skipped watch, and
+// Skipped says which check refused it — the reason a scheduler's log line and the
+// watch's own last_skip_reason both quote.
+type FireResult struct {
+	Fired   bool   `json:"fired"`
+	ItemID  string `json:"item_id,omitempty"`
+	Skipped string `json:"skipped,omitempty"`
+}
+
+// Fire evaluates one due watch and, if it fires, emits its item — in one
+// transaction (M4 D1). The item, the schedule advance and the event are written
+// together, because a crash between any two either double-fires the watch or loses
+// the fire, and both are invisible until someone counts items.
+//
+// observedNextFire is the value the scan saw. The advance is guarded on it, so two
+// schedulers that scanned the same row cannot both fire: the first advances
+// next_fire_at, the second's UPDATE matches nothing and its transaction rolls back.
+// That is the same single-writer rule Claim uses, applied to a much smaller race.
+//
+// The item is queued and ordinary in every other respect: placement routes it, a
+// node claims it, it can escalate and be approved. A watch emits work, it does not
+// run it.
+func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observedNextFire int64) (FireResult, error) {
+	// BEGIN IMMEDIATE on a dedicated connection, the pattern Claim uses and for the
+	// same reason: a deferred transaction that reads and then writes can lose the
+	// upgrade to another writer with SQLITE_BUSY no matter how long its busy timeout
+	// is. Taking the write lock first makes the two fires queue instead of collide,
+	// and the guards below then decide which one has anything to do.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return FireResult{}, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return FireResult{}, fmt.Errorf("begin immediate: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	w, err := scanWatch(conn.QueryRowContext(ctx, `SELECT `+watchColumns+` FROM watches WHERE id=?`, watchID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// A watch that vanished between the scan and this transaction is not a
+			// failure of the pass: there is simply nothing to evaluate. (There is no
+			// delete route — D10 — so this is a hand-edited board, and reporting it
+			// as an error would make one bad row stop the scheduler every tick.)
+			return FireResult{Skipped: "the watch no longer exists"}, nil
+		}
+		return FireResult{}, fmt.Errorf("watch %s: %w", watchID, err)
+	}
+	if !w.Enabled {
+		// Not an evaluation: the row is off, and D7's skip record is for a watch
+		// that was considered and refused. Advancing here would also overwrite the
+		// schedule a re-enable is about to re-anchor.
+		return FireResult{Skipped: "the watch is disabled"}, nil
+	}
+	if w.NextFireAt == nil || *w.NextFireAt != observedNextFire {
+		// The schedule moved between the scan and this transaction: another
+		// scheduler fired it, or an operator patched it. Either way this scan is
+		// stale and must not fire.
+		return FireResult{Skipped: "the schedule moved since the scan"}, nil
+	}
+
+	now := clock.Now()
+	next, err := NextFire(w.Trigger, w.Schedule, now)
+	if err != nil {
+		return FireResult{}, fmt.Errorf("watch %s: %w", watchID, err)
+	}
+
+	// Claim the slot before doing any work. The token check is the re-read above
+	// (a fire always advances next_fire_at, so a second caller holding the old token
+	// is refused there, with a message that says which refusal it was); BEGIN
+	// IMMEDIATE is what makes that check atomic against another manager process.
+	//
+	// The SQL guards below are the rules the database can state for itself: the watch
+	// is still enabled, and it is actually due. The due clause is not decoration —
+	// Fire does not trust its scanner, and a scheduler that called it for every watch
+	// would otherwise emit every item early.
+	//
+	// A `next_fire_at = ?` clause and a `last_fired_at < now` clause were both
+	// removed rather than kept: with the serialized writer, the in-transaction
+	// re-read, and these two guards, neither could be reached. An unreachable guard
+	// is a mutation nobody can catch, which is worse than no guard.
+	res, err := conn.ExecContext(ctx,
+		`UPDATE watches SET last_fired_at=?, next_fire_at=?
+		  WHERE id=? AND enabled=1 AND next_fire_at <= ?`,
+		now, next, watchID, now)
+	if err != nil {
+		return FireResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return FireResult{}, err
+	}
+	if n != 1 {
+		return FireResult{Skipped: "the slot was already fired, or the watch is not due"}, nil
+	}
+
+	itemID, err := NewToken()
+	if err != nil {
+		return FireResult{}, err
+	}
+	needsJSON, err := json.Marshal(nonNilList(w.Template.Needs))
+	if err != nil {
+		return FireResult{}, err
+	}
+	maxAttempts := w.Template.MaxAttempts
+	if maxAttempts < 1 {
+		// A hand-edited row can carry 0; CreateItem would default it, but this
+		// insert is direct and an item with no attempts can never succeed.
+		maxAttempts = 3
+	}
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO work_items (id,title,brief,needs,status,priority,max_attempts,created_by,created_at,updated_at)
+		 VALUES (?,?,?,?,'queued',?,?,?,?,?)`,
+		itemID, w.Template.Title, w.Template.Brief, string(needsJSON),
+		w.Template.Priority, maxAttempts, "watch:"+w.ID, now, now); err != nil {
+		return FireResult{}, err
+	}
+
+	// The event names the item, the trigger and the schedule: "a watch fired" is not
+	// an audit trail, "this watch emitted this item at this slot" is.
+	if err := AppendEvent(ctx, conn, clock, "watch:"+w.ID, "watch", w.ID, "fired",
+		map[string]any{
+			"item": itemID, "trigger": w.Trigger, "schedule": w.Schedule,
+			"next_fire_at": next,
+		}); err != nil {
+		return FireResult{}, err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return FireResult{}, err
+	}
+	committed = true
+	return FireResult{Fired: true, ItemID: itemID}, nil
+}

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -547,5 +548,357 @@ func TestTheWatchRoutes(t *testing.T) {
 	rec = doJSON(t, h, http.MethodPatch, "/admin/watches/"+created.ID, testAdminToken, map[string]any{"enabled": false})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disable = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// due advances the clock to the watch's next slot. Fire refuses an early call, so
+// every legitimate fire in these tests has to arrive the way the scheduler does:
+// with the clock at or past next_fire_at.
+func due(t *testing.T, clock *FixedClock, w Watch) int64 {
+	t.Helper()
+	if w.NextFireAt == nil {
+		t.Fatal("the watch has no next fire to advance to")
+	}
+	if d := *w.NextFireAt - clock.Now(); d > 0 {
+		clock.Advance(time.Duration(d) * time.Second)
+	}
+	return *w.NextFireAt
+}
+
+// fireOne creates a watch and fires it once, returning the watch and the result.
+func fireOne(t *testing.T, db *sql.DB, clock *FixedClock) (Watch, FireResult) {
+	t.Helper()
+	w, err := CreateWatch(context.Background(), db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	at := due(t, clock, w)
+	res, err := Fire(context.Background(), db, clock, w.ID, at)
+	if err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+	return w, res
+}
+
+// TestFiringEmitsAnItemWithTheTemplate: the item is the template, verbatim, and it
+// belongs to the watch that emitted it. Everything downstream treats it like any
+// other queued item (M4 D1).
+func TestFiringEmitsAnItemWithTheTemplate(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	req := watchReq("disk")
+	req.Template.Priority = 5
+	req.Template.MaxAttempts = 2
+	w, err := CreateWatch(context.Background(), db, clock, req)
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+
+	at := due(t, clock, w)
+	res, err := Fire(context.Background(), db, clock, w.ID, at)
+	if err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+	if !res.Fired || res.ItemID == "" {
+		t.Fatalf("FireResult = %+v, want a fired item id", res)
+	}
+
+	var title, brief, needs, status, createdBy string
+	var priority, maxAttempts int
+	var claimedBy sql.NullString
+	if err := db.QueryRow(
+		`SELECT title,brief,needs,status,priority,max_attempts,created_by,claimed_by FROM work_items WHERE id=?`,
+		res.ItemID).Scan(&title, &brief, &needs, &status, &priority, &maxAttempts, &createdBy, &claimedBy); err != nil {
+		t.Fatalf("read item: %v", err)
+	}
+	if title != req.Template.Title || brief != req.Template.Brief {
+		t.Fatalf("item = %q / %q, want the template's title and brief", title, brief)
+	}
+	if needs != `["agentic"]` {
+		t.Fatalf("needs = %s, want [\"agentic\"]", needs)
+	}
+	if status != "queued" || claimedBy.Valid {
+		t.Fatalf("item status = %q claimed_by = %v, want a queued, unclaimed item", status, claimedBy)
+	}
+	if priority != 5 || maxAttempts != 2 {
+		t.Fatalf("priority/max_attempts = %d/%d, want 5/2", priority, maxAttempts)
+	}
+	if createdBy != "watch:"+w.ID {
+		t.Fatalf("created_by = %q, want watch:%s", createdBy, w.ID)
+	}
+
+	// The audit spine names the item and the trigger, not just "a watch fired".
+	var payload string
+	if err := db.QueryRow(
+		`SELECT payload FROM events WHERE entity='watch' AND entity_id=? AND type='fired'`, w.ID).Scan(&payload); err != nil {
+		t.Fatalf("read event: %v", err)
+	}
+	if !strings.Contains(payload, res.ItemID) || !strings.Contains(payload, `"trigger":"interval"`) {
+		t.Fatalf("fired payload = %s, want the item id and the trigger", payload)
+	}
+}
+
+// TestFiringAdvancesTheScheduleAndStampsTheFire: one fire moves the watch to its
+// next slot and records when it happened, so the next scan is about the next slot
+// rather than the one just served.
+func TestFiringAdvancesTheScheduleAndStampsTheFire(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	w, err := CreateWatch(context.Background(), db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	// The clock moves to the slot before the fire, so "advanced from now" and "left
+	// at the observed value" are different numbers. With a frozen clock they are
+	// equal and a fire that forgot to advance would pass.
+	at := due(t, clock, w)
+	res, err := Fire(context.Background(), db, clock, w.ID, at)
+	if err != nil || !res.Fired {
+		t.Fatalf("Fire = %+v, err %v; want a fire", res, err)
+	}
+
+	after, err := GetWatch(context.Background(), db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if after.LastFiredAt == nil || *after.LastFiredAt != clock.Now() {
+		t.Fatalf("last_fired_at = %s, want %s", deref(after.LastFiredAt), stamp(clock.Now()))
+	}
+	if after.NextFireAt == nil || *after.NextFireAt != clock.Now()+300 {
+		t.Fatalf("next_fire_at = %s, want %s", deref(after.NextFireAt), stamp(clock.Now()+300))
+	}
+	var events int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM events WHERE entity='watch' AND entity_id=? AND type='fired'`, w.ID).Scan(&events); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if events != 1 {
+		t.Fatalf("fired events = %d, want exactly 1", events)
+	}
+}
+
+// TestAStaleScanCannotFireTwice is the guard: two schedulers (or one that scanned
+// before another fired) both present the same next_fire_at, and only the first
+// wins. The loser writes nothing — no item, no event, no advance.
+func TestAStaleScanCannotFireTwice(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	w, err := CreateWatch(context.Background(), db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	observed := due(t, clock, w)
+
+	first, err := Fire(context.Background(), db, clock, w.ID, observed)
+	if err != nil || !first.Fired {
+		t.Fatalf("first Fire = %+v, err %v; want a fire", first, err)
+	}
+
+	// Move the clock to the watch's NEW slot and hand Fire the token from the old
+	// one. The watch is due, so only the token check can refuse this — which is
+	// what the test is for.
+	after, err := GetWatch(context.Background(), db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	clock.Advance(time.Duration(*after.NextFireAt-clock.Now()) * time.Second)
+
+	second, err := Fire(context.Background(), db, clock, w.ID, observed)
+	if err != nil {
+		t.Fatalf("second Fire: %v", err)
+	}
+	if second.Fired {
+		t.Fatalf("second Fire = %+v with a stale next_fire_at, want a skip", second)
+	}
+	if !strings.Contains(second.Skipped, "schedule moved") {
+		t.Fatalf("second Fire skipped with %q, want it to name the moved schedule", second.Skipped)
+	}
+
+	var items, events int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM events WHERE type='fired'`).Scan(&events); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if items != 1 || events != 1 {
+		t.Fatalf("items=%d fired events=%d after two evaluations of one slot, want 1 and 1", items, events)
+	}
+}
+
+// TestADisabledWatchDoesNotFire: a scan that raced a disable must not emit. The
+// disabled path is not an evaluation, so it also leaves the schedule alone — the
+// re-enable is going to re-anchor it.
+func TestADisabledWatchDoesNotFire(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	w, err := CreateWatch(context.Background(), db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	observed := due(t, clock, w)
+	off := false
+	if _, err := PatchWatch(context.Background(), db, clock, w.ID, PatchWatchRequest{Enabled: &off}); err != nil {
+		t.Fatalf("PatchWatch: %v", err)
+	}
+
+	res, err := Fire(context.Background(), db, clock, w.ID, observed)
+	if err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+	if res.Fired || !strings.Contains(res.Skipped, "disabled") {
+		t.Fatalf("Fire = %+v, want a disabled skip", res)
+	}
+	var items int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if items != 0 {
+		t.Fatalf("a disabled watch emitted %d items", items)
+	}
+}
+
+// TestFiringDoesNotTouchAParkedItemOrItsGrant is M3's rule held across M4: the
+// watch path creates items and does nothing else. A parked item keeps its request,
+// its attempt and its lease-free state, and its run stays escalated.
+func TestFiringDoesNotTouchAParkedItemOrItsGrant(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	itemID, runID, nodeID := parkOneRun(t, db, clock)
+	if err := Escalate(context.Background(), db, clock, runID, nodeID, ApprovalRequest{
+		Action: "delete /var/cache/app", Reason: "needs the disk",
+	}, RunTokens{}); err != nil {
+		t.Fatalf("Escalate: %v", err)
+	}
+	_ = itemID
+
+	w, res := fireOne(t, db, clock)
+	if !res.Fired {
+		t.Fatalf("Fire = %+v, want a fire", res)
+	}
+	if w.ID == "" {
+		t.Fatal("no watch")
+	}
+	var status, request string
+	var attempt int
+	if err := db.QueryRow(`SELECT status, COALESCE(approval_request,''), attempt FROM work_items WHERE id=?`, itemID).
+		Scan(&status, &request, &attempt); err != nil {
+		t.Fatalf("read parked item: %v", err)
+	}
+	if status != "needs_approval" || request == "" || attempt != 1 {
+		t.Fatalf("parked item = %q, request %q, attempt %d; the watch path changed it", status, request, attempt)
+	}
+	var runStatus string
+	if err := db.QueryRow(`SELECT status FROM runs WHERE id=?`, runID).Scan(&runStatus); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if runStatus != "escalated" {
+		t.Fatalf("run status = %q after a watch fired, want escalated", runStatus)
+	}
+}
+
+// TestAFiredItemIsClaimable closes the loop M4 exists for: a watch emits work and
+// the machinery that already exists picks it up. A watch whose items cannot be
+// claimed is a spam generator (spec §18).
+func TestAFiredItemIsClaimable(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+
+	w, res := fireOne(t, db, clock)
+	if !res.Fired {
+		t.Fatalf("Fire = %+v, want a fire", res)
+	}
+	claimed, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim = %d items, err %v; want the emitted item", len(claimed), err)
+	}
+	if claimed[0].Item.ID != res.ItemID {
+		t.Fatalf("claimed %s, want the fired item %s", claimed[0].Item.ID, res.ItemID)
+	}
+	_ = w
+}
+
+// TestAFireThatIsNotDueIsRefused: Fire does not trust its scanner. A scheduler
+// that called it for every watch — a bug, but a cheap one to guard against — must
+// not be able to emit an item before the schedule says so.
+func TestAFireThatIsNotDueIsRefused(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	res, err := Fire(ctx, db, clock, w.ID, *w.NextFireAt)
+	if err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+	if res.Fired {
+		t.Fatalf("Fire = %+v for a watch due in five minutes, want a skip", res)
+	}
+	var items int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if items != 0 {
+		t.Fatalf("an early fire emitted %d items", items)
+	}
+}
+
+// TestTwoFiresCannotBothEmitTheSameSlot is the guard's real test. The Go pre-check
+// in Fire refuses a stale token on its own, so a single-threaded test cannot tell
+// whether the SQL guard exists — and the guard is what protects two manager
+// processes. Two connections on one file, both holding the same token, exactly one
+// fire (the same shape as TestClaimIsExactlyOnceUnderConcurrency, and for the same
+// reason: one pool would serialise the calls inside database/sql).
+func TestTwoFiresCannotBothEmitTheSameSlot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "board.db")
+	db, clock := OpenForTest(t, path)
+	other, err := Open(path)
+	if err != nil {
+		t.Fatalf("open a second handle: %v", err)
+	}
+	t.Cleanup(func() { other.Close() })
+
+	w, err := CreateWatch(context.Background(), db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	observed := due(t, clock, w)
+
+	handles := []*sql.DB{db, other}
+	results := make([]FireResult, len(handles))
+	errs := make([]error, len(handles))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range handles {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = Fire(context.Background(), handles[i], clock, w.ID, observed)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	fired := 0
+	for i, res := range results {
+		if errs[i] != nil {
+			t.Fatalf("Fire(%d): %v", i, errs[i])
+		}
+		if res.Fired {
+			fired++
+		}
+	}
+	if fired != 1 {
+		t.Fatalf("fired = %d of 2 concurrent fires of one slot (%+v), want exactly 1", fired, results)
+	}
+
+	var items, events int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items`).Scan(&items); err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM events WHERE type='fired'`).Scan(&events); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if items != 1 || events != 1 {
+		t.Fatalf("items=%d fired events=%d after a concurrent race, want 1 and 1", items, events)
 	}
 }
