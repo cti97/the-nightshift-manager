@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -1887,3 +1888,186 @@ func TestAWatchStateCarriesOnlyACurrentSkip(t *testing.T) {
 
 // ptrInt64 is fixture sugar for the PatchWatchRequest's pointer fields.
 func ptrInt64(v int64) *int64 { return &v }
+
+// TestASlowProbeDoesNotHoldTheWriteLock: BEGIN IMMEDIATE takes the database's single
+// write lock, so a probe that ran inside the transaction would stop every claim,
+// heartbeat and report for as long as it ran. The probe is taken before the lock; this
+// test writes while a two-second probe is mid-flight and fails if the write waited.
+func TestASlowProbeDoesNotHoldTheWriteLock(t *testing.T) {
+	dir := t.TempDir()
+	db, clock := OpenForTest(t, filepath.Join(dir, "board.db"))
+	ctx := context.Background()
+	started := filepath.Join(dir, "probe-started")
+	req := watchReq("slow")
+	req.Probe = `touch "` + started + `"; sleep 2; exit 0`
+	w, err := CreateWatch(ctx, db, clock, req)
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	at := due(t, clock, w)
+
+	type outcome struct {
+		res FireResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := Fire(ctx, db, clock, w.ID, at)
+		done <- outcome{res, err}
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the probe never started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	writeStart := time.Now()
+	if _, err := db.Exec(`INSERT INTO config (key,value) VALUES ('during-probe','1')`); err != nil {
+		t.Fatalf("a write during a probe failed: %v (waited %s)", err, time.Since(writeStart))
+	}
+	if waited := time.Since(writeStart); waited > 500*time.Millisecond {
+		t.Fatalf("a write waited %s behind a running probe; the probe is holding the write lock", waited)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil || !got.res.Fired {
+			t.Fatalf("Fire = %+v, err %v; want the probe's watch to fire", got.res, got.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Fire never returned")
+	}
+}
+
+// TestATimedOutProbeTakesItsChildrenWithIt: a probe is arbitrary shell, and killing only
+// the shell leaves its children running — and holding the output pipe. The timeout kills
+// the process group, so the whole observation is abandoned.
+func TestATimedOutProbeTakesItsChildrenWithIt(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	probe := `sleep 30 & echo $! > "` + pidFile + `"; wait`
+
+	exit, tail, timedOut := runWatchProbe(context.Background(), probe, 300*time.Millisecond)
+	if !timedOut {
+		t.Fatalf("probe = exit %d, tail %q; want a timeout", exit, tail)
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("the probe did not record its child's pid: %v (tail %q)", err, tail)
+	}
+	pid := strings.TrimSpace(string(raw))
+	if pid == "" {
+		t.Fatalf("empty pid file (tail %q)", tail)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processAlive(t, pid) {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("child %s survived the probe's timeout: only the shell was killed", pid)
+}
+
+// processAlive asks ps, so the check does not depend on signal semantics a test cannot
+// see. ps -p <pid> exits non-zero when the process is gone.
+func processAlive(t *testing.T, pid string) bool {
+	t.Helper()
+	out, err := exec.Command("ps", "-p", pid, "-o", "pid=").Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
+// TestAPassRespectsItsTimeBudget: one slow probe must not let a pass run for as long as
+// the probes take. The watch the budget cut off stays due and the next pass fires it.
+func TestAPassRespectsItsTimeBudget(t *testing.T) {
+	old := watchPassBudget
+	watchPassBudget = 100 * time.Millisecond
+	t.Cleanup(func() { watchPassBudget = old })
+
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	slowReq := watchReq("slow")
+	slowReq.Probe = "sleep 0.4; exit 0"
+	slow, err := CreateWatch(ctx, db, clock, slowReq)
+	if err != nil {
+		t.Fatalf("CreateWatch slow: %v", err)
+	}
+	fast, err := CreateWatch(ctx, db, clock, watchReq("fast"))
+	if err != nil {
+		t.Fatalf("CreateWatch fast: %v", err)
+	}
+	// The slow watch sorts first: ORDER BY next_fire_at, id, and ids are random tokens.
+	if _, err := db.Exec(`UPDATE watches SET next_fire_at=next_fire_at-10 WHERE id=?`, slow.ID); err != nil {
+		t.Fatalf("order the watches: %v", err)
+	}
+	clock.Advance(300 * time.Second)
+
+	pass, err := RunWatchesOnce(ctx, db, clock)
+	if err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if pass.Fired != 1 {
+		t.Fatalf("first pass = %+v, want the slow watch only", pass)
+	}
+	cut, err := GetWatch(ctx, db, fast.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if cut.LastFiredAt != nil {
+		t.Fatal("the pass ran past its budget and fired the second watch")
+	}
+
+	pass, err = RunWatchesOnce(ctx, db, clock)
+	if err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if pass.Fired != 1 {
+		t.Fatalf("second pass = %+v, want the watch the first pass left", pass)
+	}
+}
+
+// TestACancelledEvaluationWritesNoSkip: a probe killed by the manager's own shutdown is
+// not the watch's failure. Writing a skip there would put the shutdown in the watch's
+// history and, for a condition, look like a failed check.
+func TestACancelledEvaluationWritesNoSkip(t *testing.T) {
+	dir := t.TempDir()
+	db, clock := OpenForTest(t, filepath.Join(dir, "board.db"))
+	ctx := context.Background()
+	req := watchReq("slow")
+	req.Trigger, req.Schedule, req.Probe = TriggerCondition, "", "sleep 2; exit 0"
+	w, err := CreateWatch(ctx, db, clock, req)
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE watches SET last_result=1 WHERE id=?`, w.ID); err != nil {
+		t.Fatalf("seed last_result: %v", err)
+	}
+	at := due(t, clock, w)
+
+	probeCtx, cancel := context.WithCancel(ctx)
+	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
+	res, err := Fire(probeCtx, db, clock, w.ID, at)
+	if err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+	if res.Fired {
+		t.Fatalf("Fire = %+v on a cancelled evaluation, want a skip", res)
+	}
+	current, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if current.LastSkipAt != nil || current.LastSkipReason != "" {
+		t.Fatalf("a cancelled evaluation wrote a skip: %s / %q", deref(current.LastSkipAt), current.LastSkipReason)
+	}
+	if current.LastResult == nil || !*current.LastResult {
+		t.Fatalf("last_result = %v, want the seeded true untouched", current.LastResult)
+	}
+}

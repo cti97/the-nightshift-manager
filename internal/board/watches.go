@@ -367,12 +367,68 @@ type FireResult struct {
 // The item is queued and ordinary in every other respect: placement routes it, a
 // node claims it, it can escalate and be approved. A watch emits work, it does not
 // run it.
+// probeResult is one probe's answer, carried from the unlocked phase into the
+// transaction. By the time the transaction decides, the probe is finished: this is a
+// value, not a handle.
+type probeResult struct {
+	exit     int
+	tail     string
+	timedOut bool
+}
+
 func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observedNextFire int64) (FireResult, error) {
-	// BEGIN IMMEDIATE on a dedicated connection, the pattern Claim uses and for the
-	// same reason: a deferred transaction that reads and then writes can lose the
-	// upgrade to another writer with SQLITE_BUSY no matter how long its busy timeout
-	// is. Taking the write lock first makes the two fires queue instead of collide,
-	// and the guards below then decide which one has anything to do.
+	// Phase 1, unlocked: decide whether this watch is worth a probe, and if it is, run
+	// it WITHOUT holding a write lock.
+	//
+	// The probe must not run inside the transaction. BEGIN IMMEDIATE takes the
+	// database's single write lock, and a probe may take thirty seconds (watchProbeTimeout):
+	// one slow probe would stop every claim, heartbeat and report on the board for as
+	// long as it ran, and the board's whole promise is that it keeps working while a
+	// run is stuck. An observation is a fact about a moment, so it is taken here and
+	// used below only if the row is still the same row.
+	w, err := GetWatch(ctx, db, watchID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// A watch that vanished between the scan and this evaluation is not a
+			// failure of the pass: there is simply nothing to evaluate. (There is no
+			// delete route — D10 — so this is a hand-edited board, and reporting it as
+			// an error would make one bad row stop the scheduler every tick.)
+			return FireResult{Skipped: "the watch no longer exists"}, nil
+		}
+		return FireResult{}, fmt.Errorf("watch %s: %w", watchID, err)
+	}
+	if !w.Enabled {
+		// Not an evaluation: the row is off, and D7's skip record is for a watch that
+		// was considered and refused. Writing here would also overwrite the schedule a
+		// re-enable is about to re-anchor.
+		return FireResult{Skipped: "the watch is disabled"}, nil
+	}
+	if w.NextFireAt == nil || *w.NextFireAt != observedNextFire {
+		// The schedule moved between the scan and this evaluation: another scheduler
+		// fired it, or an operator patched it. Either way this scan is stale and must
+		// not spend a probe on it.
+		return FireResult{Skipped: "the schedule moved since the scan"}, nil
+	}
+	var probe *probeResult
+	if w.Probe != "" && skipReason(w, clock.Now()) == "" {
+		// A held or windowed watch does not pay for a probe (D6's order: the decision
+		// is already made).
+		exit, tail, timedOut := runWatchProbe(ctx, w.Probe, watchProbeTimeout)
+		probe = &probeResult{exit: exit, tail: tail, timedOut: timedOut}
+	}
+
+	if ctx.Err() != nil {
+		// Shutting down between the probe and the transaction: the probe's death is ours,
+		// not the watch's, so nothing is written and the slot stays due.
+		return FireResult{Skipped: "the evaluation was cancelled"}, nil
+	}
+
+	// Phase 2, the transaction. Everything read in phase 1 is re-read here, because a
+	// probe can take half a minute and an operator can hold, disable or patch the
+	// watch while it runs. BEGIN IMMEDIATE on a dedicated connection, the pattern
+	// Claim uses and for the same reason: a deferred transaction that reads and then
+	// writes can lose the upgrade to another writer with SQLITE_BUSY no matter how
+	// long its busy timeout is.
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return FireResult{}, err
@@ -388,27 +444,17 @@ func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observed
 		}
 	}()
 
-	w, err := scanWatch(conn.QueryRowContext(ctx, `SELECT `+watchColumns+` FROM watches WHERE id=?`, watchID))
+	w, err = scanWatch(conn.QueryRowContext(ctx, `SELECT `+watchColumns+` FROM watches WHERE id=?`, watchID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// A watch that vanished between the scan and this transaction is not a
-			// failure of the pass: there is simply nothing to evaluate. (There is no
-			// delete route — D10 — so this is a hand-edited board, and reporting it
-			// as an error would make one bad row stop the scheduler every tick.)
 			return FireResult{Skipped: "the watch no longer exists"}, nil
 		}
 		return FireResult{}, fmt.Errorf("watch %s: %w", watchID, err)
 	}
 	if !w.Enabled {
-		// Not an evaluation: the row is off, and D7's skip record is for a watch
-		// that was considered and refused. Advancing here would also overwrite the
-		// schedule a re-enable is about to re-anchor.
 		return FireResult{Skipped: "the watch is disabled"}, nil
 	}
 	if w.NextFireAt == nil || *w.NextFireAt != observedNextFire {
-		// The schedule moved between the scan and this transaction: another
-		// scheduler fired it, or an operator patched it. Either way this scan is
-		// stale and must not fire.
 		return FireResult{Skipped: "the schedule moved since the scan"}, nil
 	}
 
@@ -448,35 +494,49 @@ func Fire(ctx context.Context, db *sql.DB, clock Clock, watchID string, observed
 		return FireResult{Skipped: reason}, nil
 	}
 
-	// The operator's hold, then the system's window (D6).
+	// The operator's hold, then the system's window (D6) — re-checked, because the
+	// operator may have held the watch while the probe ran.
 	if reason := skipReason(w, now); reason != "" {
 		return skip(reason, nil)
 	}
 
 	// The probe (D5, D8). A condition watch fires on the false→true transition and
 	// only there; last_result holds the previous observation, so a manager restart
-	// cannot re-fire a condition that was already true. An interval or cron watch
-	// uses its probe as a gate: true proceeds to the fire, false is a skip.
+	// cannot re-fire a condition that was already true. An interval or cron watch uses
+	// its probe as a gate: true proceeds to the fire, false is a skip.
 	var observed *bool
 	if w.Probe != "" {
-		exit, tail, timedOut := runWatchProbe(ctx, w.Probe, watchProbeTimeout)
-		if timedOut {
+		if probe == nil {
+			// Phase 1 saw a refusal (a hold or a window) and did not probe; the refusal
+			// is gone now, so this evaluation has no observation. Firing a gated watch on
+			// an observation nobody took would be a guess; leave the slot where it is and
+			// let the next pass evaluate it properly.
+			return FireResult{Skipped: "the watch became firable while it was being evaluated; the next pass will take it"}, nil
+		}
+		if ctx.Err() != nil {
+			// The manager is shutting down, and the probe it killed is why there is no
+			// observation. Recording that as the watch's skip would put our shutdown in
+			// the watch's history and, for a condition, look like a failed check. The slot
+			// stays due for whoever starts next.
+			return FireResult{Skipped: "the evaluation was cancelled"}, nil
+		}
+		if probe.timedOut {
 			// The observation did not happen, so nothing is recorded: treating a timeout
 			// as "false" would make a condition fire spuriously on the tick after a slow
 			// probe, and treat an outage as a state change.
 			return skip(fmt.Sprintf("the probe did not finish within %s; the observation did not happen", watchProbeTimeout), nil)
 		}
-		v := exit == 0
+		v := probe.exit == 0
 		observed = &v
 		if w.Trigger == TriggerCondition {
 			if !v {
-				return skip(probeReason("the condition is false", exit, tail), observed)
+				return skip(probeReason("the condition is false", probe.exit, probe.tail), observed)
 			}
 			if w.LastResult != nil && *w.LastResult {
 				return skip("the condition is already true; a condition fires on the transition, not on every check", observed)
 			}
 		} else if !v {
-			return skip(probeReason("the probe reported false", exit, tail), observed)
+			return skip(probeReason("the probe reported false", probe.exit, probe.tail), observed)
 		}
 	}
 
@@ -621,6 +681,15 @@ type dueWatch struct {
 	observed int64
 }
 
+// watchPassBudget bounds how long one pass may spend starting watches. A probe can
+// take thirty seconds, so a board with many due probes could otherwise spend ten
+// minutes in a single pass while every other watch stays unexamined. A watch the budget
+// cuts off is still due — the next pass picks it up, in the same order.
+//
+// The budget is wall-clock, deliberately: it is an operational bound on a subprocess
+// tree, not a fact about board time, and a fake clock must not be able to turn it off.
+var watchPassBudget = 20 * time.Second
+
 // RunWatchesOnce is one scheduler pass: scan the due watches and fire each one.
 //
 // A watch that errors does not stop the pass. The scan order is stable, so returning
@@ -651,7 +720,13 @@ func RunWatchesOnce(ctx context.Context, db *sql.DB, clock Clock) (WatchPass, er
 
 	var pass WatchPass
 	var errs []error
+	started := time.Now()
 	for _, d := range due {
+		if time.Since(started) > watchPassBudget {
+			// Out of time for this pass. Everything left is still due; the next pass
+			// starts with the same ordering, so the oldest slots go first.
+			break
+		}
 		if err := ctx.Err(); err != nil {
 			// Shutdown mid-pass: the remaining watches stay due and the next
 			// manager picks them up. Reporting it as a failure would blame the rows.
@@ -659,6 +734,10 @@ func RunWatchesOnce(ctx context.Context, db *sql.DB, clock Clock) (WatchPass, er
 		}
 		res, err := Fire(ctx, db, clock, d.id, d.observed)
 		if err != nil {
+			if ctx.Err() != nil {
+				// The manager is stopping; the error is the shutdown, not the watch.
+				break
+			}
 			pass.Failed++
 			errs = append(errs, fmt.Errorf("watch %s: %w", d.id, err))
 			continue

@@ -234,6 +234,17 @@ a node. A watch that needs to check something that only exists on a laptop must 
 a work item with the right `needs` and let placement route it — otherwise the watch has
 quietly become a job runner on the wrong machine.
 
+Two bounds make that safe, both learned when the board was exercised rather than designed:
+
+- **A probe never runs inside a write transaction.** `BEGIN IMMEDIATE` is the database's single
+  write lock, and a probe may take thirty seconds; running it under the lock would stop every
+  claim, heartbeat and report for as long as the probe ran. The observation is taken first,
+  then the transaction re-reads the row and uses the observation only if it is still the same
+  slot.
+- **A pass has a time budget** (20s against a 15s tick). A board with many due probes must
+  degrade — watches later in the order stay due for the next pass — rather than spend ten
+  minutes in one pass while everything else waits.
+
 ### Invariants
 
 1. `runs` is append-only. `(work_item_id, attempt)` is unique. Every attempt is recorded,

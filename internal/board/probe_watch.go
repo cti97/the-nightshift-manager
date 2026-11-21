@@ -40,6 +40,10 @@ func runWatchProbe(ctx context.Context, command string, timeout time.Duration) (
 
 	cmd := exec.CommandContext(probeCtx, "/bin/sh", "-c", command)
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	// A probe is arbitrary shell: put it in its own process group so a timeout kills
+	// what it started, not only the shell. See probe_unix.go.
+	setProbeGroup(cmd)
+	cmd.Cancel = func() error { return killProbeGroup(cmd) }
 	// A killed shell can leave a child holding its output pipe, and Wait waits for
 	// that pipe before returning — a `sleep` in a probe made a 50ms timeout take two
 	// seconds. WaitDelay closes the pipes shortly after the process exits.
