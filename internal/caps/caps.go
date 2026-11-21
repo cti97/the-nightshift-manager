@@ -21,7 +21,17 @@ const (
 	localFSPrefix = "local_fs:"
 	tokensPrefix  = "tokens:"
 	lanPrefix     = "lan:"
+	sandboxPrefix = "sandbox:"
 )
+
+// sandboxProfiles is the closed set of confinement a node may declare and an item may require
+// (spec §22.1). It is deliberately NOT a strength order: Seatbelt, bwrap and a systemd scope are
+// different mechanisms on different platforms, and a scheduler that treated one as "at least"
+// another would place work on a boundary it cannot reason about. The single hierarchy that is
+// true is the floor: any real mechanism also confines the run to a directory.
+var sandboxProfiles = map[string]struct{}{
+	"none": {}, "dir": {}, "bwrap": {}, "systemd_scope": {}, "seatbelt": {},
+}
 
 // Parse validates and canonicalises a capability list: trimmed, sorted, and
 // de-duplicated; local_fs paths are reduced to their canonical form, and
@@ -71,6 +81,12 @@ func validate(c string) (string, error) {
 			return "", fmt.Errorf("capability %q: tokens must be a positive integer", c)
 		}
 		return c, nil
+	case strings.HasPrefix(c, sandboxPrefix):
+		profile := strings.TrimPrefix(c, sandboxPrefix)
+		if _, ok := sandboxProfiles[profile]; !ok {
+			return "", fmt.Errorf("capability %q: unknown sandbox profile (want none, dir, bwrap, systemd_scope or seatbelt)", c)
+		}
+		return sandboxPrefix + profile, nil
 	case strings.HasPrefix(c, lanPrefix):
 		name := strings.TrimSpace(strings.TrimPrefix(c, lanPrefix))
 		if name == "" {
@@ -159,7 +175,31 @@ func satisfiedBy(need string, provides []string) bool {
 			if ok1 && ok2 && n == pn {
 				return true
 			}
+		case strings.HasPrefix(need, sandboxPrefix) && strings.HasPrefix(p, sandboxPrefix):
+			// Exact match, plus the one hierarchy that is true: anything stronger than "none"
+			// also satisfies the directory floor. The profiles are not otherwise ordered —
+			// Seatbelt and bwrap are different mechanisms, not rungs of a ladder (see
+			// sandboxProfiles).
+			want := strings.TrimPrefix(need, sandboxPrefix)
+			have := strings.TrimPrefix(p, sandboxPrefix)
+			if want == have || (want == "dir" && have != "none") {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// SandboxProfile is the confinement a node's capabilities declare, or "none" when it declares
+// none. A node declares nothing rather than declaring "sandbox:none", because a capability list
+// states what the machine can do; absence is the honest way to say it cannot confine.
+func SandboxProfile(provides []string) string {
+	for _, p := range provides {
+		if strings.HasPrefix(p, sandboxPrefix) {
+			if prof := strings.TrimPrefix(p, sandboxPrefix); prof != "none" {
+				return prof
+			}
+		}
+	}
+	return "none"
 }

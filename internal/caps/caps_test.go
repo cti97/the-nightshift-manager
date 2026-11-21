@@ -155,3 +155,55 @@ func TestMissingAllCovered(t *testing.T) {
 		t.Fatalf("Missing = %v, want no gaps", got)
 	}
 }
+
+// TestSandboxCapabilitiesAreClosedAndNotALadder: the profile names are a closed set, and the only
+// ordering is the directory floor. Seatbelt and bwrap are different mechanisms on different
+// platforms; treating one as "at least" the other would place work on a boundary the scheduler
+// cannot reason about.
+func TestSandboxCapabilitiesAreClosedAndNotALadder(t *testing.T) {
+	for _, ok := range []string{"sandbox:none", "sandbox:dir", "sandbox:bwrap", "sandbox:systemd_scope", "sandbox:seatbelt"} {
+		if _, err := Parse([]string{ok}); err != nil {
+			t.Fatalf("Parse(%q) = %v, want it accepted", ok, err)
+		}
+	}
+	// Parse trims the whole capability before validating, as it does for every prefix, so a
+	// trailing space is normalised rather than refused.
+	for _, bad := range []string{"sandbox:quantum", "sandbox:", "sandbox: bwrap"} {
+		if _, err := Parse([]string{bad}); err == nil {
+			t.Fatalf("Parse(%q) accepted an unknown profile", bad)
+		}
+	}
+
+	cases := []struct {
+		need, have string
+		want       bool
+	}{
+		{"sandbox:seatbelt", "sandbox:seatbelt", true},
+		{"sandbox:dir", "sandbox:seatbelt", true},    // the one true hierarchy: a mechanism is a directory too
+		{"sandbox:dir", "sandbox:bwrap", true},       //
+		{"sandbox:dir", "sandbox:none", false},       // "none" confines nothing, not even a directory
+		{"sandbox:seatbelt", "sandbox:bwrap", false}, // different mechanisms, not rungs
+		{"sandbox:bwrap", "sandbox:systemd_scope", false},
+		{"sandbox:seatbelt", "", false},
+	}
+	for _, c := range cases {
+		var provides []string
+		if c.have != "" {
+			provides = []string{c.have}
+		}
+		if got := Satisfies([]string{c.need}, provides); got != c.want {
+			t.Fatalf("Satisfies(%q, %v) = %v, want %v", c.need, provides, got, c.want)
+		}
+	}
+}
+
+// TestSandboxProfileReadsTheDeclaration: a node that declares nothing is "none", not "unknown" —
+// the dashboard needs one word for "this machine cannot confine a run".
+func TestSandboxProfileReadsTheDeclaration(t *testing.T) {
+	if got := SandboxProfile([]string{"agentic"}); got != "none" {
+		t.Fatalf("a node declaring no profile = %q, want none", got)
+	}
+	if got := SandboxProfile([]string{"agentic", "sandbox:seatbelt"}); got != "seatbelt" {
+		t.Fatalf("profile = %q, want seatbelt", got)
+	}
+}

@@ -205,8 +205,11 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 // on every beat: the board stores the live set, and an empty one here would
 // overwrite the registration on purpose (the node can then claim nothing).
 func (a *Agent) heartbeat(ctx context.Context) {
+	// The confinement capability is appended to the declared set on every beat, from the probe
+	// rather than from configuration: what this agent can promise about the boundary is a fact
+	// about the machine, and a stale claim here is a run placed on a sandbox that is not there.
 	resp, err := a.c.Heartbeat(ctx, board.HeartbeatRequest{
-		ProvidesLive: a.cfg.Provides,
+		ProvidesLive: append(append([]string{}, a.cfg.Provides...), SandboxCapability()...),
 		ReachClasses: a.cfg.Reaches,
 		FreeSlots:    freeSlots,
 		Protocol:     a.cfg.Protocol,

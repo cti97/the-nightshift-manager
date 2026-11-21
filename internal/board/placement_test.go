@@ -1,6 +1,7 @@
 package board
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -309,4 +310,73 @@ func TestEligibleCarriesTheProbeReason(t *testing.T) {
 	if _, why := Eligible(item("agentic"), quiet); strings.Contains(why, ": ") {
 		t.Fatalf("why = %q, want no colon when there is no reason", why)
 	}
+}
+
+// TestASandboxRequirementIsEnforcedByPlacement: the review's A9, in the smallest shape that makes
+// it real. A node declares its confinement as a capability; an item that needs one is placed only
+// where the declaration covers it, and /why prints the refusal. Nothing here trusts a comment in
+// sandbox.go — the scheduler refuses the placement.
+func TestASandboxRequirementIsEnforcedByPlacement(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+
+	// Two nodes: one that confines (Seatbelt) and one that does not (declares nothing).
+	confined, token, err := RegisterNode(ctx, db, clock, RegisterRequest{
+		Name: "mac", Role: "executor", ProvidesDeclared: []string{"agentic"},
+		ReachClasses: []string{"host"}, Concurrency: 1,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	if _, err := Heartbeat(ctx, db, clock, confined, HeartbeatRequest{
+		ProvidesLive: []string{"agentic", "sandbox:seatbelt"},
+		ReachClasses: []string{"host"}, Protocol: ProtocolMax,
+	}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	plain, plainToken, err := RegisterNode(ctx, db, clock, RegisterRequest{
+		Name: "plain", Role: "executor", ProvidesDeclared: []string{"agentic"},
+		ReachClasses: []string{"host"}, Concurrency: 1,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	if _, err := Heartbeat(ctx, db, clock, plain, HeartbeatRequest{
+		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host"}, Protocol: ProtocolMax,
+	}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+
+	// The unconfined node must be offline, so the only candidate is the confined one.
+	if _, err := db.Exec(`UPDATE nodes SET status='offline' WHERE id=?`, plain); err != nil {
+		t.Fatalf("take the plain node offline: %v", err)
+	}
+	item := mustCreateItemNeeding(t, db, clock, []string{"agentic", "sandbox:seatbelt"})
+	got := mustClaim(t, db, clock, confined, 1)
+	if len(got) != 1 || got[0].Item.ID != item {
+		t.Fatalf("claim on the confined node = %d items, want the sandbox item", len(got))
+	}
+
+	// Now the reverse: the confined node is the only one online, and the item needs bwrap, which it
+	// cannot provide. No placement, and /why names the missing capability.
+	if _, err := db.Exec(`UPDATE nodes SET status='offline' WHERE id=?`, confined); err != nil {
+		t.Fatalf("take the confined node offline: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE nodes SET status='online' WHERE id=?`, plain); err != nil {
+		t.Fatalf("bring the plain node online: %v", err)
+	}
+	bwrap := mustCreateItemNeeding(t, db, clock, []string{"agentic", "sandbox:bwrap"})
+	if got := mustClaim(t, db, clock, plain, 1); len(got) != 0 {
+		t.Fatalf("the unconfined node claimed %d bwrap items, want none", len(got))
+	}
+	ex, err := Explain(ctx, db, clock, bwrap)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if ex.Placed || !strings.Contains(ex.BlockedReason, "sandbox:bwrap") {
+		t.Fatalf("why = %q (placed %v), want the missing sandbox named", ex.BlockedReason, ex.Placed)
+	}
+	_ = token
+	_ = plainToken
 }

@@ -659,6 +659,22 @@ var (
 // this function or by the running process, and on a non-darwin OS it has no
 // effect: the test skips on the platform before it reads the variable, and there
 // is no kernel layer here for it to require.
+// SandboxCapability is the confinement this machine can honestly promise, as a capability for the
+// heartbeat. It is computed from the same probe the run itself uses, not configured: a flag could
+// declare a boundary the tools do not have, and placement would then route confinement-requiring
+// work to a machine that cannot confine it.
+//
+// Only Seatbelt is claimed today. Linux has no profile in the agent's tool path (the run
+// directory is a plain directory there), so a Linux node declares nothing and an item needing
+// `sandbox:dir` or better will not be placed on it — which is the honest answer until a bwrap or
+// systemd-scope path exists.
+func SandboxCapability() []string {
+	if active, _ := KernelConfinement(); active {
+		return []string{"sandbox:seatbelt"}
+	}
+	return nil
+}
+
 func KernelConfinement() (bool, string) {
 	k := detectKernel()
 	if k.path != "" {

@@ -2,16 +2,24 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/cti97/the-nightshift-manager/internal/board"
+	"github.com/cti97/the-nightshift-manager/internal/caps"
 )
 
 // newTestSandbox is the common fixture: a sandbox under a temporary root that
@@ -612,5 +620,62 @@ func TestKernelConfinementStatesTheReason(t *testing.T) {
 	}
 	if runtime.GOOS != "darwin" && active {
 		t.Fatal("kernel confinement is reported active on a non-darwin OS")
+	}
+}
+
+// TestTheHeartbeatDeclaresTheConfinementTheProbeFinds: the sandbox capability is derived from the
+// probe on every beat, never from configuration. A node that declared Seatbelt on a machine where
+// sandbox-exec cannot apply a profile would be handed confinement-requiring work it cannot confine.
+func TestTheHeartbeatDeclaresTheConfinementTheProbeFinds(t *testing.T) {
+	active, why := KernelConfinement()
+	got := SandboxCapability()
+	if active {
+		if len(got) != 1 || got[0] != "sandbox:seatbelt" {
+			t.Fatalf("SandboxCapability() = %v with confinement active, want [sandbox:seatbelt]", got)
+		}
+		return
+	}
+	if len(got) != 0 {
+		t.Fatalf("SandboxCapability() = %v without confinement (%s), want nothing declared", got, why)
+	}
+}
+
+// TestTheAgentSendsTheSandboxCapabilityOnTheWire: the derivation above is only worth anything if the
+// heartbeat carries it. The board enforces declared capabilities, so a capability computed and not
+// sent is a capability that does not exist.
+func TestTheAgentSendsTheSandboxCapabilityOnTheWire(t *testing.T) {
+	var mu sync.Mutex
+	var last board.HeartbeatRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/nodes/heartbeat") {
+			body, _ := io.ReadAll(r.Body)
+			var hb board.HeartbeatRequest
+			if json.Unmarshal(body, &hb) == nil {
+				mu.Lock()
+				last = hb
+				mu.Unlock()
+			}
+		}
+		board.WriteJSON(w, http.StatusOK, board.HeartbeatResponse{Status: "online"})
+	}))
+	defer srv.Close()
+
+	a := New(Config{BaseURL: srv.URL, Token: "t", NodeID: "n", Protocol: board.ProtocolMax,
+		Provides: []string{"agentic"}, Reaches: []string{"host"}})
+	a.heartbeat(context.Background())
+
+	mu.Lock()
+	sent := append([]string{}, last.ProvidesLive...)
+	mu.Unlock()
+	if len(sent) == 0 {
+		t.Fatal("no heartbeat reached the server")
+	}
+	active, _ := KernelConfinement()
+	if active {
+		if !caps.Satisfies([]string{"sandbox:seatbelt"}, sent) {
+			t.Fatalf("heartbeat capabilities = %v, want seatbelt among them", sent)
+		}
+	} else if caps.Satisfies([]string{"sandbox:dir"}, sent) {
+		t.Fatalf("heartbeat capabilities = %v declare confinement on a machine without it", sent)
 	}
 }

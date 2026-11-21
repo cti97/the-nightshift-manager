@@ -83,6 +83,19 @@ func mustCreateItem(t *testing.T, db *sql.DB, clock *FixedClock, title string) s
 	return id
 }
 
+// mustCreateItemNeeding creates an item with exactly these needs, for the tests where the needs are
+// the subject (sandbox requirements, say) rather than the fixture.
+func mustCreateItemNeeding(t *testing.T, db *sql.DB, clock *FixedClock, needs []string) string {
+	t.Helper()
+	id, err := CreateItem(context.Background(), db, clock, CreateItemRequest{
+		Title: "needy", Brief: "b", Needs: needs,
+	})
+	if err != nil {
+		t.Fatalf("CreateItem %v: %v", needs, err)
+	}
+	return id
+}
+
 func mustClaim(t *testing.T, db *sql.DB, clock *FixedClock, nodeID string, slots int) []ClaimedItem {
 	t.Helper()
 	got, err := Claim(context.Background(), db, clock, nodeID, slots)

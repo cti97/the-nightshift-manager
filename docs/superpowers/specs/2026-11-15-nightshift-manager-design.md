@@ -275,10 +275,17 @@ of producing permanently unplaceable work.
 | `local_fs:<path>` | Requires read access to a path on the node |
 | `lan:<service>` | Requires reliable presence inside the home LAN |
 | `tokens:<n>` | Estimated token budget; the model must accept it |
+| `sandbox:<profile>` | Requires that confinement: `none`, `dir`, `bwrap`, `systemd_scope`, `seatbelt` |
 
-Two capabilities are parameterized and do not match by string equality: `local_fs:<path>`
-matches when the provider's path is a prefix of the need, and `tokens:<n>` matches when
-`provided >= needed`. Everything else is exact.
+Four capabilities are parameterized and do not match by string equality: `local_fs:<path>`
+matches when the provider's path is a prefix of the need, `tokens:<n>` matches when
+`provided >= needed`, `lan:<service>` matches exactly, and `sandbox:<profile>` matches exactly
+with one exception — anything stronger than `none` also satisfies the `dir` floor, because a
+process boundary also confines the run to a directory. The profiles are **not** otherwise
+ordered: Seatbelt and bwrap are different mechanisms on different platforms, and a scheduler
+that treated one as "at least" another would place work on a boundary it cannot reason about. A
+node declares the profile it actually applies, from its own probe, on every heartbeat; a node
+that declares nothing cannot confine a run.
 
 **`no_egress` and `strict_local` are two different promises** and conflating them is how data
 leaks. A Pi serving a laptop over the home LAN satisfies `no_egress`. A rented GPU box in a
@@ -969,12 +976,17 @@ The three amendments below are the ones that would fit *this* design; the rest a
   a glitch. An epoch in the claim would still be the stronger design — it would catch a
   live-looking stale run — but the status guard makes that unreachable today, so it stays an
   option rather than a task.
-- **Confinement as a declared capability (A9).** `nodes` could declare `sandbox_profile`
-  (`none | dir | bwrap | systemd_scope | seatbelt`), an item could require one
-  (`sandbox:bwrap`), and placement would then enforce a safety property instead of only a
-  feature. `/why` would answer with the counterfactual — "nearest node is the laptop, missing
-  `sandbox:bwrap`". One column and one predicate; today Linux confinement is a comment in
-  `sandbox.go`, which is honest but not enforced.
+- **Confinement as a declared capability (A9 — done, without a column).** The review proposed a
+  `nodes.sandbox_profile` column; the capability list already carries exactly that, so
+  `sandbox:none | dir | bwrap | systemd_scope | seatbelt` became a closed capability family
+  instead. A node declares the profile it *actually applies*, computed from its own probe on
+  every heartbeat (never from a flag); an item requiring `sandbox:bwrap` is placed only where the
+  declaration covers it, and `/why` prints "no provider for sandbox:bwrap" for every node that
+  does not. The profiles are deliberately not a strength ladder — Seatbelt and bwrap are
+  different mechanisms — with one exception that is true: anything stronger than `none` also
+  satisfies the `dir` floor. Only Seatbelt is claimed today, because only Seatbelt is applied;
+  a Linux item requiring confinement is refused, which is the honest answer until a bwrap path
+  exists.
 - **Policy before the tool (A4).** `request_approval` is a tool the model may decline, so
   "anything real gets approved" is a convention. A per-node `allow | deny | ask` policy
   consulted before dispatch, with `request_approval` kept as the model's escape hatch, is what
