@@ -69,3 +69,20 @@ restart, and then exactly one item.
    issues from `ok` (probe it first), and a model serving `agentic` needs the `tools`
    feature. Both were M3 steps that had to be repeated here, and both failures were
    silent until `/why` named the rule.
+
+## Re-run after hardening (9cb3384)
+
+Part A was run again after the probe moved out of the write transaction and the pass
+gained its budget. Same result: one item within 9s of the edge, 45s quiet, escalate →
+approve → grant consumed → done, spend `0.00279`, `unpriced_runs: 0`. The restructure
+changed where the observation is taken, not what the board does with it.
+
+### The trade-off the fix accepts
+
+Moving the probe before the lock means two managers racing for the same slot will both
+run its probe, and one of them will lose the race at `BEGIN IMMEDIATE` and discard the
+observation. That is wasted work, and it is the price of not blocking the board for up
+to thirty seconds per probe. The alternative — one write to "claim" the slot before
+probing — would put a write on every probe and add a second reason a slot can be
+reserved, for a case (two schedulers on one database) that is already not the intended
+deployment.
