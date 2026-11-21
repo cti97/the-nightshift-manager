@@ -1,11 +1,13 @@
 #!/bin/sh
 # Fail if the working tree contains iCloud-style duplicate copies of source files.
 #
-# Why this exists: this repo lives inside an iCloud-synced Documents folder, and
-# the sync service drops copies named "name 2.go", "go 2.mod", "Makefile 2" into
-# the tree. They are untracked, so `git status` says almost nothing, but the Go
-# toolchain compiles them: the build dies with "redeclared in this block" and the
-# real cause is invisible. It has broken a green build twice.
+# Why this exists: this repo was once synced through iCloud, which drops copies
+# named "name 2.go", "go 2.mod", "Makefile 2" into the tree. It has since moved
+# out of iCloud, but the same thing happens with any sync client (Dropbox, OneDrive,
+# a backup tool restoring beside the original), and the copies are untracked, so
+# `git status` says almost nothing while the Go toolchain compiles them: the build
+# dies with "redeclared in this block" and the real cause is invisible. It broke a
+# green build twice, which is why the check is cheap enough to keep running.
 #
 # Fixing the symptom is a `mv`; making it visible is this script.
 set -eu

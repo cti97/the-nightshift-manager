@@ -84,7 +84,7 @@ const (
 	// pricingRule is what the numbers on /admin/spend/today mean. It travels
 	// with the response because a spend figure nobody can reproduce is a spend
 	// figure nobody should trust.
-	pricingRule = "input tokens and reserved tokens at the model's cost_in_per_mtok; output tokens at cost_out_per_mtok; priced once at report time and frozen on the run"
+	pricingRule = "input tokens and reserved tokens at the model's cost_in_per_mtok; output tokens at cost_out_per_mtok; priced once at report time and frozen on the run; runs the reaper settled without a report count as zero because their usage is unknowable, and lost_runs says how many"
 )
 
 // SpendDay returns the calendar day containing the instant now (Unix seconds):
@@ -245,9 +245,16 @@ type SpendStatus struct {
 	// nothing: a free local model, or a model nobody priced. Both are legitimate
 	// and only one is a mistake, so the ledger reports the count instead of
 	// deciding which it was.
-	UnpricedRuns int          `json:"unpriced_runs"`
-	Pricing      string       `json:"pricing"`
-	ByModel      []ModelSpend `json:"by_model"`
+	UnpricedRuns int `json:"unpriced_runs"`
+	// LostRuns counts today's runs the reaper settled without a report ('lost' or
+	// 'abandoned'). They contribute nothing to Spent on purpose — a crashed
+	// attempt's tokens are unknowable and inventing them would be worse than
+	// under-counting (sumSpend) — but a total that does not say how many such runs
+	// it is missing cannot be explained, and an unexplained bill is the failure
+	// this ledger exists to prevent.
+	LostRuns int          `json:"lost_runs"`
+	Pricing  string       `json:"pricing"`
+	ByModel  []ModelSpend `json:"by_model"`
 }
 
 // spendReader is the read surface a ledger query needs. *sql.DB, *sql.Tx and
@@ -510,7 +517,7 @@ func formatAmount(v float64) string {
 // under-counting them.
 func sumSpend(ctx context.Context, q spendReader, dayStart int64) (SpendStatus, error) {
 	var st SpendStatus
-	var runs, in, out, reserved, unpriced int64
+	var runs, in, out, reserved, unpriced, lost int64
 	err := q.QueryRowContext(ctx, `
 		SELECT COUNT(*),
 		       COALESCE(SUM(input_tokens),0),
@@ -519,15 +526,16 @@ func sumSpend(ctx context.Context, q spendReader, dayStart int64) (SpendStatus, 
 		       COALESCE(SUM(cost_estimate),0),
 		       COALESCE(SUM(CASE WHEN cost_estimate = 0
 		                          AND input_tokens+output_tokens+reserved_tokens > 0
-		                         THEN 1 ELSE 0 END),0)
+		                         THEN 1 ELSE 0 END),0),
+		       COALESCE(SUM(CASE WHEN status IN ('lost','abandoned') THEN 1 ELSE 0 END),0)
 		  FROM runs
 		 WHERE started_at >= ? AND started_at < ?`, dayStart, dayStart+secondsPerDay).
-		Scan(&runs, &in, &out, &reserved, &st.Spent, &unpriced)
+		Scan(&runs, &in, &out, &reserved, &st.Spent, &unpriced, &lost)
 	if err != nil {
 		return SpendStatus{}, fmt.Errorf("sum today's runs: %w", err)
 	}
-	st.RunCount, st.InputTokens, st.OutputTokens, st.ReservedTokens, st.UnpricedRuns =
-		int(runs), in, out, reserved, int(unpriced)
+	st.RunCount, st.InputTokens, st.OutputTokens, st.ReservedTokens, st.UnpricedRuns, st.LostRuns =
+		int(runs), in, out, reserved, int(unpriced), int(lost)
 	return st, nil
 }
 

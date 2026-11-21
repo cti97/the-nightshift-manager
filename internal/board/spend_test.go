@@ -1347,3 +1347,48 @@ func TestSetCeilingValidationIs400AndStorageFailureIs500(t *testing.T) {
 	}
 	assertErrorCode(t, rec, "set_ceiling")
 }
+
+// TestALostRunIsCountedEvenThoughItCostsNothing: a run the reaper settled without a report
+// contributes 0 to the day's spend, because its usage is unknowable — but the ledger has to
+// say how many such runs it is missing, or "0.00279 over two runs" hides the seven that
+// crashed and the number stops being explainable.
+func TestALostRunIsCountedEvenThoughItCostsNothing(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node, _ := seedClaimableBoard(t, db, clock)
+	mustCreateItem(t, db, clock, "work that dies")
+	mustClaim(t, db, clock, node, 1)
+	// Never started, never reported: the lease expires and the reaper requeues it.
+	clock.Advance(10 * time.Minute)
+	if _, err := Reap(ctx, db, clock); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	st := mustSpend(t, db, clock)
+	if st.LostRuns != 1 {
+		t.Fatalf("lost runs = %d, want 1: the ledger must say how many runs it could not price", st.LostRuns)
+	}
+	if st.Spent != 0 {
+		t.Fatalf("spent = %v for a run that never reported, want 0 (its usage is unknowable, not zero)", st.Spent)
+	}
+	if st.RunCount != 1 {
+		t.Fatalf("runs = %d, want the run still counted as issued", st.RunCount)
+	}
+	if !strings.Contains(st.Pricing, "lost_runs") {
+		t.Fatalf("pricing prose = %q, want it to name the runs the total is missing", st.Pricing)
+	}
+
+	// A run that does report is not a lost run, even when it fails.
+	mustCreateItem(t, db, clock, "work that reports")
+	got := mustClaim(t, db, clock, node, 1)
+	if err := StartRun(ctx, db, clock, got[0].RunID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if _, err := Report(ctx, db, clock, got[0].RunID, node, ReportRequest{Status: "error", Error: "boom"}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	st = mustSpend(t, db, clock)
+	if st.LostRuns != 1 {
+		t.Fatalf("lost runs = %d after a reported failure, want still 1", st.LostRuns)
+	}
+}

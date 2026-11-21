@@ -943,3 +943,83 @@ that has to run unattended.
 - Do providers get model discovery (`/v1/models`, `/api/tags`) or is every model declared by
   hand? Discovery is convenient and conflicts with declaring `features` per model — the likely
   compromise is discovery creates rows with provider defaults and a human overrides `features`.
+
+## 22. Roadmap: the factory layer (not planned)
+
+An external review (2026-11-21, against `124baf1`) argued that this board should become the
+board of an **AI software factory**: a fleet that takes a repository at a base ref, produces a
+diff, proves it with tests, and publishes it for review. The review is right about the gap and
+right about the shape of the answer. It is recorded here because the arguments are good, and
+because a future author deserves to meet them with their costs attached rather than
+rediscover them.
+
+**Nothing in this section is planned.** The board's job is to coordinate heterogeneous,
+intermittently awake machines and explain itself; a factory adds a different product on top.
+The three amendments below are the ones that would fit *this* design; the rest are the factory.
+
+### 22.1 What fits the current design
+
+- **Fencing the client, not the ledger (the review's A1, corrected).** A late report from a
+  reaped run is already refused — `Report` accepts only `claimed`/`running` runs, both its
+  UPDATEs carry that predicate, and a lost run's late write returns `Applied:false` and writes
+  nothing. What is missing is the *client* rule: a node that reconnects after a partition
+  learns only that its report was not applied, and may already have pushed. An epoch in the
+  claim and a `stale_lease` answer would turn that into "abandon the run, do not publish".
+  Small, and it belongs to the client contract more than to the schema.
+- **Confinement as a declared capability (A9).** `nodes` could declare `sandbox_profile`
+  (`none | dir | bwrap | systemd_scope | seatbelt`), an item could require one
+  (`sandbox:bwrap`), and placement would then enforce a safety property instead of only a
+  feature. `/why` would answer with the counterfactual — "nearest node is the laptop, missing
+  `sandbox:bwrap`". One column and one predicate; today Linux confinement is a comment in
+  `sandbox.go`, which is honest but not enforced.
+- **Policy before the tool (A4).** `request_approval` is a tool the model may decline, so
+  "anything real gets approved" is a convention. A per-node `allow | deny | ask` policy
+  consulted before dispatch, with `request_approval` kept as the model's escape hatch, is what
+  makes an unattended run fail closed.
+- **Budget reconciliation for runs that never report (A7, corrected).** The review called this
+  a reservation held forever; it is the opposite. The board has no escrow, so a crashed run
+  contributes zero to the day's ledger because its usage is unknowable — and `spend/today` now
+  reports `lost_runs` so the total says how many runs it is missing. The remaining question is
+  whether to charge a *floor* (the brief's token estimate at the model's input rate, marked as
+  an estimate) or keep the honest zero and the count. The current answer is the count.
+
+### 22.2 What is the factory, not this
+
+Each of these is a week of work in this codebase's idiom (schema + route + tests + proof), and
+each changes what the product is:
+
+- **Repo isolation.** Items carry `repo`, `base_ref`, `test_cmd`, `max_diff_lines`,
+  `out_of_scope`; the executor gets a worktree rather than a directory. A factory job is "this
+  repo, at this base, until this command exits 0", not a prose brief.
+- **A verify stage.** A run's `ok` would mean "tests passed", not "the agent stopped", with the
+  exit code, duration and log digest recorded as evidence and exactly one event per transition.
+  The vocabulary would gain `verifying` / `rejected`, and `ok` would arguably have to become
+  `verified` — a breaking change `protocol_version` exists to carry.
+- **Review as a state, and the KPI it enables.** `awaiting_review → accepted |
+  rejected_by_human` with a closed rejection vocabulary, so cost-per-accepted-change becomes
+  computable. The review calls this its highest value per line, and it is probably right.
+- **A publisher.** Branch, commit, push, PR, with the credential held outside the run directory
+  and the PR body assembled from the run's own report. This is where "the board is the single
+  writer" would earn its keep.
+- **Execution adapters.** An `external` executor behind the same interface as the native loop,
+  so a stronger already-installed agent runtime can drive this board without a second runtime
+  on the fleet. This one amends D6 and should not be taken lightly.
+- **Session tokens and an artifact store.** Short-lived node sessions with a revocation
+  generation, and content-addressed artifacts with retention classes. The second is the least
+  exciting and decides whether the thing is still running in six months.
+
+### 22.3 What the review got wrong, for the record
+
+- "The ledger double-charges and `result_summary` thrashes" — it cannot; see 22.1's first point.
+- "A reservation is held forever when an executor dies" — there is no escrow to leak; the
+  defect is under-counting, and `lost_runs` now makes it visible.
+- The review's R7/R8/R9 (README stale, no CI, no licence) were true when written and are done.
+
+### 22.4 The two questions that decide it
+
+1. **Is the fleet real?** On one always-on box, the placement engine is complexity that is
+   operated but never exercised, and a smaller board would do. With a genuine VPS + laptops +
+   Pi roster, this design is the right one and a factory should be built *on* it.
+2. **Is D6 negotiable?** If "one agent loop" is absolute, the factory belongs in a separate
+   repository that talks to this board over its API. If an execution adapter is acceptable,
+   the factory can live here. Either answer is defensible; guessing is not.
