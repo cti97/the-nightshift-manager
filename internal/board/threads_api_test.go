@@ -77,8 +77,9 @@ func (f *threadFixture) do(t *testing.T, method, path, token string, body any) *
 // client branches on, and the same for a closed thread and a repeated author.
 func TestTheThreadRoutesSpeakTheirCodes(t *testing.T) {
 	f := newThreadFixture(t)
+	out := 64
 	rec := f.do(t, "POST", "/admin/threads", testAdminToken,
-		CreateThreadRequest{Subject: "s", BudgetTokens: 10})
+		CreateThreadRequest{Subject: "s", BudgetTokens: 65, MaxOutputTokens: &out})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
 	}
@@ -87,7 +88,11 @@ func TestTheThreadRoutesSpeakTheirCodes(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	rec = f.do(t, "POST", "/threads/"+th.ID+"/messages", f.nodeToken, PostMessageRequest{Author: "a", Body: "x"})
+	rec = f.do(t, "POST", "/threads/"+th.ID+"/messages", f.nodeToken, PostMessageRequest{Author: "a", Body: "hi"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("the first post: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = f.do(t, "POST", "/threads/"+th.ID+"/messages", f.nodeToken, PostMessageRequest{Author: "b", Body: "hi"})
 	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "thread_frozen") {
 		t.Fatalf("post to a thread whose reserve does not fit: %d %s", rec.Code, rec.Body.String())
 	}
@@ -97,11 +102,11 @@ func TestTheThreadRoutesSpeakTheirCodes(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("patch: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = f.do(t, "POST", "/threads/"+th.ID+"/messages", f.nodeToken, PostMessageRequest{Author: "a", Body: "x"})
+	rec = f.do(t, "POST", "/threads/"+th.ID+"/messages", f.nodeToken, PostMessageRequest{Author: "b", Body: "hi"})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("post after the reopen: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = f.do(t, "POST", "/threads/"+th.ID+"/messages", f.nodeToken, PostMessageRequest{Author: "a", Body: "y"})
+	rec = f.do(t, "POST", "/threads/"+th.ID+"/messages", f.nodeToken, PostMessageRequest{Author: "b", Body: "again"})
 	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "same_author_twice") {
 		t.Fatalf("repeated author: %d %s", rec.Code, rec.Body.String())
 	}
@@ -115,7 +120,7 @@ func TestTheThreadRoutesSpeakTheirCodes(t *testing.T) {
 // not a node token, and neither is a missing one.
 func TestTheThreadReadRequiresANode(t *testing.T) {
 	f := newThreadFixture(t)
-	rec := f.do(t, "POST", "/admin/threads", testAdminToken, CreateThreadRequest{Subject: "s", BudgetTokens: 1000})
+	rec := f.do(t, "POST", "/admin/threads", testAdminToken, CreateThreadRequest{Subject: "s", BudgetTokens: 5000})
 	var th Thread
 	if err := json.Unmarshal(rec.Body.Bytes(), &th); err != nil {
 		t.Fatalf("decode: %v", err)

@@ -88,6 +88,22 @@ const defaultMaxOutput = 1024
 // defaultMaxTurns matches the schema's default.
 const defaultMaxTurns = 20
 
+// Input bounds (M5 hardening). They are the board's, not the transport's: a caller that
+// reaches the board another way — the CLI, a test, a future route — is bounded the same, and a
+// node cannot use a thread as a disk it does not own. The turn and output caps also bound the
+// arithmetic: every reservation adds prompt + max_output to counters, and unbounded values let
+// a caller overflow the ints the check trusts.
+const (
+	maxSubjectBytes    = 512
+	maxAuthorBytes     = 128
+	maxMessageBytes    = 64 << 10
+	maxCheckpointBytes = 64 << 10
+	maxBudgetTokens    = 1_000_000_000
+	maxOutputTokens    = 1_000_000
+	maxTurnsLimit      = 1000
+	maxReportedTokens  = 1_000_000_000
+)
+
 // estimateTokens is the board's reserve-only prompt estimate (D1): roughly four bytes per
 // token, rounded up, minimum one. It is deliberately crude and deliberately the manager's
 // number — a caller-supplied reserve can be gamed, and the reservation exists to protect a
@@ -106,8 +122,12 @@ func CreateThread(ctx context.Context, db *sql.DB, clock Clock, req CreateThread
 	switch {
 	case subject == "":
 		return Thread{}, fmt.Errorf("a thread needs a subject")
+	case len(subject) > maxSubjectBytes:
+		return Thread{}, fmt.Errorf("the subject is %d bytes; a thread's subject is a line, not a document (limit %d)", len(subject), maxSubjectBytes)
 	case req.BudgetTokens <= 0:
 		return Thread{}, fmt.Errorf("budget_tokens must be positive: a thread with no budget can never send a message")
+	case req.BudgetTokens > maxBudgetTokens:
+		return Thread{}, fmt.Errorf("budget_tokens %d is past the board's limit of %d", req.BudgetTokens, maxBudgetTokens)
 	}
 	maxOutput := defaultMaxOutput
 	if req.MaxOutputTokens != nil {
@@ -116,12 +136,25 @@ func CreateThread(ctx context.Context, db *sql.DB, clock Clock, req CreateThread
 	if maxOutput <= 0 {
 		return Thread{}, fmt.Errorf("max_output_tokens must be positive")
 	}
+	if maxOutput > maxOutputTokens {
+		return Thread{}, fmt.Errorf("max_output_tokens %d is past the board's limit of %d", maxOutput, maxOutputTokens)
+	}
 	maxTurns := defaultMaxTurns
 	if req.MaxTurns != nil {
 		maxTurns = *req.MaxTurns
 	}
 	if maxTurns <= 0 {
 		return Thread{}, fmt.Errorf("max_turns must be positive")
+	}
+	if maxTurns > maxTurnsLimit {
+		return Thread{}, fmt.Errorf("max_turns %d is past the board's limit of %d", maxTurns, maxTurnsLimit)
+	}
+	// A budget that cannot hold the cheapest possible turn would freeze on its very first
+	// message. Refusing at create is the difference between a thread nobody can use and a
+	// clear answer at the moment it is configured: the cheapest reservation is one prompt
+	// token plus the output ceiling.
+	if req.BudgetTokens < maxOutput+1 {
+		return Thread{}, fmt.Errorf("budget_tokens %d cannot hold a single turn: the cheapest reservation is max_output_tokens+1 (%d). Raise the budget or lower the output ceiling", req.BudgetTokens, maxOutput+1)
 	}
 	// A thread that names an item must name one that exists; the foreign key would refuse
 	// it anyway, and a message from SQLite's constraint is not an answer an operator can act
@@ -247,11 +280,15 @@ func PostMessage(ctx context.Context, db *sql.DB, clock Clock, threadID string, 
 	switch {
 	case author == "":
 		return out, fmt.Errorf("a message needs an author")
+	case len(author) > maxAuthorBytes:
+		return out, fmt.Errorf("the author is %d bytes; an author is a name (limit %d)", len(author), maxAuthorBytes)
 	case strings.TrimSpace(req.Body) == "":
 		return out, fmt.Errorf("a message needs a body")
+	case len(req.Body) > maxMessageBytes:
+		return out, fmt.Errorf("the body is %d bytes; a message is prose, not an attachment (limit %d)", len(req.Body), maxMessageBytes)
 	}
-	if req.Tokens != nil && *req.Tokens < 0 {
-		return out, fmt.Errorf("tokens must not be negative")
+	if req.Tokens != nil && (*req.Tokens < 0 || *req.Tokens > maxReportedTokens) {
+		return out, fmt.Errorf("tokens must be between 0 and %d", maxReportedTokens)
 	}
 
 	conn, err := db.Conn(ctx)
@@ -476,6 +513,9 @@ func PatchThread(ctx context.Context, db *sql.DB, clock Clock, id string, req Pa
 	if budget <= 0 {
 		return Thread{}, fmt.Errorf("budget_tokens must be positive")
 	}
+	if budget > maxBudgetTokens {
+		return Thread{}, fmt.Errorf("budget_tokens %d is past the board's limit of %d", budget, maxBudgetTokens)
+	}
 
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -512,14 +552,19 @@ func PatchThread(ctx context.Context, db *sql.DB, clock Clock, id string, req Pa
 		return Thread{}, fmt.Errorf("%w: a closed thread's budget is not a lever", ErrThreadClosed)
 	}
 
-	// Reopen only when the smallest possible next turn fits: max_output plus one prompt
-	// token, which is the cheapest reservation PostMessage can make (estimateTokens("") is
-	// 1). A looser test — "the budget is above what is used" — would set the thread open and
-	// let the very next post freeze it again, which reads to an operator as a patch that did
-	// not work.
+	// The status is a function of the numbers, not a flag to be kept in step by hand: a thread
+	// is open exactly when the cheapest possible next turn fits (max_output plus one prompt
+	// token, which is the smallest reservation PostMessage can make), and frozen otherwise. A
+	// looser rule — "the budget is above what is used" — sets a thread open and lets the very
+	// next post freeze it again, which reads to an operator as a patch that did not work; and
+	// a stricter one that only ever reopened would leave an open thread that cannot send.
 	newStatus := th.Status
-	if th.Status == ThreadFrozen && budget >= th.TokensUsed+th.MaxOutputTokens+1 {
-		newStatus = ThreadOpen
+	if th.Status != ThreadClosed {
+		if budget >= th.TokensUsed+th.MaxOutputTokens+1 {
+			newStatus = ThreadOpen
+		} else {
+			newStatus = ThreadFrozen
+		}
 	}
 	if _, err := conn.ExecContext(ctx,
 		`UPDATE threads SET budget_tokens=?, status=? WHERE id=?`, budget, newStatus, id); err != nil {

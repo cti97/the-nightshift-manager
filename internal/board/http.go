@@ -49,6 +49,30 @@ func NewServer(db *sql.DB, clock Clock, providers *provider.Registry, adminToken
 	}
 }
 
+// requestBodyLimit is the most a single JSON body may be. A node can reach every route that
+// takes one, and a board whose process is killed by a five-gigabyte body is a board that
+// dropped every lease it was reaping for. One mebibyte is far more than any of these requests
+// needs: the largest is a message body, capped again at the board layer.
+const requestBodyLimit = 1 << 20
+
+// decodeJSON reads one JSON body with the size cap, writing the refusal itself: 413 for a body
+// past the limit (a client can act on that), 400 for anything else. It returns false when the
+// handler must stop.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, requestBodyLimit)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			WriteError(w, http.StatusRequestEntityTooLarge, "body_too_large",
+				fmt.Sprintf("the body exceeds %d bytes", requestBodyLimit))
+			return false
+		}
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return false
+	}
+	return true
+}
+
 // HashToken is the only form in which a credential is stored or compared.
 func HashToken(tok string) string {
 	sum := sha256.Sum256([]byte(tok))
@@ -191,8 +215,7 @@ func nodeIDFrom(r *http.Request) string {
 
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	id, token, err := RegisterNode(r.Context(), s.db, s.clock, req)
@@ -206,8 +229,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req HeartbeatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	resp, err := Heartbeat(r.Context(), s.db, s.clock, nodeIDFrom(r), req)
@@ -222,8 +244,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 // token, never from the body: a node cannot claim on another node's behalf.
 func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	var req ClaimRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	items, err := Claim(r.Context(), s.db, s.clock, nodeIDFrom(r), req.FreeSlots)
@@ -254,8 +275,7 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 // of its calls settled the item, and only the first one did.
 func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 	var req ReportRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	res, err := Report(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r), req)
@@ -292,8 +312,7 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 	var req DecisionRequest
 	if form {
 		req = DecisionRequest{Decision: r.PostFormValue("decision"), Note: r.PostFormValue("note")}
-	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	} else if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Decision != Approve && req.Decision != Deny {
@@ -369,8 +388,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
 // of the world is stale and a retry of the same body will not fix it.
 func (s *Server) handleEscalate(w http.ResponseWriter, r *http.Request) {
 	var body EscalationRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 	if body.Action == "" {
@@ -430,8 +448,7 @@ func (s *Server) handleCorruptRows(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	var req CreateItemRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	id, err := CreateItem(r.Context(), s.db, s.clock, req)
@@ -466,8 +483,7 @@ func probePath(endpointID string) string {
 // typo is a 400 here rather than a row that never places.
 func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	var req CreateEndpointRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	ep, err := CreateEndpoint(r.Context(), s.db, s.clock, s.providers, req)
@@ -514,8 +530,7 @@ func (s *Server) handleListEndpoints(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateModel(w http.ResponseWriter, r *http.Request) {
 	var req CreateModelRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	m, err := CreateModel(r.Context(), s.db, s.clock, req)
@@ -531,8 +546,7 @@ func (s *Server) handleCreateModel(w http.ResponseWriter, r *http.Request) {
 // file comment and the Task 8 report.
 func (s *Server) handlePatchModel(w http.ResponseWriter, r *http.Request) {
 	var req PatchModelRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	m, err := PatchModel(r.Context(), s.db, s.clock, r.PathValue("id"), req)
@@ -590,8 +604,7 @@ type setCeilingRequest struct {
 // today's spend resumed the board or whether it is still reached.
 func (s *Server) handleSetSpendCeiling(w http.ResponseWriter, r *http.Request) {
 	var req setCeilingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Ceiling == nil {
@@ -690,8 +703,7 @@ func (s *Server) logf(format string, a ...any) { log.Printf(format, a...) }
 // manager (M4 D8). The route is adminAuth for both reasons.
 func (s *Server) handleCreateWatch(w http.ResponseWriter, r *http.Request) {
 	var req CreateWatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	watch, err := CreateWatch(r.Context(), s.db, s.clock, req)
@@ -744,8 +756,7 @@ func (s *Server) handleGetWatch(w http.ResponseWriter, r *http.Request) {
 // the handler refuses a body that names neither rather than treating it as a no-op.
 func (s *Server) handlePatchWatch(w http.ResponseWriter, r *http.Request) {
 	var req PatchWatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Enabled == nil && req.CooldownUntil == nil {
@@ -793,8 +804,7 @@ func threadErrorStatus(err error) (int, string) {
 // handleCreateThread is POST /admin/threads.
 func (s *Server) handleCreateThread(w http.ResponseWriter, r *http.Request) {
 	var req CreateThreadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	th, err := CreateThread(r.Context(), s.db, s.clock, req)
@@ -822,8 +832,7 @@ func (s *Server) handleGetThread(w http.ResponseWriter, r *http.Request) {
 // re-read the thread to learn what it cost.
 func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 	var req PostMessageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	res, err := PostMessage(r.Context(), s.db, s.clock, r.PathValue("id"), req)
@@ -838,8 +847,7 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 // handlePatchThread is PATCH /admin/threads/{id}: the budget lever.
 func (s *Server) handlePatchThread(w http.ResponseWriter, r *http.Request) {
 	var req PatchThreadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	th, err := PatchThread(r.Context(), s.db, s.clock, r.PathValue("id"), req)
@@ -855,8 +863,7 @@ func (s *Server) handlePatchThread(w http.ResponseWriter, r *http.Request) {
 // and belong to the calling node.
 func (s *Server) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 	var req CheckpointRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	cp, err := WriteCheckpoint(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r), req)

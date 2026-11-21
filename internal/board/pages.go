@@ -2,7 +2,6 @@
 package board
 
 import (
-	"encoding/json"
 	"html/template"
 	"log"
 	"net/http"
@@ -253,8 +252,7 @@ func (s *Server) handleAdminMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req = PostMessageRequest{Author: "admin", Body: r.PostFormValue("body")}
-	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+	} else if !decodeJSON(w, r, &req) {
 		return
 	} else {
 		req.Author = "admin"

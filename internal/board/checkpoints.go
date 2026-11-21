@@ -51,6 +51,15 @@ func WriteCheckpoint(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID
 	if progress == "" {
 		return Checkpoint{}, fmt.Errorf("declared_progress is required: a checkpoint that says nothing resumes nothing")
 	}
+	// A checkpoint is a note the next attempt reads, not a place to park a transcript: it is
+	// bounded like a message, so a run cannot fill the board's disk with one tool call.
+	for field, value := range map[string]string{
+		"declared_progress": progress, "state": req.State, "artifacts": req.Artifacts,
+	} {
+		if len(value) > maxCheckpointBytes {
+			return Checkpoint{}, fmt.Errorf("%s is %d bytes; a checkpoint field is a note (limit %d)", field, len(value), maxCheckpointBytes)
+		}
+	}
 
 	conn, err := db.Conn(ctx)
 	if err != nil {

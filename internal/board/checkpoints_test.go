@@ -3,8 +3,10 @@ package board
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -141,5 +143,49 @@ func TestTheSecondClaimCarriesTheFirstCheckpoint(t *testing.T) {
 	}
 	if claimed[0].Item.ID != itemID {
 		t.Fatalf("claimed item = %s, want %s", claimed[0].Item.ID, itemID)
+	}
+}
+
+// TestTwoCheckpointsAtOnceGetDistinctSeqs: seq is allocated inside BEGIN IMMEDIATE, so two
+// writes racing on one run serialize into 1 and 2 rather than colliding on the unique index.
+func TestTwoCheckpointsAtOnceGetDistinctSeqs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "board.db")
+	db, clock := OpenForTest(t, path)
+	ctx := context.Background()
+	_, runID, nodeID := parkOneRun(t, db, clock)
+	db2, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatalf("open second handle: %v", err)
+	}
+	defer db2.Close()
+
+	errs := make(chan error, 2)
+	seqs := make(chan int, 2)
+	for i, handle := range []*sql.DB{db, db2} {
+		go func(i int, handle *sql.DB) {
+			cp, err := WriteCheckpoint(ctx, handle, clock, runID, nodeID, CheckpointRequest{
+				DeclaredProgress: []string{"half", "three quarters"}[i],
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			seqs <- cp.Seq
+			errs <- nil
+		}(i, handle)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("a racing checkpoint failed: %v", err)
+		}
+	}
+	close(seqs)
+	var got []int
+	for seq := range seqs {
+		got = append(got, seq)
+	}
+	slices.Sort(got)
+	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("seqs = %v, want 1 and 2", got)
 	}
 }

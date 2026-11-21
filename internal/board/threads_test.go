@@ -4,11 +4,15 @@ package board
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMigrationSixAddsThreadsAndCheckpoints upgrades a real version-5 board and checks the
@@ -147,6 +151,8 @@ func TestCreateThreadStoresTheBudget(t *testing.T) {
 }
 
 // TestThreadBudgetIsValidated: every refusal names the field and creates nothing.
+func ptrInt(v int) *int { return &v }
+
 func TestThreadBudgetIsValidated(t *testing.T) {
 	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
 	ctx := context.Background()
@@ -158,13 +164,18 @@ func TestThreadBudgetIsValidated(t *testing.T) {
 		req  CreateThreadRequest
 		want string
 	}{
-		{"no subject", CreateThreadRequest{BudgetTokens: 100}, "subject"},
+		{"no subject", CreateThreadRequest{BudgetTokens: 5000}, "subject"},
+		{"subject too long", CreateThreadRequest{Subject: strings.Repeat("s", maxSubjectBytes+1), BudgetTokens: 5000}, "subject is a line"},
 		{"zero budget", CreateThreadRequest{Subject: "x", BudgetTokens: 0}, "budget_tokens must be positive"},
 		{"negative budget", CreateThreadRequest{Subject: "x", BudgetTokens: -1}, "budget_tokens must be positive"},
+		{"budget past the limit", CreateThreadRequest{Subject: "x", BudgetTokens: maxBudgetTokens + 1}, "past the board's limit"},
 		{"zero max output", CreateThreadRequest{Subject: "x", BudgetTokens: 100, MaxOutputTokens: &zero}, "max_output_tokens must be positive"},
-		{"negative max output", CreateThreadRequest{Subject: "x", BudgetTokens: 100, MaxOutputTokens: &negative}, "max_output_tokens"},
+		{"negative max output", CreateThreadRequest{Subject: "x", BudgetTokens: 100, MaxOutputTokens: &negative}, "max_output_tokens must be positive"},
+		{"max output past the limit", CreateThreadRequest{Subject: "x", BudgetTokens: maxBudgetTokens, MaxOutputTokens: ptrInt(maxOutputTokens + 1)}, "past the board's limit"},
 		{"zero turns", CreateThreadRequest{Subject: "x", BudgetTokens: 100, MaxTurns: &zero}, "max_turns must be positive"},
-		{"unknown item", CreateThreadRequest{Subject: "x", BudgetTokens: 100, WorkItemID: "nope"}, "does not exist"},
+		{"turns past the limit", CreateThreadRequest{Subject: "x", BudgetTokens: 5000, MaxTurns: ptrInt(maxTurnsLimit + 1)}, "past the board's limit"},
+		{"budget cannot hold one turn", CreateThreadRequest{Subject: "x", BudgetTokens: 1000}, "cannot hold a single turn"},
+		{"unknown item", CreateThreadRequest{Subject: "x", BudgetTokens: 5000, WorkItemID: "nope"}, "does not exist"},
 	}
 	for _, c := range cases {
 		if _, err := CreateThread(ctx, db, clock, c.req); err == nil {
@@ -187,7 +198,7 @@ func TestThreadBudgetIsValidated(t *testing.T) {
 func TestGetThreadReturnsMessagesInOrder(t *testing.T) {
 	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
 	ctx := context.Background()
-	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 1000})
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 5000})
 	if err != nil {
 		t.Fatalf("CreateThread: %v", err)
 	}
@@ -302,16 +313,18 @@ func TestSettlementReleasesTheDifference(t *testing.T) {
 // the property — an off-by-one here either freezes a thread with room or lets one exceed.
 func TestTheThreadFreezesAtTheReservationBoundary(t *testing.T) {
 	ctx0 := context.Background()
-	// The reservation for "hi" is estimateTokens("hi")+maxOutput = 1+64 = 65 with a 64-token
-	// output ceiling (the estimate is 1+len/4, and len("hi")/4 is 0). A budget of 64 is one
-	// short; 65 is exact.
+	// The 64-token ceiling makes each short message reserve 65 (1 prompt token + 64). The
+	// first message fits exactly at 65; the second needs 66 more, so the boundary is the
+	// budget where 65 (used) + 66 (reserve) lands: 130 refuses, 131 accepts. "Not before and
+	// not after" is the property — an off-by-one either freezes a thread with room or lets one
+	// exceed.
 	for _, c := range []struct {
 		name    string
 		budget  int
 		wantErr bool
 	}{
-		{"one short", 64, true},
-		{"exact", 65, false},
+		{"one short", 130, true},
+		{"exact", 131, false},
 	} {
 		db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
 		out := 64
@@ -319,10 +332,13 @@ func TestTheThreadFreezesAtTheReservationBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: CreateThread: %v", c.name, err)
 		}
-		_, err = PostMessage(ctx0, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "hi"})
+		if _, err := PostMessage(ctx0, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "hi"}); err != nil {
+			t.Fatalf("%s: the first message was refused: %v", c.name, err)
+		}
+		_, err = PostMessage(ctx0, db, clock, th.ID, PostMessageRequest{Author: "b", Body: "hi"})
 		switch {
 		case c.wantErr && err == nil:
-			t.Fatalf("%s: the post was accepted with a budget of %d", c.name, c.budget)
+			t.Fatalf("%s: the second message was accepted with a budget of %d", c.name, c.budget)
 		case c.wantErr && !errors.Is(err, ErrThreadFrozen):
 			t.Fatalf("%s: err = %v, want ErrThreadFrozen", c.name, err)
 		case !c.wantErr && err != nil:
@@ -468,13 +484,16 @@ func TestTheReservationGrowsWithTheConversation(t *testing.T) {
 func TestAFrozenThreadRefusesMessages(t *testing.T) {
 	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
 	ctx := context.Background()
-	out := 100
-	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 50, MaxOutputTokens: &out})
+	out := 64
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 65, MaxOutputTokens: &out})
 	if err != nil {
 		t.Fatalf("CreateThread: %v", err)
 	}
-	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
-		t.Fatalf("first post = %v, want ErrThreadFrozen (reserve 102 > budget 50)", err)
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "hi"}); err != nil {
+		t.Fatalf("the first message was refused: %v", err)
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "b", Body: "hi"}); !errors.Is(err, ErrThreadFrozen) {
+		t.Fatalf("the second message = %v, want ErrThreadFrozen", err)
 	}
 	for i, author := range []string{"a", "b"} {
 		if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: author, Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
@@ -488,12 +507,15 @@ func TestAFrozenThreadRefusesMessages(t *testing.T) {
 func TestRaisingTheBudgetReopensTheThread(t *testing.T) {
 	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
 	ctx := context.Background()
-	out := 100
-	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 50, MaxOutputTokens: &out})
+	out := 64
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 65, MaxOutputTokens: &out})
 	if err != nil {
 		t.Fatalf("CreateThread: %v", err)
 	}
-	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "hi"}); err != nil {
+		t.Fatalf("first post: %v", err)
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "b", Body: "hi"}); !errors.Is(err, ErrThreadFrozen) {
 		t.Fatalf("the thread did not freeze: %v", err)
 	}
 	big := 10_000
@@ -504,7 +526,9 @@ func TestRaisingTheBudgetReopensTheThread(t *testing.T) {
 	if patched.Status != ThreadOpen || patched.BudgetTokens != 10_000 {
 		t.Fatalf("after the patch = %+v, want open at 10000", patched)
 	}
-	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); err != nil {
+	// The refused post wrote nothing, so the turn owner is still "a": the reply that proves the
+	// thread is usable again must come from the other agent.
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "b", Body: "hi"}); err != nil {
 		t.Fatalf("the reopened thread refused a post: %v", err)
 	}
 	// The reopen is an event: the dashboard's history reads events, and a status that
@@ -523,8 +547,8 @@ func TestRaisingTheBudgetReopensTheThread(t *testing.T) {
 func TestFreezingWritesExactlyOneEvent(t *testing.T) {
 	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
 	ctx := context.Background()
-	out := 100
-	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 50, MaxOutputTokens: &out})
+	out := 64
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 65, MaxOutputTokens: &out})
 	if err != nil {
 		t.Fatalf("CreateThread: %v", err)
 	}
@@ -535,14 +559,18 @@ func TestFreezingWritesExactlyOneEvent(t *testing.T) {
 		}
 		return n
 	}
-	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
-		t.Fatalf("first post = %v", err)
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "hi"}); err != nil {
+		t.Fatalf("first post: %v", err)
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "b", Body: "hi"}); !errors.Is(err, ErrThreadFrozen) {
+		t.Fatalf("the second post = %v, want ErrThreadFrozen", err)
 	}
 	if got := count(); got != 1 {
 		t.Fatalf("frozen events = %d after the freeze, want 1", got)
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "b", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
+		author := []string{"a", "b"}[i%2]
+		if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: author, Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
 			t.Fatalf("post %d = %v", i, err)
 		}
 	}
@@ -556,15 +584,20 @@ func TestFreezingWritesExactlyOneEvent(t *testing.T) {
 func TestPatchNeverContradictsTheThread(t *testing.T) {
 	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
 	ctx := context.Background()
-	out := 100
-	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 50, MaxOutputTokens: &out})
+	out := 64
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 130, MaxOutputTokens: &out})
 	if err != nil {
 		t.Fatalf("CreateThread: %v", err)
 	}
-	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "hi"}); err != nil {
+		t.Fatalf("first post: %v", err)
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "b", Body: "hi"}); !errors.Is(err, ErrThreadFrozen) {
 		t.Fatalf("the thread did not freeze: %v", err)
 	}
-	small := 60
+	// 65 used + 64 ceiling + 1 prompt token = the cheapest turn is 130; a patch to 129 still
+	// cannot hold one, so the thread must stay frozen.
+	small := 129
 	if _, err := PatchThread(ctx, db, clock, th.ID, PatchThreadRequest{BudgetTokens: &small}); err != nil {
 		t.Fatalf("PatchThread: %v", err)
 	}
@@ -576,7 +609,9 @@ func TestPatchNeverContradictsTheThread(t *testing.T) {
 		t.Fatalf("status = %q after a patch that does not fit, want frozen", view.Status)
 	}
 
-	// A closed thread's budget is not a lever: the conversation is over.
+	// The same rule the other way: lowering an open thread's budget below the cheapest turn
+	// freezes it, because the status is a function of the numbers rather than a flag kept in
+	// step by hand.
 	two := 1
 	closed, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 10_000, MaxTurns: &two})
 	if err != nil {
@@ -587,5 +622,141 @@ func TestPatchNeverContradictsTheThread(t *testing.T) {
 	}
 	if _, err := PatchThread(ctx, db, clock, closed.ID, PatchThreadRequest{BudgetTokens: &small}); !errors.Is(err, ErrThreadClosed) {
 		t.Fatalf("patching a closed thread = %v, want ErrThreadClosed", err)
+	}
+
+	open, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 10_000, MaxOutputTokens: &out})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	low := 10
+	patched, err := PatchThread(ctx, db, clock, open.ID, PatchThreadRequest{BudgetTokens: &low})
+	if err != nil {
+		t.Fatalf("lowering an open thread: %v", err)
+	}
+	if patched.Status != ThreadFrozen {
+		t.Fatalf("an open thread lowered below one turn is %q, want frozen", patched.Status)
+	}
+}
+
+// TestTwoPostersCannotBothTakeTheLastOfTheBudget: the reservation check and the insert are one
+// BEGIN IMMEDIATE transaction, so two posters racing for the last of the budget cannot both see
+// it free. One is served, the other freezes, and the thread never exceeds its budget.
+func TestTwoPostersCannotBothTakeTheLastOfTheBudget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "board.db")
+	db, clock := OpenForTest(t, path)
+	ctx := context.Background()
+	out := 64
+	// 65 used by the first message, then room for exactly one 66-token turn.
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 131, MaxOutputTokens: &out})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "hi"}); err != nil {
+		t.Fatalf("the first post: %v", err)
+	}
+	// A second handle on the same file is a second manager process as far as SQLite is
+	// concerned.
+	db2, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatalf("open second handle: %v", err)
+	}
+	defer db2.Close()
+
+	// A third connection holds the write lock while both posters arrive. That is what makes
+	// the overlap deterministic: the posters are certainly inside the same window, and a
+	// deferred transaction would let both read the same counters before either writes.
+	blocker, err := db2.Conn(ctx)
+	if err != nil {
+		t.Fatalf("blocker conn: %v", err)
+	}
+	defer blocker.Close()
+	if _, err := blocker.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("blocker begin: %v", err)
+	}
+
+	started := make(chan struct{}, 2)
+	errs := make(chan error, 2)
+	for i, handle := range []*sql.DB{db, db2} {
+		go func(i int, handle *sql.DB) {
+			started <- struct{}{}
+			_, err := PostMessage(ctx, handle, clock, th.ID, PostMessageRequest{
+				Author: []string{"b", "c"}[i], Body: "hi",
+			})
+			errs <- err
+		}(i, handle)
+	}
+	<-started
+	<-started
+	time.Sleep(150 * time.Millisecond) // both are now waiting on the lock
+	if _, err := blocker.ExecContext(ctx, "COMMIT"); err != nil {
+		t.Fatalf("blocker commit: %v", err)
+	}
+
+	first, second := <-errs, <-errs
+	succeeded := 0
+	for _, err := range []error{first, second} {
+		switch {
+		case err == nil:
+			succeeded++
+		case !errors.Is(err, ErrThreadFrozen):
+			t.Fatalf("a racing post failed with %v, want ErrThreadFrozen", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("%d of two racing posts were served, want exactly one", succeeded)
+	}
+	view, err := GetThread(ctx, db, th.ID)
+	if err != nil {
+		t.Fatalf("GetThread: %v", err)
+	}
+	if view.TokensUsed > view.BudgetTokens {
+		t.Fatalf("tokens_used = %d > budget %d: both posters charged", view.TokensUsed, view.BudgetTokens)
+	}
+	if len(view.Messages) != 2 {
+		t.Fatalf("messages = %d, want the first and exactly one of the racing two", len(view.Messages))
+	}
+}
+
+// TestAnOversizedMessageIsRefused: a thread is not a disk the node does not own. The board caps
+// the body itself, so a caller that reaches it another way is bounded the same.
+func TestAnOversizedMessageIsRefused(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 100_000})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	huge := strings.Repeat("a", maxMessageBytes+1)
+	_, err = PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: huge})
+	if err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("an oversized body = %v, want a refusal naming the limit", err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("messages = %d after an oversized body, want none", n)
+	}
+}
+
+// TestAnOversizedRequestIsRefusedAtTheDoor: the transport cap answers 413 before the body is
+// buffered, so a node cannot exhaust the manager's memory with one request.
+func TestAnOversizedRequestIsRefusedAtTheDoor(t *testing.T) {
+	f := newThreadFixture(t)
+	rec := f.do(t, "POST", "/admin/threads", testAdminToken, CreateThreadRequest{Subject: "s", BudgetTokens: 5000})
+	var th Thread
+	if err := json.Unmarshal(rec.Body.Bytes(), &th); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	huge := strings.Repeat("a", requestBodyLimit+1024)
+	body := `{"author":"a","body":"` + huge + `"}`
+	req := httptest.NewRequest("POST", "/threads/"+th.ID+"/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+f.nodeToken)
+	rec = httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec.Body.String(), "body_too_large") {
+		t.Fatalf("oversized request: %d %s, want 413 body_too_large", rec.Code, rec.Body.String())
 	}
 }

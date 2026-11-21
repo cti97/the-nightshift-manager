@@ -614,6 +614,26 @@ Third: `max_turns`. Fourth: a **global daily spend ceiling**. When it trips, the
 issuing work and marks itself `paused` (§8). Thread freezing is M3's to implement alongside the
 thread tables.
 
+**Bounds that make it safe** (M5, all learned from what a hostile or clumsy caller can do):
+
+- A post, the reservation check and the settle are one `BEGIN IMMEDIATE` transaction. A deferred
+  transaction lets two posters read the same counters and both spend the last of the budget; the
+  test puts a third connection on the write lock to make the overlap certain, and the deferred
+  version fails with `SQLITE_BUSY` rather than a wrong answer.
+- `budget_tokens` must exceed `max_output_tokens`: a thread whose cheapest possible turn does not
+  fit would freeze on its first message. Refusing at create is the difference between a thread
+  nobody can use and a clear answer when it is configured.
+- A thread's status is a function of its numbers, not a flag: open exactly when
+  `budget >= used + max_output + 1`, frozen otherwise, closed once its turns are gone. A PATCH
+  that lowers an open thread below that line freezes it; one that raises a frozen thread past it
+  reopens it.
+- Every input is bounded: 64 KiB for a message body and each checkpoint field, 512 bytes for a
+  subject, 1 MiB for any request body at the transport, and caps on budget, output ceiling, turn
+  count and reported tokens. The turn and output caps also bound the arithmetic — unbounded
+  counters overflow the ints the reservation check trusts.
+- A checkpoint is a note, not a transcript: the same 64 KiB per field, and the run must be live
+  and owned by the writing node.
+
 **What a ceiling does and does not bound.** M2's ceiling bounds *issuance* — the work the manager
 hands out. A loop that runs away inside a single run is bounded by that node's own step and token
 caps, which the manager neither enforces nor observes. So the board's ceiling is a budget for work
