@@ -1,0 +1,102 @@
+name: ci
+
+# What this workflow is for: the README claims a six-target matrix, a race-clean suite and a
+# race detector that has actually run. Those claims are cheap to make and expensive to keep, so
+# CI runs the same commands the README names — `make test`, `make race`, `make release` — rather
+# than a second definition that could drift from the one a developer runs.
+#
+# Both test platforms matter: the agent's kernel sandbox is macOS Seatbelt when it can apply a
+# profile, and the sandbox tests skip on Linux with a stated reason. Running only one platform
+# would leave either the sandbox or the Linux build unproven.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go mod tidy leaves nothing behind
+        # The module has one dependency on purpose (pure-Go SQLite). A second one arriving by
+        # accident is a distribution problem, so a dirty go.mod fails here rather than later.
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: make test
+
+      - name: race
+        # -race needs cgo, which the release build deliberately turns off. The runner has a C
+        # toolchain; this is the one step where cgo is on.
+        env:
+          CGO_ENABLED: "1"
+        run: make race
+
+  release:
+    name: six targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build every target
+        # The script refuses to call a partial build a release: it counts the artifacts, asserts
+        # each one's architecture with file(1), and swaps dist/ in only after everything succeeds.
+        run: make release VERSION=ci
+
+      - name: the matrix really is six
+        run: |
+          ls -l dist/
+          echo
+          cat dist/SHA256SUMS
+          count=$(ls dist/nsm-* | wc -l)
+          if [ "$count" -ne 6 ]; then
+            echo "built $count artifacts, want 6"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nsm-ci
+          path: dist/
+          retention-days: 7

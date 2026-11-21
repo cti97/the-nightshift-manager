@@ -1,5 +1,7 @@
 # The Night Shift Manager
 
+[![ci](https://github.com/cti97/the-nightshift-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/cti97/the-nightshift-manager/actions/workflows/ci.yml)
+
 A coordination board for heterogeneous machines. A VPS runs the manager; laptops and a
 Raspberry Pi run agents that pick up work whenever they are awake and qualified. Nothing is
 assigned to anyone — nodes ask, the board decides placement from declared capabilities, and
