@@ -14,7 +14,7 @@ The name is the point: it is a night shift for machines that sleep.
 | VPS | `manager` | yes | The board: SQLite, scheduler, dashboard, approvals |
 | Home laptop (macOS + Ollama) | `executor` | no | Agentic work, local models, shell |
 | Work laptop (Claude) | `executor` | no | Agentic work, cloud models |
-| Raspberry Pi 5 | `steward` | yes | Reflex work, LAN presence, endpoint canary, read-only replica |
+| Raspberry Pi 5 | `steward` | yes | Reflex work, LAN presence, endpoint canary, read-only replica (all M6 — not built yet) |
 
 Inference is not necessarily local to a node. A cloud Ollama, llama.cpp, or any
 OpenAI-compatible endpoint is a first-class participant with a declared network reach.
