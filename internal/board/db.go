@@ -28,6 +28,9 @@ var schema4 string
 //go:embed schema5.sql
 var schema5 string
 
+//go:embed schema6.sql
+var schema6 string
+
 // A migration upgrades a database one version, to Version.
 type migration struct {
 	version int
@@ -61,6 +64,11 @@ var migrations = []migration{
 	// the three columns the watch's own state needs (last_result, last_skip_at,
 	// last_skip_reason). See schema5.sql for why each exists.
 	{version: 5, script: schema5},
+	// Migration 6 (M5 Task 1): threads, messages and checkpoints — the conversation with
+	// a budget (spec §13) and the progress markers a requeued attempt resumes from
+	// (spec §12). See schema6.sql for the two columns the spec's sketch is missing and
+	// why each exists.
+	{version: 6, script: schema6},
 }
 
 // schemaVersion is the schema version this binary implements: the version

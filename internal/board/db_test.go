@@ -123,17 +123,22 @@ func TestMigrationCreatesExpectedObjects(t *testing.T) {
 	}
 
 	want := []string{
+		"index idx_checkpoints_run_seq",
 		"index idx_events_entity",
 		"index idx_items_claimable",
 		"index idx_items_parked",
+		"index idx_messages_thread",
 		"index idx_runs_started_at",
 		"index idx_watches_due",
+		"table checkpoints",
 		"table config",
 		"table endpoints",
 		"table events",
+		"table messages",
 		"table models",
 		"table nodes",
 		"table runs",
+		"table threads",
 		"table watches",
 		"table work_items",
 	}
