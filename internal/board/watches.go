@@ -807,7 +807,7 @@ func scheduleState(w Watch, name string, now int64) string {
 		// minutes ago is not waiting for anything. Either the manager is down or the
 		// scheduler loop is not running, and saying "waiting" would send the operator
 		// looking at the schedule instead of at the process.
-		return fmt.Sprintf("watch %q was due at %s (%s ago) and has not fired: the scheduler is not running or is stuck",
+		return fmt.Sprintf("watch %q is overdue: it was due at %s (%s ago) and has not fired, so the scheduler is not running or is stuck",
 			name, isoTime(*w.NextFireAt), waitedFor(now-*w.NextFireAt))
 	default:
 		return fmt.Sprintf("watch %q is due at %s; the scheduler's next pass will take it%s",

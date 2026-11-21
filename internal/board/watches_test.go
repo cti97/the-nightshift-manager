@@ -1623,6 +1623,9 @@ func TestAWatchStateNamesAnOverdueSchedule(t *testing.T) {
 	if !strings.Contains(state, "was due at "+stamp(overdueAt)) {
 		t.Fatalf("state = %q, want the slot it missed (%s)", state, stamp(overdueAt))
 	}
+	if !strings.Contains(state, "overdue") {
+		t.Fatalf("state = %q, want the word an operator uses", state)
+	}
 	if !strings.Contains(state, "scheduler is not running or is stuck") {
 		t.Fatalf("state = %q, want the scheduler named as the cause", state)
 	}

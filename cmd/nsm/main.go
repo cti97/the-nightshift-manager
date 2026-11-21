@@ -70,6 +70,8 @@ func run(args []string, out, errOut io.Writer) int {
 		return decideCommand(board.Approve, args[1:], out, errOut)
 	case "deny":
 		return decideCommand(board.Deny, args[1:], out, errOut)
+	case "watch":
+		return watchCommand(args[1:], out, errOut)
 	default:
 		usage(errOut)
 		return 2
@@ -77,7 +79,7 @@ func run(args []string, out, errOut io.Writer) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: nsm <version|manager|agent|node|approvals|approve|deny> [args]")
+	fmt.Fprintln(w, "usage: nsm <version|manager|agent|node|approvals|approve|deny|watch> [args]")
 }
 
 // managerTokens reads both credentials from the environment, for the same
@@ -340,6 +342,30 @@ func adminToken(errOut io.Writer) (string, bool) {
 	return tok, true
 }
 
+// adminError is a refused admin request, with the status kept separate from the
+// message. Commands need the number to answer the right way on the way out: a 4xx is
+// the caller's mistake and exits 2, a 5xx is the board's and exits 1. The message is
+// byte-for-byte what these commands printed before, so nothing that reads them
+// changes.
+type adminError struct {
+	Code int
+	Text string
+	Body string
+}
+
+func (e *adminError) Error() string { return e.Text + ": " + e.Body }
+
+// exitFor maps a failed admin call to a shell exit code: 2 when the request was
+// wrong (the operator can fix it and the board created nothing), 1 when the board
+// failed or could not be reached.
+func exitFor(err error) int {
+	var ae *adminError
+	if errors.As(err, &ae) && ae.Code >= 400 && ae.Code < 500 {
+		return 2
+	}
+	return 1
+}
+
 // adminCall performs one admin request and decodes the reply. Accept is JSON on
 // purpose: these commands are scripts with a person at the keyboard, and the
 // approvals page's HTML is for a browser.
@@ -369,7 +395,7 @@ func adminCall(ctx context.Context, method, baseURL, path, token string, in, out
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(msg)))
+		return &adminError{Code: resp.StatusCode, Text: resp.Status, Body: strings.TrimSpace(string(msg))}
 	}
 	if out == nil {
 		return nil
@@ -513,4 +539,256 @@ func splitIDAndFlags(args []string) (string, []string, error) {
 		id = a
 	}
 	return id, flags, nil
+}
+
+// defaultBoard is where a manager listens when nothing says otherwise; the four
+// commands that talk to it default here so a terminal on the same machine needs no
+// flags.
+const defaultBoard = "http://127.0.0.1:8081"
+
+// watchUsage is the whole of `nsm watch`. It is printed on a bare `nsm watch`, so the
+// three forms an operator needs are one line each rather than a paragraph.
+func watchUsage(w io.Writer) {
+	fmt.Fprintln(w, "usage: nsm watch <add|list|hold> [args]")
+	fmt.Fprintln(w, `  nsm watch add --name nightly (--every 24h | --cron "30 2 * * *") --title "..."`)
+	fmt.Fprintln(w, `      [--brief "..."] [--needs agentic] [--probe "test -f /flag"] [--dedupe 1h]`)
+	fmt.Fprintln(w, "  nsm watch list")
+	fmt.Fprintln(w, "  nsm watch hold <name> (--for 6h | --clear)")
+}
+
+// watchCommand is `nsm watch`. Watches are created and held from the terminal rather
+// than by hand in SQLite: a schedule is the kind of value a typo turns into a watch
+// that never fires, and CreateWatch refuses one at the moment it is typed.
+func watchCommand(args []string, out, errOut io.Writer) int {
+	if len(args) == 0 {
+		watchUsage(errOut)
+		return 2
+	}
+	switch args[0] {
+	case "add":
+		return watchAdd(args[1:], out, errOut)
+	case "list", "ls":
+		return watchList(args[1:], out, errOut)
+	case "hold":
+		return watchHold(args[1:], out, errOut)
+	default:
+		watchUsage(errOut)
+		return 2
+	}
+}
+
+// watchAdd is `nsm watch add`. Exactly one of --every and --cron is required, and
+// everything else is validated by the board, so the reasons an operator sees here are
+// the same ones the API gives — one validator, not two that drift.
+func watchAdd(args []string, out, errOut io.Writer) int {
+	fs := flag.NewFlagSet("watch add", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	baseURL := fs.String("board", defaultBoard, "board base URL")
+	name := fs.String("name", "", "unique watch name")
+	every := fs.String("every", "", "interval schedule, e.g. 24h")
+	cron := fs.String("cron", "", `cron schedule in UTC, e.g. "30 2 * * *"`)
+	title := fs.String("title", "", "title of the item a fire creates")
+	brief := fs.String("brief", "", "brief for the item")
+	needs := fs.String("needs", "", "comma-separated capabilities the item needs")
+	probe := fs.String("probe", "", "command run on the manager before firing; exit 0 means fire")
+	dedupe := fs.String("dedupe", "1h", "minimum time between emissions; 0 disables")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	req := board.CreateWatchRequest{
+		Name:  *name,
+		Probe: *probe,
+		Template: board.WatchTemplate{
+			Title: *title,
+			Brief: *brief,
+			Needs: splitList(*needs),
+		},
+	}
+	switch {
+	case strings.TrimSpace(*name) == "":
+		fmt.Fprintln(errOut, "--name is required: it is how you hold the watch and how you read it in a list")
+		return 2
+	case strings.TrimSpace(*title) == "":
+		fmt.Fprintln(errOut, "--title is required: a fired watch is an item, and every item has one")
+		return 2
+	case strings.TrimSpace(*brief) == "":
+		// The board refuses a template without one, and it is right to: the brief is
+		// what the executor reads at 03:00, and a watch that fires a title with no
+		// instructions emits work nobody can do.
+		fmt.Fprintln(errOut, "--brief is required: it is what the executor reads when the item runs")
+		return 2
+	case *every == "" && *cron == "":
+		fmt.Fprintln(errOut, "one of --every or --cron is required")
+		return 2
+	case *every != "" && *cron != "":
+		fmt.Fprintln(errOut, "--every and --cron are alternatives; give one")
+		return 2
+	}
+	if *every != "" {
+		req.Trigger, req.Schedule = board.TriggerInterval, *every
+	} else {
+		req.Trigger, req.Schedule = board.TriggerCron, *cron
+	}
+	if d, err := time.ParseDuration(*dedupe); err != nil {
+		fmt.Fprintf(errOut, "--dedupe %q: %v\n", *dedupe, err)
+		return 2
+	} else if d < 0 {
+		fmt.Fprintln(errOut, "--dedupe must not be negative; use 0 to disable the window")
+		return 2
+	} else {
+		window := int(d / time.Second)
+		req.DedupeWindow = &window
+	}
+
+	token, ok := adminToken(errOut)
+	if !ok {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	var created board.Watch
+	if err := adminCall(ctx, http.MethodPost, *baseURL, "/admin/watches", token, req, &created); err != nil {
+		fmt.Fprintf(errOut, "watch add: %v\n", err)
+		return exitFor(err)
+	}
+	slot := "no slot computed"
+	if created.NextFireAt != nil {
+		slot = time.Unix(*created.NextFireAt, 0).UTC().Format(time.RFC3339)
+	}
+	fmt.Fprintf(out, "watch %q created (%s %s, id %s), first slot %s\n",
+		created.Name, created.Trigger, created.Schedule, created.ID, slot)
+	return 0
+}
+
+// watchList is `nsm watch list`: one block per watch, with the board's own state
+// sentence underneath. The sentence is the board's, not this command's (Task 8), so
+// the terminal and the API cannot disagree about why a watch is quiet.
+func watchList(args []string, out, errOut io.Writer) int {
+	fs := flag.NewFlagSet("watch list", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	baseURL := fs.String("board", defaultBoard, "board base URL")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	token, ok := adminToken(errOut)
+	if !ok {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	var views []board.WatchView
+	if err := adminCall(ctx, http.MethodGet, *baseURL, "/admin/watches", token, nil, &views); err != nil {
+		fmt.Fprintf(errOut, "watch list: %v\n", err)
+		return exitFor(err)
+	}
+	if len(views) == 0 {
+		fmt.Fprintln(out, "[]")
+		return 0
+	}
+	for _, v := range views {
+		status := "enabled"
+		if !v.Enabled {
+			status = "disabled"
+		}
+		fmt.Fprintf(out, "%s  %s %s  [%s]\n", v.Name, v.Trigger, v.Schedule, status)
+		fmt.Fprintf(out, "    %s\n", v.State)
+	}
+	return 0
+}
+
+// watchHold is `nsm watch hold <name> --for 6h` and `--clear`. --for is parsed as a
+// duration and sent as an absolute cooldown_until, because the CLI's clock is not the
+// board's: a duration is what an operator thinks in, a timestamp is what survives the
+// request.
+func watchHold(args []string, out, errOut io.Writer) int {
+	name, flags, err := splitIDAndFlags(args)
+	if err != nil {
+		fmt.Fprintln(errOut, err)
+		return 2
+	}
+	fs := flag.NewFlagSet("watch hold", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	baseURL := fs.String("board", defaultBoard, "board base URL")
+	forDuration := fs.Duration("for", 0, "how long to hold the watch, e.g. 6h")
+	clear := fs.Bool("clear", false, "release the hold")
+	if err := fs.Parse(flags); err != nil {
+		return 2
+	}
+	switch {
+	case name == "":
+		fmt.Fprintln(errOut, "usage: nsm watch hold <name> (--for 6h | --clear)")
+		return 2
+	case *clear && *forDuration != 0:
+		fmt.Fprintln(errOut, "--for and --clear are alternatives; give one")
+		return 2
+	case !*clear && *forDuration <= 0:
+		fmt.Fprintln(errOut, "one of --for <duration> or --clear is required")
+		return 2
+	}
+
+	token, ok := adminToken(errOut)
+	if !ok {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	var views []board.WatchView
+	if err := adminCall(ctx, http.MethodGet, *baseURL, "/admin/watches", token, nil, &views); err != nil {
+		fmt.Fprintf(errOut, "watch hold: %v\n", err)
+		return exitFor(err)
+	}
+	id := ""
+	for _, v := range views {
+		if v.Name == name {
+			id = v.ID
+			break
+		}
+	}
+	if id == "" {
+		// There is no delete and no rename, so a wrong name is a typo, not a race: say
+		// what exists rather than only what does not.
+		fmt.Fprintf(errOut, "no watch named %q\n", name)
+		if len(views) > 0 {
+			names := make([]string, 0, len(views))
+			for _, v := range views {
+				names = append(names, v.Name)
+			}
+			fmt.Fprintf(errOut, "watches on this board: %s\n", strings.Join(names, ", "))
+		}
+		return 2
+	}
+
+	var until int64
+	if !*clear {
+		until = time.Now().Add(*forDuration).Unix()
+	}
+	var patched board.Watch
+	if err := adminCall(ctx, http.MethodPatch, *baseURL, "/admin/watches/"+url.PathEscape(id), token,
+		board.PatchWatchRequest{CooldownUntil: &until}, &patched); err != nil {
+		fmt.Fprintf(errOut, "watch hold: %v\n", err)
+		return exitFor(err)
+	}
+	if *clear {
+		fmt.Fprintf(out, "watch %q released\n", name)
+		return 0
+	}
+	fmt.Fprintf(out, "watch %q held until %s\n", name,
+		time.Unix(until, 0).UTC().Format(time.RFC3339))
+	return 0
+}
+
+// splitList turns "a, b ,c" into a slice and "  " into nil, so an empty --needs is
+// absent rather than a list holding one empty string.
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

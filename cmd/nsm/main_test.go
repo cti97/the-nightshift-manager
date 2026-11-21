@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cti97/the-nightshift-manager/internal/agent"
 	"github.com/cti97/the-nightshift-manager/internal/board"
@@ -514,5 +516,228 @@ func TestApproveReportsTheBoardsRefusal(t *testing.T) {
 	}
 	if out.String() != "" {
 		t.Fatalf("stdout = %q, want nothing: the decision did not land", out.String())
+	}
+}
+
+// watchBoard is a real board behind an HTTP server, plus the DB so a test can age a
+// row the way a stopped manager leaves it. The CLI is exercised through run(), so the
+// flag parsing, the request and the exit code are all the ones an operator gets.
+func watchBoard(t *testing.T) (*httptest.Server, *sql.DB, *board.FixedClock) {
+	t.Helper()
+	db, clock := board.OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	srv := httptest.NewServer(board.NewServer(db, clock, provider.NewRegistry(),
+		board.HashToken("admin-secret"), board.HashToken("enroll-secret")).Handler())
+	t.Cleanup(srv.Close)
+	t.Setenv("NSM_ADMIN_TOKEN", "admin-secret")
+	return srv, db, clock
+}
+
+// TestWatchAddRequiresATriggerAndATemplate: every refusal names what is missing and
+// leaves the board empty. The board validates; the CLI does not keep a second copy of
+// the rules, so an unknown capability is refused by the same code that would refuse it
+// at 03:00.
+func TestWatchAddRequiresATriggerAndATemplate(t *testing.T) {
+	srv, db, _ := watchBoard(t)
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"no trigger", []string{"watch", "add", "--name", "x", "--title", "t", "--brief", "b"}, "--every or --cron"},
+		{"both triggers", []string{"watch", "add", "--name", "x", "--title", "t", "--brief", "b", "--every", "1h", "--cron", "0 * * * *"}, "alternatives"},
+		{"no title", []string{"watch", "add", "--name", "x", "--every", "1h", "--brief", "b"}, "--title is required"},
+		{"no brief", []string{"watch", "add", "--name", "x", "--every", "1h", "--title", "t"}, "--brief is required"},
+		{"unknown capability", []string{"watch", "add", "--name", "x", "--every", "1h", "--title", "t", "--brief", "b", "--needs", "teleport"}, "teleport"},
+		{"bad schedule", []string{"watch", "add", "--name", "x", "--every", "soon", "--title", "t", "--brief", "b"}, "schedule"},
+	}
+	for _, c := range cases {
+		var out, errOut bytes.Buffer
+		if code := run(append(c.args, "--board", srv.URL), &out, &errOut); code != 2 {
+			t.Fatalf("%s: exit = %d, want 2 (stderr %s)", c.name, code, errOut.String())
+		}
+		if !strings.Contains(errOut.String(), c.want) {
+			t.Fatalf("%s: stderr = %q, want it to contain %q", c.name, errOut.String(), c.want)
+		}
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM watches`).Scan(&count); err != nil {
+		t.Fatalf("count watches: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("watches = %d after five refused adds, want none", count)
+	}
+}
+
+// TestWatchAddCreatesAWatchAndNamesItsSlot: the operator sees when it will first fire
+// without a second command, and the row exists with the fields they typed.
+func TestWatchAddCreatesAWatchAndNamesItsSlot(t *testing.T) {
+	srv, db, clock := watchBoard(t)
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"watch", "add", "--board", srv.URL,
+		"--name", "nightly", "--cron", "30 2 * * *",
+		"--title", "Sweep the cache", "--brief", "delete what is stale",
+		"--needs", "agentic, gpu", "--probe", "test -f /tmp/flag", "--dedupe", "6h",
+	}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr %s)", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "first slot") {
+		t.Fatalf("stdout = %q, want the first slot named", out.String())
+	}
+
+	var w board.Watch
+	var needsJSON string
+	if err := db.QueryRow(`SELECT name,trigger,schedule,probe,title,needs,dedupe_window FROM watches,
+	        (SELECT json_extract(template,'$.title') AS title, json_extract(template,'$.needs') AS needs FROM watches) x
+	     WHERE name='nightly'`).Scan(&w.Name, &w.Trigger, &w.Schedule, &w.Probe, &w.Template.Title, &needsJSON, &w.DedupeWindow); err != nil {
+		t.Fatalf("read watch: %v", err)
+	}
+	if w.Name != "nightly" || w.Trigger != board.TriggerCron || w.Schedule != "30 2 * * *" {
+		t.Fatalf("watch = %+v, want the cron watch that was typed", w)
+	}
+	if w.Probe != "test -f /tmp/flag" || w.DedupeWindow != 6*3600 {
+		t.Fatalf("probe %q dedupe %d, want them as typed", w.Probe, w.DedupeWindow)
+	}
+	if !strings.Contains(needsJSON, "agentic") || !strings.Contains(needsJSON, "gpu") {
+		t.Fatalf("needs = %s, want both capabilities", needsJSON)
+	}
+	if clock.Now() == 0 {
+		t.Fatal("the fixture clock was not the board's")
+	}
+}
+
+// TestWatchListPrintsTheState: the terminal repeats the board's sentence, so a held
+// watch reads as held with the expiry and an overdue one reads as overdue. A command
+// that composed its own wording would drift from the API the first time the sentence
+// changed.
+func TestWatchListPrintsTheState(t *testing.T) {
+	srv, db, clock := watchBoard(t)
+
+	for _, name := range []string{"held", "overdue"} {
+		var out, errOut bytes.Buffer
+		if code := run([]string{"watch", "add", "--board", srv.URL, "--name", name,
+			"--every", "1h", "--title", "t", "--brief", "b"}, &out, &errOut); code != 0 {
+			t.Fatalf("add %s: exit = %d (stderr %s)", name, code, errOut.String())
+		}
+	}
+	// Hold one for six hours; age the other's slot ten minutes into the past, which is
+	// what a stopped manager leaves behind.
+	var out, errOut bytes.Buffer
+	if code := run([]string{"watch", "hold", "held", "--for", "6h", "--board", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("hold: exit = %d (stderr %s)", code, errOut.String())
+	}
+	if _, err := db.Exec(`UPDATE watches SET next_fire_at=? WHERE name='overdue'`, clock.Now()-600); err != nil {
+		t.Fatalf("age the watch: %v", err)
+	}
+
+	out.Reset()
+	if code := run([]string{"watch", "list", "--board", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("list: exit = %d (stderr %s)", code, errOut.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "held by the operator until") {
+		t.Fatalf("stdout = %q, want the hold sentence", got)
+	}
+	if !strings.Contains(got, "overdue") || !strings.Contains(got, "scheduler is not running") {
+		t.Fatalf("stdout = %q, want the overdue sentence", got)
+	}
+}
+
+// TestWatchHoldSetsAndClears: --for is sent as an absolute timestamp (the CLI's clock,
+// not the board's), the row carries it, and --clear removes it. Every malformed form
+// exits 2 and changes nothing.
+func TestWatchHoldSetsAndClears(t *testing.T) {
+	srv, db, _ := watchBoard(t)
+	var out, errOut bytes.Buffer
+	if code := run([]string{"watch", "add", "--board", srv.URL, "--name", "nightly",
+		"--every", "1h", "--title", "t", "--brief", "b"}, &out, &errOut); code != 0 {
+		t.Fatalf("add: exit = %d (stderr %s)", code, errOut.String())
+	}
+
+	var id string
+	if err := db.QueryRow(`SELECT id FROM watches WHERE name='nightly'`).Scan(&id); err != nil {
+		t.Fatalf("read id: %v", err)
+	}
+	before := time.Now().Add(6 * time.Hour).Unix()
+	out.Reset()
+	if code := run([]string{"watch", "hold", "nightly", "--for", "6h", "--board", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("hold: exit = %d (stderr %s)", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "held until") {
+		t.Fatalf("stdout = %q, want the expiry named", out.String())
+	}
+	w, err := board.GetWatch(context.Background(), db, id)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if w.CooldownUntil == nil || *w.CooldownUntil < before || *w.CooldownUntil > before+5 {
+		t.Fatalf("cooldown_until = %v, want about six hours from the CLI's now (%d)", w.CooldownUntil, before)
+	}
+
+	for _, c := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"neither", []string{"watch", "hold", "nightly"}, "--for <duration> or --clear"},
+		{"both", []string{"watch", "hold", "nightly", "--for", "1h", "--clear"}, "alternatives"},
+		{"negative", []string{"watch", "hold", "nightly", "--for", "-1h"}, "--for <duration> or --clear"},
+		{"unknown name", []string{"watch", "hold", "nope", "--for", "1h"}, "no watch named"},
+		{"no name", []string{"watch", "hold", "--for", "1h"}, "usage"},
+	} {
+		var o, e bytes.Buffer
+		if code := run(append(c.args, "--board", srv.URL), &o, &e); code != 2 {
+			t.Fatalf("%s: exit = %d, want 2 (stderr %s)", c.name, code, e.String())
+		}
+		if !strings.Contains(e.String(), c.want) {
+			t.Fatalf("%s: stderr = %q, want %q", c.name, e.String(), c.want)
+		}
+	}
+	if w, err := board.GetWatch(context.Background(), db, id); err != nil || w.CooldownUntil == nil {
+		t.Fatalf("a refused hold changed the row: %+v, err %v", w.CooldownUntil, err)
+	}
+
+	out.Reset()
+	if code := run([]string{"watch", "hold", "nightly", "--clear", "--board", srv.URL}, &out, &errOut); code != 0 {
+		t.Fatalf("clear: exit = %d (stderr %s)", code, errOut.String())
+	}
+	if w, err := board.GetWatch(context.Background(), db, id); err != nil || w.CooldownUntil != nil {
+		t.Fatalf("cooldown_until = %v after --clear, want nil", w.CooldownUntil)
+	}
+}
+
+// TestTheAdminTokenIsNeverAFlag: the credential comes from the environment and only
+// from there. If --token parsed, someone would put it in their shell history and in
+// ps, which is the rule M3 established.
+func TestTheAdminTokenIsNeverAFlag(t *testing.T) {
+	srv, _, _ := watchBoard(t)
+	var out, errOut bytes.Buffer
+	code := run([]string{"watch", "list", "--token", "admin-secret", "--board", srv.URL}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (stderr %s)", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "flag provided but not defined: -token") {
+		t.Fatalf("stderr = %q, want the flag refused by name", errOut.String())
+	}
+}
+
+// TestWatchCommandsExitOneWhenTheBoardFails: a 4xx is the operator's mistake and exits
+// 2; an unreachable board is not, and exits 1. The two are different things to a
+// script, and a wrapper that retries on one and re-prompts on the other needs them
+// apart.
+func TestWatchCommandsExitOneWhenTheBoardFails(t *testing.T) {
+	t.Setenv("NSM_ADMIN_TOKEN", "admin-secret")
+	unreachable := "http://127.0.0.1:1"
+	for _, args := range [][]string{
+		{"watch", "list", "--board", unreachable},
+		{"watch", "hold", "nightly", "--for", "1h", "--board", unreachable},
+		{"watch", "add", "--name", "x", "--every", "1h", "--title", "t", "--brief", "b", "--board", unreachable},
+	} {
+		var out, errOut bytes.Buffer
+		if code := run(args, &out, &errOut); code != 1 {
+			t.Fatalf("%v: exit = %d, want 1 (stderr %s)", args[:2], code, errOut.String())
+		}
 	}
 }
