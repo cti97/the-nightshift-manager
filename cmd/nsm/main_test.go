@@ -805,3 +805,41 @@ func TestAgentRunRefusesABadPolicyBeforeClaiming(t *testing.T) {
 		t.Fatalf("stderr = %q, want the loaded policy summarised", errOut.String())
 	}
 }
+
+// TestAgentRunChoosesTheExecutor: the steward runs the reflex path; a typo in --executor must be
+// refused at start, not silently turned into the full tool loop on a machine that cannot carry it.
+func TestAgentRunChoosesTheExecutor(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("NSM_NODE_TOKEN", "token")
+	base := []string{"--node", "n", "--provides", "reflex", "--reach", "host", "--sandbox-root", dir}
+
+	// The token is unset by a successful parse (it is read once and removed), so each call sets it
+	// again rather than relying on the first.
+	t.Setenv("NSM_NODE_TOKEN", "token")
+	var errOut bytes.Buffer
+	cfg, ok := parseAgentConfig(append(base, "--executor", "reflex"), &errOut)
+	if !ok {
+		t.Fatalf("--executor reflex refused: %s", errOut.String())
+	}
+	if _, isReflex := cfg.Executor.(*agent.ReflexExecutor); !isReflex {
+		t.Fatalf("executor = %T, want *agent.ReflexExecutor", cfg.Executor)
+	}
+
+	errOut.Reset()
+	t.Setenv("NSM_NODE_TOKEN", "token")
+	if _, ok := parseAgentConfig(append(base, "--executor", "agntic"), &errOut); ok {
+		t.Fatal("a misspelled executor was accepted")
+	}
+	if !strings.Contains(errOut.String(), "neither agentic nor reflex") {
+		t.Fatalf("stderr = %q, want the vocabulary", errOut.String())
+	}
+
+	// The default is the loop, so existing invocations keep meaning what they meant.
+	errOut.Reset()
+	t.Setenv("NSM_NODE_TOKEN", "token")
+	if cfg, ok := parseAgentConfig(base, &errOut); !ok {
+		t.Fatalf("the default was refused: %s", errOut.String())
+	} else if _, isAgentic := cfg.Executor.(*agent.AgenticExecutor); !isAgentic {
+		t.Fatalf("default executor = %T, want *agent.AgenticExecutor", cfg.Executor)
+	}
+}

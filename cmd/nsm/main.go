@@ -233,6 +233,7 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	reach := fs.String("reach", "", "comma-separated reach classes this node can actually use (host,lan,wan)")
 	sandboxRoot := fs.String("sandbox-root", "", "absolute path under which each run gets a disposable directory (required)")
 	policyPath := fs.String("policy", "", "JSON file of per-tool verdicts (allow|deny|ask), e.g. {\"default\":\"allow\",\"shell\":\"deny\"}")
+	executorKind := fs.String("executor", "agentic", "which executor to run: agentic (full tool loop) or reflex (one model call, for a steward)")
 	if err := fs.Parse(args); err != nil {
 		return agent.Config{}, false
 	}
@@ -297,6 +298,24 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 		fmt.Fprintf(errOut, "policy: %s\n", policy.String())
 	}
 
+	var executor agent.Executor
+	switch *executorKind {
+	case "agentic":
+		executor = &agent.AgenticExecutor{
+			Registry:    provider.NewRegistry(),
+			SandboxRoot: *sandboxRoot,
+			Policy:      policy,
+		}
+	case "reflex":
+		// The steward's path: one call, no tools, no sandbox. --sandbox-root is still required by
+		// this command because the flag is the node's, not the executor's, and a steward that
+		// later switches to agentic must not be unconfigured for it.
+		executor = &agent.ReflexExecutor{Registry: provider.NewRegistry()}
+	default:
+		fmt.Fprintf(errOut, "--executor %q is neither agentic nor reflex\n", *executorKind)
+		return agent.Config{}, false
+	}
+
 	// The token is read once and then removed from this process's environment.
 	// What that buys is inheritance, not secrecy: an ordinary child process
 	// started after this point does not receive the token in its environment.
@@ -321,11 +340,7 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 		// from the claim's config, and the credential is resolved by name from
 		// this process's environment. The sandbox root is the flag, not a
 		// second configuration: it is the one thing the claim cannot supply.
-		Executor: &agent.AgenticExecutor{
-			Registry:    provider.NewRegistry(),
-			SandboxRoot: *sandboxRoot,
-			Policy:      policy,
-		},
+		Executor: executor,
 		Protocol: board.ProtocolMax,
 		Provides: providesLive,
 		Reaches:  reaches,

@@ -408,7 +408,24 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 // A construction failure names the endpoint, not just the family: "provider
 // openai failed (auth)" cannot tell an operator whose key failed, while
 // "endpoint laptop (provider openai) failed" can.
-func (e *AgenticExecutor) providerFor(item board.ClaimedItem) (provider.Provider, string, error) {
+// providerDeps is everything constructing a provider needs, gathered so the agentic loop and the
+// reflex path share one implementation: two copies of the auth_ref rules would drift, and the one
+// that drifted would be the one nobody reads.
+type providerDeps struct {
+	Registry    *provider.Registry
+	newProvider func(provider.Config) (provider.Provider, error)
+	lookupEnv   func(string) string
+}
+
+func (d providerDeps) env(name string) string {
+	if d.lookupEnv != nil {
+		return d.lookupEnv(name)
+	}
+	return os.Getenv(name)
+}
+
+// forItem builds the adapter for the endpoint a claim names and returns the wire model id to send.
+func (d providerDeps) forItem(item board.ClaimedItem) (provider.Provider, string, error) {
 	ep := item.Endpoint
 	switch {
 	case strings.TrimSpace(ep.Provider) == "":
@@ -424,7 +441,7 @@ func (e *AgenticExecutor) providerFor(item board.ClaimedItem) (provider.Provider
 		if err := provider.CheckAuthRef(ep.AuthRef); err != nil {
 			return nil, "", fmt.Errorf("agent: endpoint %q: %w", ep.Name, err)
 		}
-		key := e.env(ep.AuthRef)
+		key := d.env(ep.AuthRef)
 		if key == "" {
 			return nil, "", fmt.Errorf(
 				"agent: endpoint %q: auth_ref %q names a provider key that is not set in this node's environment",
@@ -433,9 +450,9 @@ func (e *AgenticExecutor) providerFor(item board.ClaimedItem) (provider.Provider
 		cfg.APIKey = key
 	}
 
-	ctor := e.newProvider
+	ctor := d.newProvider
 	if ctor == nil {
-		ctor = e.Registry.New
+		ctor = d.Registry.New
 	}
 	p, err := ctor(cfg)
 	if err != nil {
@@ -450,11 +467,9 @@ func (e *AgenticExecutor) providerFor(item board.ClaimedItem) (provider.Provider
 	return p, item.Model.ModelID, nil
 }
 
-func (e *AgenticExecutor) env(name string) string {
-	if e.lookupEnv != nil {
-		return e.lookupEnv(name)
-	}
-	return os.Getenv(name)
+// providerFor and env keep the executor's names; the work lives in providerDeps.
+func (e *AgenticExecutor) providerFor(item board.ClaimedItem) (provider.Provider, string, error) {
+	return providerDeps{Registry: e.Registry, newProvider: e.newProvider, lookupEnv: e.lookupEnv}.forItem(item)
 }
 
 // complete sends one request through the retry policy. The reservation and the
