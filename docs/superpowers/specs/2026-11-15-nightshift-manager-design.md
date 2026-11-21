@@ -392,6 +392,13 @@ board keeps heartbeating, reaping and reporting — only issuance stops.
 detect drift (a node whose live set shrinks for an hour is a dashboard warning, not a silent
 degradation).
 
+The agent rebuilds that set from facts on every beat, never from what it declared last time:
+`sandbox:<profile>` from the confinement probe, and `lan:<service>` from a TCP dial to each
+configured `service=host:port` (the dial is the promise — nothing here speaks SMB or CUPS, and a
+deeper check would be a lie a placement decision could act on). A probe that does not answer within
+a second keeps its service out of the set, so a closed lid removes the capability at the next
+heartbeat rather than at the next restart.
+
 **Lease semantics.** Lease = 300s, extended to `now()+300` on each heartbeat. All lease
 arithmetic is server-side.
 
@@ -762,7 +769,7 @@ Cheap because the model is stubbed. The six that matter:
 - **M3** — escalation and approvals.
 - **M4** — watches (cron, interval, condition) with dedupe and cooldown.
 - **M5** — threads and budget reserve/settle.
-- **M6** — steward: Pi, `ReflexExecutor`, dynamic `lan:*` capabilities, endpoint canary,
+- **M6** — steward: Pi, `ReflexExecutor` (done), dynamic `lan:*` capabilities (done), endpoint canary,
   read-only replica, plus `nsm agent install` (launchd / systemd / Task Scheduler), release
   signing, and the manager's `/dist` channel.
 

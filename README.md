@@ -69,6 +69,7 @@ nsm version
 nsm manager serve   [--addr] [--db]
 nsm node register   --name --provides --reach [--role] [--concurrency] [--board]
 nsm agent run       --node --provides --reach --sandbox-root [--policy FILE] [--executor agentic|reflex]
+                    [--lan service=host:port,...]
 nsm agent install   --node --provides --reach --sandbox-root [--executor …] [--print]
 nsm approvals       [--board]                       # the queue, for a terminal
 nsm approve <item>  [--note "…"] [--board]
@@ -81,6 +82,9 @@ nsm watch hold <name> (--for 6h | --clear) [--board]
 
 Credentials are never flags: `NSM_ADMIN_TOKEN` for the admin commands, `NSM_ENROLL_TOKEN` for
 `node register`, `NSM_NODE_TOKEN` for `agent run`. A `--token` argument does not parse.
+
+`--lan` declares a service capability (`lan:nas`) only while a TCP dial to it answers, re-checked
+on every heartbeat: a laptop that leaves the house stops advertising the home NAS within 15s.
 
 `nsm agent install` writes a launchd agent (macOS) or a systemd **user** unit (Linux), plus a
 wrapper that sources a `0600` environment file: the node token never appears in a unit file or a

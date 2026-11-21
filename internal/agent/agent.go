@@ -48,6 +48,10 @@ type Config struct {
 	// Heartbeat and Poll default to 15s and 25s (spec §10).
 	Heartbeat time.Duration
 	Poll      time.Duration
+	// Lan is the services this node promises are reachable from inside the home network. They are
+	// probed on every heartbeat and declared only while they answer (spec §8): a cached capability
+	// is one the node stopped having when its owner closed the lid.
+	Lan []LanProbe
 }
 
 type Agent struct {
@@ -208,8 +212,13 @@ func (a *Agent) heartbeat(ctx context.Context) {
 	// The confinement capability is appended to the declared set on every beat, from the probe
 	// rather than from configuration: what this agent can promise about the boundary is a fact
 	// about the machine, and a stale claim here is a run placed on a sandbox that is not there.
+	// The declared set is rebuilt every beat from facts about the machine — the confinement probe
+	// and the LAN probes — never from what was declared last time.
+	caps := append([]string{}, a.cfg.Provides...)
+	caps = append(caps, SandboxCapability()...)
+	caps = append(caps, LanCapabilities(ctx, a.cfg.Lan)...)
 	resp, err := a.c.Heartbeat(ctx, board.HeartbeatRequest{
-		ProvidesLive: append(append([]string{}, a.cfg.Provides...), SandboxCapability()...),
+		ProvidesLive: caps,
 		ReachClasses: a.cfg.Reaches,
 		FreeSlots:    freeSlots,
 		Protocol:     a.cfg.Protocol,
