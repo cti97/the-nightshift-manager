@@ -136,7 +136,10 @@ frozen thread's budget.
   [carryover](docs/superpowers/plans/2026-11-16-m2-carryover.md),
   [M3](docs/superpowers/plans/2026-11-16-m3-escalation-and-approvals.md),
   [M4](docs/superpowers/plans/2026-11-17-m4-watches.md),
-  [M5](docs/superpowers/plans/2026-11-21-m5-threads-and-budgets.md).
+  [M5](docs/superpowers/plans/2026-11-21-m5-threads-and-budgets.md),
+  [M6](docs/superpowers/plans/2026-11-21-m6-steward.md) (in progress).
+- Design memos — proposals that are not scheduled:
+  [read-only replica](docs/superpowers/designs/2026-11-21-read-only-replica.md).
 - Proofs — what was run against the real binaries, and what it found:
   [M4 watches](docs/superpowers/proofs/2026-11-21-m4-watches-proof.md),
   [M5 threads](docs/superpowers/proofs/2026-11-21-m5-threads-proof.md).
