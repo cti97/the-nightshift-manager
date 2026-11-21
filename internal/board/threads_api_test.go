@@ -164,3 +164,119 @@ func TestTheCheckpointRouteIsNodeAndLive(t *testing.T) {
 		t.Fatalf("another node: %d %s, want 403", rec.Code, rec.Body.String())
 	}
 }
+
+// TestTheThreadPageShowsTheBudgetBar: a phone gets one column, the numbers, the messages and
+// a form. The bar's width is the used percentage, and the text beside it is the number an
+// operator quotes.
+func TestTheThreadPageShowsTheBudgetBar(t *testing.T) {
+	f := newThreadFixture(t)
+	ctx := context.Background()
+	th, err := CreateThread(ctx, f.db, f.clock, CreateThreadRequest{Subject: "cache policy", BudgetTokens: 2000})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	if _, err := PostMessage(ctx, f.db, f.clock, th.ID, PostMessageRequest{Author: "agent-a", Body: "delete the cache?"}); err != nil {
+		t.Fatalf("PostMessage: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/admin/threads/"+th.ID, nil)
+	req.Header.Set("Accept", "text/html")
+	req.SetBasicAuth("operator", testAdminToken)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("page: %d %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"cache policy", "tokens used", "delete the cache?", "agent-a", `<form method="post"`, "Your reply"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("page is missing %q", want)
+		}
+	}
+	if !strings.Contains(body, `class="bar"`) {
+		t.Fatal("the page has no budget bar")
+	}
+}
+
+// TestTheThreadPagePostsAsAdmin: the form's post is the operator's, the author is "admin"
+// whatever the body says, and the answer is a redirect back to the page (303, so a refresh
+// does not repost).
+func TestTheThreadPagePostsAsAdmin(t *testing.T) {
+	f := newThreadFixture(t)
+	ctx := context.Background()
+	th, err := CreateThread(ctx, f.db, f.clock, CreateThreadRequest{Subject: "s", BudgetTokens: 10_000})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	form := "body=hold+off+on+the+cache&author=agent-a"
+	req := httptest.NewRequest("POST", "/admin/threads/"+th.ID+"/messages", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth("operator", testAdminToken)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("form post: %d %s", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "/admin/threads/"+th.ID {
+		t.Fatalf("redirect = %q, want the thread page", loc)
+	}
+	view, err := GetThread(ctx, f.db, th.ID)
+	if err != nil {
+		t.Fatalf("GetThread: %v", err)
+	}
+	if len(view.Messages) != 1 || view.Messages[0].Author != "admin" {
+		t.Fatalf("messages = %+v, want one from admin", view.Messages)
+	}
+	if view.Messages[0].Body != "hold off on the cache" {
+		t.Fatalf("body = %q, want the form's text", view.Messages[0].Body)
+	}
+
+	// The JSON branch is the same rule: the credential names the author, not the body. An
+	// operator posting here cannot appear as an agent in the record.
+	rec = f.do(t, "POST", "/admin/threads/"+th.ID+"/messages", testAdminToken,
+		PostMessageRequest{Author: "agent-a", Body: "json reply"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("json post: %d %s", rec.Code, rec.Body.String())
+	}
+	view, err = GetThread(ctx, f.db, th.ID)
+	if err != nil {
+		t.Fatalf("GetThread: %v", err)
+	}
+	if last := view.Messages[len(view.Messages)-1]; last.Author != "admin" {
+		t.Fatalf("the JSON post was recorded as %q, want admin", last.Author)
+	}
+}
+
+// TestThePageAndTheJSONAgreeOnRemaining: one route, two representations, one set of numbers.
+func TestThePageAndTheJSONAgreeOnRemaining(t *testing.T) {
+	f := newThreadFixture(t)
+	ctx := context.Background()
+	th, err := CreateThread(ctx, f.db, f.clock, CreateThreadRequest{Subject: "s", BudgetTokens: 5000})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	ten := 10
+	if _, err := PostMessage(ctx, f.db, f.clock, th.ID, PostMessageRequest{Author: "agent-a", Body: "x", Tokens: &ten}); err != nil {
+		t.Fatalf("PostMessage: %v", err)
+	}
+	get := func(accept string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "/admin/threads/"+th.ID, nil)
+		req.Header.Set("Accept", accept)
+		req.SetBasicAuth("operator", testAdminToken)
+		rec := httptest.NewRecorder()
+		f.srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	jsonRec := get("application/json")
+	var view ThreadView
+	if err := json.Unmarshal(jsonRec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	htmlBody := get("text/html").Body.String()
+	if !strings.Contains(htmlBody, "4990 left") {
+		t.Fatalf("the page does not show the JSON's remaining (%d): %s", view.Remaining, htmlBody)
+	}
+	if view.Remaining != 4990 {
+		t.Fatalf("remaining = %d, want 4990", view.Remaining)
+	}
+}

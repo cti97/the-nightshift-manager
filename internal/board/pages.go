@@ -2,6 +2,7 @@
 package board
 
 import (
+	"encoding/json"
 	"html/template"
 	"log"
 	"net/http"
@@ -127,4 +128,150 @@ func renderHTML(w http.ResponseWriter, status int, tmpl *template.Template, data
 	if err := tmpl.Execute(w, data); err != nil {
 		log.Printf("board: render page: %v", err)
 	}
+}
+
+// threadPage is the conversation with its budget bar (spec §14 item 4). The bar is a plain
+// div with a width, not a canvas: a phone must be able to read it, and the numbers beside it
+// are what an operator actually quotes.
+var threadPage = template.Must(template.New("thread").Funcs(template.FuncMap{
+	"when": func(ts int64) string {
+		return time.Unix(ts, 0).UTC().Format("2006-01-02 15:04") + " UTC"
+	},
+}).Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Subject}} — thread</title>
+<style>
+  body { margin: 0 auto; max-width: 44rem; padding: 1rem; font: 16px/1.5 system-ui, -apple-system, sans-serif; color: #111; background: #fff; }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+  .meta { font-size: .85rem; color: #555; margin: .25rem 0; }
+  .bar { height: .75rem; border-radius: .4rem; background: #e8e8e8; overflow: hidden; margin: .5rem 0 .25rem; }
+  .bar span { display: block; height: 100%; background: #444; }
+  .bar span.frozen { background: #b33; }
+  ol { list-style: none; padding: 0; }
+  li { border: 1px solid #9994; border-radius: .5rem; padding: .6rem .8rem; margin: .6rem 0; }
+  .author { font-size: .8rem; color: #555; text-transform: uppercase; letter-spacing: .03em; }
+  .body { white-space: pre-wrap; margin: .25rem 0 0; }
+  form { margin-top: 1rem; }
+  label { display: block; font-size: .9rem; color: #333; }
+  textarea { width: 100%; box-sizing: border-box; font: inherit; margin-top: .25rem; }
+  button { font: inherit; padding: .5rem 1.1rem; margin-top: .5rem; border-radius: .35rem; border: 1px solid #777; background: #f4f4f4; }
+  .closed { color: #555; }
+</style>
+</head>
+<body>
+<h1>{{.Subject}}</h1>
+<p class="meta">{{.Status}} — {{.TokensUsed}} of {{.BudgetTokens}} tokens used, {{.Remaining}} left{{if .TurnOwner}} — last word from {{.TurnOwner}}{{end}}</p>
+<div class="bar"><span class="{{.Status}}" style="width:{{.UsedPct}}%"></span></div>
+{{if .WorkItemID}}<p class="meta">item {{.WorkItemID}}</p>{{end}}
+<ol>
+{{range .Messages}}
+<li>
+  <div class="author">{{.Author}} — {{when .CreatedAt}} — {{.TokensCharged}} tokens</div>
+  <div class="body">{{.Body}}</div>
+</li>
+{{end}}
+</ol>
+{{if eq .Status "open"}}
+<form method="post" action="/admin/threads/{{.ID}}/messages">
+  <label>Your reply, as the operator
+    <textarea name="body" rows="3" required></textarea>
+  </label>
+  <button type="submit">Post</button>
+</form>
+{{else}}<p class="closed">This thread is {{.Status}}; only raising its budget can reopen it.</p>{{end}}
+</body>
+</html>
+`))
+
+// threadErrorPage is what a browser sees when its post is refused — a frozen thread, most
+// often — with the reason and a way back.
+var threadErrorPage = template.Must(template.New("thread-error").Parse(`<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Post refused</title>
+<style>body { margin: 0 auto; max-width: 44rem; padding: 1rem; font: 16px/1.5 system-ui, sans-serif; }
+.error { border: 1px solid #b33; border-radius: .5rem; padding: 1rem; margin: 1rem 0; }</style></head>
+<body><h1>Post refused</h1><p class="error">{{.Message}}</p>
+<p><a href="/admin/threads/{{.ID}}">Back to the thread</a></p></body></html>
+`))
+
+// threadPageData is the view the template needs: the thread, its messages, and the bar's
+// percentage, clamped at 100 because an overspent thread (settlement is uncapped, D1) must
+// still draw a full bar rather than an overhanging one.
+type threadPageData struct {
+	ThreadView
+	UsedPct int
+}
+
+func newThreadPageData(view ThreadView) threadPageData {
+	pct := 0
+	if view.BudgetTokens > 0 {
+		pct = view.TokensUsed * 100 / view.BudgetTokens
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return threadPageData{ThreadView: view, UsedPct: pct}
+}
+
+// handleThreadPage is GET /admin/threads/{id}: the page for a browser, the JSON view for
+// everything else. One route, like the approvals page, so the two representations cannot
+// diverge in what they count.
+func (s *Server) handleThreadPage(w http.ResponseWriter, r *http.Request) {
+	view, err := GetThread(r.Context(), s.db, r.PathValue("id"))
+	if err != nil {
+		status, code := threadErrorStatus(err)
+		if wantsHTML(r) {
+			renderHTML(w, status, threadErrorPage, map[string]string{
+				"ID": r.PathValue("id"), "Message": err.Error(),
+			})
+			return
+		}
+		WriteError(w, status, code, err.Error())
+		return
+	}
+	if wantsHTML(r) {
+		renderHTML(w, http.StatusOK, threadPage, newThreadPageData(view))
+		return
+	}
+	WriteJSON(w, http.StatusOK, view)
+}
+
+// handleAdminMessage is POST /admin/threads/{id}/messages: the operator's own reply. The
+// author is "admin" and only "admin" — the route is behind the admin credential, so letting a
+// body name an author would let an operator impersonate an agent in the thread's record.
+// That is also the only path by which D3's exemption (an operator may post twice) exists.
+func (s *Server) handleAdminMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req PostMessageRequest
+	if isFormPost(r) {
+		if err := r.ParseForm(); err != nil {
+			WriteError(w, http.StatusBadRequest, "bad_form", err.Error())
+			return
+		}
+		req = PostMessageRequest{Author: "admin", Body: r.PostFormValue("body")}
+	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	} else {
+		req.Author = "admin"
+	}
+	res, err := PostMessage(r.Context(), s.db, s.clock, id, req)
+	if err != nil {
+		status, code := threadErrorStatus(err)
+		if isFormPost(r) {
+			renderHTML(w, status, threadErrorPage, map[string]string{"ID": id, "Message": err.Error()})
+			return
+		}
+		WriteError(w, status, code, err.Error())
+		return
+	}
+	if isFormPost(r) {
+		http.Redirect(w, r, "/admin/threads/"+id, http.StatusSeeOther)
+		return
+	}
+	WriteJSON(w, http.StatusCreated, res)
 }

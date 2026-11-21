@@ -92,6 +92,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("PATCH /admin/watches/{id}", s.adminAuth(http.HandlerFunc(s.handlePatchWatch)))
 	mux.Handle("POST /admin/threads", s.adminAuth(http.HandlerFunc(s.handleCreateThread)))
 	mux.Handle("PATCH /admin/threads/{id}", s.adminAuth(http.HandlerFunc(s.handlePatchThread)))
+	// The operator's own view and reply. The page and the JSON share one route (M3 D8's pattern).
+	mux.Handle("GET /admin/threads/{id}", s.adminAuth(http.HandlerFunc(s.handleThreadPage)))
+	mux.Handle("POST /admin/threads/{id}/messages", s.adminAuth(http.HandlerFunc(s.handleAdminMessage)))
 	// The conversation itself is a participant's view: an agent reads and posts with the node
 	// token it already holds, and the operator's levers (create, budget) are admin routes.
 	mux.Handle("GET /threads/{id}", s.nodeAuth(http.HandlerFunc(s.handleGetThread)))
