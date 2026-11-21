@@ -53,11 +53,19 @@ func run(args []string, out, errOut io.Writer) int {
 		}
 		return managerServe(args[2:], errOut)
 	case "agent":
-		if len(args) < 2 || args[1] != "run" {
+		if len(args) < 2 {
 			usage(errOut)
 			return 2
 		}
-		return agentRun(args[2:], errOut)
+		switch args[1] {
+		case "run":
+			return agentRun(args[2:], errOut)
+		case "install":
+			return installCommand(args[2:], out, errOut)
+		default:
+			usage(errOut)
+			return 2
+		}
 	case "node":
 		if len(args) < 2 || args[1] != "register" {
 			usage(errOut)
@@ -80,6 +88,7 @@ func run(args []string, out, errOut io.Writer) int {
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage: nsm <version|manager|agent|node|approvals|approve|deny|watch> [args]")
+	fmt.Fprintln(w, "       nsm agent <run|install> [args]")
 }
 
 // managerTokens reads both credentials from the environment, for the same
