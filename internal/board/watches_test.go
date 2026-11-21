@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1547,3 +1548,339 @@ func TestTheSchedulerLoopTicksAndStops(t *testing.T) {
 		t.Fatal("RunWatches did not return after its context was cancelled")
 	}
 }
+
+// watchRowSnapshot renders every column of a watch as text, so a test can assert a
+// read changed nothing without listing the columns a second time.
+func watchRowSnapshot(t *testing.T, db *sql.DB, id string) string {
+	t.Helper()
+	rows, err := db.Query(`SELECT * FROM watches WHERE id=?`, id)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("snapshot columns: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("snapshot: no watch %s", id)
+	}
+	vals := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		t.Fatalf("snapshot scan: %v", err)
+	}
+	var b strings.Builder
+	for i, c := range cols {
+		fmt.Fprintf(&b, "%s=%v;", c, vals[i])
+	}
+	return b.String()
+}
+
+// TestAWatchStateNamesTheNextSlot: a healthy schedule watch says when it will look
+// again, in the same format the skip reasons use.
+func TestAWatchStateNamesTheNextSlot(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	w, err := CreateWatch(context.Background(), db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	state := WatchState(w, clock.Now())
+	// It has not fired yet, so the sentence is about its first slot; what matters is
+	// that the slot's own timestamp is there to compare with the schedule.
+	if !strings.Contains(state, stamp(*w.NextFireAt)) || !strings.Contains(state, "slot") {
+		t.Fatalf("state = %q, want the slot %s named", state, stamp(*w.NextFireAt))
+	}
+	if strings.Contains(state, "not running") {
+		t.Fatalf("state = %q claims a stopped scheduler for a healthy watch", state)
+	}
+}
+
+// TestAWatchStateNamesAnOverdueSchedule is the sentence that matters: a slot ten
+// minutes in the past is not "waiting", it is a manager that is not running.
+func TestAWatchStateNamesAnOverdueSchedule(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	// The row a stopped manager leaves behind: the slot came and went, nothing
+	// advanced it.
+	overdueAt := clock.Now() - 600
+	if _, err := db.Exec(`UPDATE watches SET next_fire_at=? WHERE id=?`, overdueAt, w.ID); err != nil {
+		t.Fatalf("make overdue: %v", err)
+	}
+	got, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+
+	state := WatchState(got, clock.Now())
+	if !strings.Contains(state, "was due at "+stamp(overdueAt)) {
+		t.Fatalf("state = %q, want the slot it missed (%s)", state, stamp(overdueAt))
+	}
+	if !strings.Contains(state, "scheduler is not running or is stuck") {
+		t.Fatalf("state = %q, want the scheduler named as the cause", state)
+	}
+	if strings.Contains(state, "waiting") {
+		t.Fatalf("state = %q calls an overdue watch waiting", state)
+	}
+}
+
+// TestAWatchStateNamesAnOverdueSlotAsImminentInsideTheGrace: a slot a few seconds
+// old is the next pass's business, not a stopped manager. Without the grace every
+// watch would read as broken for fifteen seconds per slot.
+func TestAWatchStateNamesAnOverdueSlotAsImminentInsideTheGrace(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE watches SET next_fire_at=? WHERE id=?`, clock.Now()-5, w.ID); err != nil {
+		t.Fatalf("make due: %v", err)
+	}
+	got, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	state := WatchState(got, clock.Now())
+	if !strings.Contains(state, "the scheduler's next pass will take it") {
+		t.Fatalf("state = %q, want the next pass named", state)
+	}
+	if strings.Contains(state, "not running") {
+		t.Fatalf("state = %q calls a five-second-old slot a stopped scheduler", state)
+	}
+}
+
+// TestAWatchStateNamesTheHoldBeforeTheSchedule: held and overdue is still "held".
+// The operator's decision is the answer; the missed slot is a consequence of it.
+func TestAWatchStateNamesTheHoldBeforeTheSchedule(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	until := clock.Now() + 7200
+	hold(t, db, clock, w.ID, until)
+	if _, err := db.Exec(`UPDATE watches SET next_fire_at=? WHERE id=?`, clock.Now()-600, w.ID); err != nil {
+		t.Fatalf("make overdue: %v", err)
+	}
+	got, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	state := WatchState(got, clock.Now())
+	if !strings.Contains(state, "held by the operator until "+stamp(until)) {
+		t.Fatalf("state = %q, want the hold (%s)", state, stamp(until))
+	}
+	if strings.Contains(state, "scheduler is not running") {
+		t.Fatalf("state = %q diagnoses a stopped scheduler when the operator held the watch", state)
+	}
+}
+
+// TestAWatchStateSaysDisabledFirst: a disabled watch's schedule is frozen, so naming
+// a hold or a slot would describe something nobody is consulting.
+func TestAWatchStateSaysDisabledFirst(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	off := false
+	if _, err := PatchWatch(ctx, db, clock, w.ID, PatchWatchRequest{Enabled: &off}); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	hold(t, db, clock, w.ID, clock.Now()+7200)
+	got, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	state := WatchState(got, clock.Now())
+	if !strings.Contains(state, "disabled") || strings.Contains(state, "held") {
+		t.Fatalf("state = %q, want disabled named and the hold left out", state)
+	}
+}
+
+// TestAConditionStateNamesTheObservation: a condition watch's next_fire_at is always
+// "now", so the overdue rule must not apply — a healthy one would read as a stopped
+// scheduler. The observation, and how long ago it was taken, is the answer.
+func TestAConditionStateNamesTheObservation(t *testing.T) {
+	dir := t.TempDir()
+	db, clock := OpenForTest(t, filepath.Join(dir, "board.db"))
+	ctx := context.Background()
+	w := conditionWatch(t, db, clock, filepath.Join(dir, "flag"))
+
+	// Never checked: no observation, no claim about the scheduler.
+	if state := WatchState(w, clock.Now()); !strings.Contains(state, "has not been checked yet") {
+		t.Fatalf("state = %q for an unchecked condition, want that said", state)
+	}
+
+	// A false observation, taken just now.
+	res := fireAgain(t, db, clock, w.ID)
+	if res.Fired {
+		t.Fatalf("an unset flag fired: %+v", res)
+	}
+	current, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	state := WatchState(current, clock.Now())
+	if !strings.Contains(state, "the condition is false") {
+		t.Fatalf("state = %q, want the observation", state)
+	}
+	if strings.Contains(state, "not running") {
+		t.Fatalf("state = %q calls a just-checked condition a stopped scheduler", state)
+	}
+
+	// The same row, ten minutes later: nothing looked at it.
+	stale := WatchState(current, clock.Now()+600)
+	if !strings.Contains(stale, "scheduler is not running") {
+		t.Fatalf("state = %q for a condition unchecked for ten minutes, want the scheduler named", stale)
+	}
+}
+
+// TestReadingAWatchWritesNothing is the /why rule again: an explanation must not
+// change the thing it explains. Both forms are read — the row and its sentence — and
+// the row, the event count and the second response are compared before and after.
+func TestReadingAWatchWritesNothing(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	srv := NewServer(db, clock, nil, HashToken(testAdminToken), HashToken(testEnrollToken))
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO config (key,value) VALUES ('board_paused','1')`); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+
+	before := watchRowSnapshot(t, db, w.ID)
+	var eventsBefore int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&eventsBefore); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+
+	rec := do(t, srv.Handler(), "GET", "/admin/watches/"+w.ID, testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body WatchView
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.State == "" {
+		t.Fatal("the response carries no state sentence")
+	}
+
+	again := do(t, srv.Handler(), "GET", "/admin/watches/"+w.ID, testAdminToken)
+	if again.Body.String() != rec.Body.String() {
+		t.Fatalf("two reads differ:\n%s\n%s", rec.Body.String(), again.Body.String())
+	}
+	if after := watchRowSnapshot(t, db, w.ID); after != before {
+		t.Fatalf("the row changed across a read:\nbefore %s\nafter  %s", before, after)
+	}
+	var eventsAfter int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&eventsAfter); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if eventsAfter != eventsBefore {
+		t.Fatalf("events went from %d to %d across a read", eventsBefore, eventsAfter)
+	}
+}
+
+// TestTheListCarriesTheState: a list an operator scans has to be readable without a
+// request per row.
+func TestTheListCarriesTheState(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	srv := NewServer(db, clock, nil, HashToken(testAdminToken), HashToken(testEnrollToken))
+	if _, err := CreateWatch(ctx, db, clock, watchReq("a")); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	if _, err := CreateWatch(ctx, db, clock, watchReq("b")); err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+	rec := do(t, srv.Handler(), "GET", "/admin/watches", testAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var views []WatchView
+	if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(views) != 2 {
+		t.Fatalf("got %d watches, want 2", len(views))
+	}
+	for _, v := range views {
+		if !strings.Contains(v.State, stamp(*v.NextFireAt)) {
+			t.Fatalf("watch %s state = %q, want its slot %s", v.Name, v.State, stamp(*v.NextFireAt))
+		}
+	}
+}
+
+// TestAWatchStateCarriesOnlyACurrentSkip: a skip older than the last fire describes
+// a slot that has since been overtaken. Printing it would tell an operator about a
+// refusal that no longer applies.
+func TestAWatchStateCarriesOnlyACurrentSkip(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	w, err := CreateWatch(ctx, db, clock, watchReq("disk"))
+	if err != nil {
+		t.Fatalf("CreateWatch: %v", err)
+	}
+
+	if first := fireAgain(t, db, clock, w.ID); !first.Fired {
+		t.Fatalf("first fire = %+v", first)
+	}
+	fired, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if state := WatchState(fired, clock.Now()); strings.Contains(state, "last skipped") {
+		t.Fatalf("state = %q narrates a skip that never happened", state)
+	}
+
+	// Hold it, then let a slot pass: that is a skip, and the newest event of the two.
+	hold(t, db, clock, w.ID, clock.Now()+7200)
+	clock.Advance(300 * time.Second)
+	if res := fireAgain(t, db, clock, w.ID); res.Fired {
+		t.Fatalf("a held slot fired: %+v", res)
+	}
+	// Released without moving the clock: the hold no longer explains the quiet, so the
+	// sentence falls through to the schedule — and the skip it narrates is the current
+	// one, newer than the last fire.
+	if _, err := PatchWatch(ctx, db, clock, w.ID, PatchWatchRequest{CooldownUntil: ptrInt64(0)}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	released, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if state := WatchState(released, clock.Now()); !strings.Contains(state, "last skipped at "+stamp(*released.LastSkipAt)) {
+		t.Fatalf("state = %q, want the current skip narrated", state)
+	}
+
+	// Fire again, past the dedupe window. The skip is now older than the fire and must
+	// stop being narrated.
+	clock.Advance(time.Duration(*released.LastFiredAt+3600-clock.Now()+60) * time.Second)
+	if res := fireAgain(t, db, clock, w.ID); !res.Fired {
+		t.Fatalf("the fire after the hold = %+v", res)
+	}
+	final, err := GetWatch(ctx, db, w.ID)
+	if err != nil {
+		t.Fatalf("GetWatch: %v", err)
+	}
+	if state := WatchState(final, clock.Now()); strings.Contains(state, "last skipped") {
+		t.Fatalf("state = %q still narrates an overtaken skip", state)
+	}
+}
+
+// ptrInt64 is fixture sugar for the PatchWatchRequest's pointer fields.
+func ptrInt64(v int64) *int64 { return &v }

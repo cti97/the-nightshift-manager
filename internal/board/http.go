@@ -698,23 +698,30 @@ func (s *Server) handleCreateWatch(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleListWatches is GET /admin/watches: oldest first, [] when there are none.
+// handleListWatches is GET /admin/watches: oldest first, [] when there are none. Each
+// row carries its derived state so a list is readable without a request per row.
 func (s *Server) handleListWatches(w http.ResponseWriter, r *http.Request) {
 	watches, err := ListWatches(r.Context(), s.db)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "watches", err.Error())
 		return
 	}
-	WriteJSON(w, http.StatusOK, watches)
+	now := s.clock.Now()
+	views := make([]WatchView, 0, len(watches))
+	for _, w := range watches {
+		views = append(views, ViewWatch(w, now))
+	}
+	WriteJSON(w, http.StatusOK, views)
 }
 
-// handleGetWatch is GET /admin/watches/{id}. Task 8 hangs the derived state
-// sentence off this read; the row itself is what it answers today.
+// handleGetWatch is GET /admin/watches/{id}: the row plus the sentence that says why
+// it is quiet (M4 Task 8). The read writes nothing — no state column, no event — so
+// asking cannot change the answer.
 func (s *Server) handleGetWatch(w http.ResponseWriter, r *http.Request) {
 	watch, err := GetWatch(r.Context(), s.db, r.PathValue("id"))
 	switch {
 	case err == nil:
-		WriteJSON(w, http.StatusOK, watch)
+		WriteJSON(w, http.StatusOK, ViewWatch(watch, s.clock.Now()))
 	case errors.Is(err, sql.ErrNoRows):
 		WriteError(w, http.StatusNotFound, "not_found", err.Error())
 	default:

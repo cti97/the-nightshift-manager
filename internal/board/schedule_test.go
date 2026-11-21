@@ -19,7 +19,7 @@ func at(t *testing.T, s string) int64 {
 	return tm.Unix()
 }
 
-func stamp(unix int64) string { return time.Unix(unix, 0).UTC().Format(time.RFC3339) }
+func stamp(unix int64) string { return isoTime(unix) }
 
 // TestCronFiresAtTheNextMatchingMinute is the core table: every row is a schedule
 // an operator would plausibly type, and the answer is the next minute it fires.

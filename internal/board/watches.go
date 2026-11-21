@@ -697,3 +697,140 @@ func (s *Server) RunWatches(ctx context.Context, every time.Duration) {
 		}
 	}
 }
+
+// watchStaleAfter is how late a slot may be before the board stops calling it
+// "the next pass will take it" and starts calling the scheduler stopped. It is a
+// grace, not a threshold of interest: the manager's tick is 15s, so a slot a few
+// seconds old is a watch that is about to fire, and calling that "the scheduler is
+// not running" on every watch for fifteen seconds per slot would make the sentence
+// worthless. Two minutes is eight ticks — long enough that a healthy manager never
+// trips it, short enough that a stopped one is noticed within the minute.
+const watchStaleAfter = int64(2 * time.Minute / time.Second)
+
+// WatchView is a watch plus the sentence an operator reads instead of the columns
+// (M4 D10). It is derived on read and stored nowhere: a state column would need
+// writing on every tick, would be wrong between ticks, and would disagree with the
+// scheduling columns the way a cache does.
+type WatchView struct {
+	Watch
+	State string `json:"state"`
+}
+
+// ViewWatch pairs a stored row with its sentence.
+func ViewWatch(w Watch, now int64) WatchView {
+	return WatchView{Watch: w, State: WatchState(w, now)}
+}
+
+// WatchState answers "why is this watch quiet" from what is stored (M4 Task 8). The
+// order is the fix order of Fire's own gate chain, so the sentence names the same
+// refusal the scheduler would: disabled, held, then — for a schedule — overdue or
+// waiting, with a current skip appended.
+//
+// It is a read. Nothing here writes, for the /why reason: asking why must not change
+// the answer it is explaining.
+func WatchState(w Watch, now int64) string {
+	name := w.Name
+	if name == "" {
+		name = w.ID
+	}
+	if !w.Enabled {
+		// First because it is the first thing Fire checks, and because a disabled
+		// watch's other columns are frozen: reporting a hold or an overdue slot
+		// would describe a schedule that is not being consulted at all.
+		return fmt.Sprintf("watch %q is disabled; it will not fire until it is switched back on", name)
+	}
+	if w.CooldownUntil != nil && *w.CooldownUntil > now {
+		return fmt.Sprintf("watch %q is held by the operator until %s (%s from now)",
+			name, isoTime(*w.CooldownUntil), waitedFor(*w.CooldownUntil-now))
+	}
+	if w.Trigger == TriggerCondition {
+		return conditionState(w, name, now)
+	}
+	return scheduleState(w, name, now)
+}
+
+// conditionState describes a condition watch. Its next_fire_at is always "now" by
+// design — it is evaluated every pass — so the overdue rule must not be applied to
+// it: a perfectly healthy condition watch would read as a stopped scheduler.
+//
+// The last observation's age is what answers the scheduler question here, and it is
+// knowable because every evaluation writes a skip or a fire (Task 5's decision to
+// record the "already true" skip is what makes this sentence possible).
+func conditionState(w Watch, name string, now int64) string {
+	checkedAt := w.LastSkipAt
+	if w.LastFiredAt != nil && (checkedAt == nil || *w.LastFiredAt > *checkedAt) {
+		checkedAt = w.LastFiredAt
+	}
+	if checkedAt == nil {
+		return fmt.Sprintf("watch %q has not been checked yet; its probe runs on the scheduler's next pass", name)
+	}
+	observation := "the probe's last run produced no observation (it timed out or could not start)"
+	if w.LastResult != nil {
+		if *w.LastResult {
+			observation = "the condition is true"
+		} else {
+			observation = "the condition is false"
+		}
+	}
+	sentence := fmt.Sprintf("watch %q is a condition watch: %s (last checked %s ago)",
+		name, observation, waitedFor(now-*checkedAt))
+	if age := now - *checkedAt; age > watchStaleAfter {
+		sentence += fmt.Sprintf("; nothing has looked at it for longer than %s, so the scheduler is not running or is stuck", waitedFor(watchStaleAfter))
+	}
+	// A condition's every quiet evaluation is a skip, so its reason is usually just
+	// the observation already stated above. It is worth printing only when the
+	// observation is missing — that is the case no other clause covers.
+	if w.LastResult == nil && w.LastSkipReason != "" && w.LastSkipAt != nil {
+		sentence += "; it last skipped at " + isoTime(*w.LastSkipAt) + " because " + w.LastSkipReason
+	}
+	return sentence
+}
+
+// scheduleState describes a triggered watch by its next slot: future means waiting,
+// past beyond the grace means the scheduler is not running, past inside the grace
+// means the next pass will take it.
+func scheduleState(w Watch, name string, now int64) string {
+	switch {
+	case w.NextFireAt == nil:
+		// Not reachable through CreateWatch, which always computes a slot; a
+		// hand-edited row is the case, and "no slot" is the honest answer.
+		return fmt.Sprintf("watch %q has no next slot recorded, so it will not fire; set its schedule again", name)
+	case *w.NextFireAt > now:
+		if w.LastFiredAt == nil {
+			return fmt.Sprintf("watch %q has not fired yet; its first slot is at %s (%s away)",
+				name, isoTime(*w.NextFireAt), waitedFor(*w.NextFireAt-now))
+		}
+		return fmt.Sprintf("watch %q is waiting for its next slot at %s (%s away)%s",
+			name, isoTime(*w.NextFireAt), waitedFor(*w.NextFireAt-now), skipClause(w))
+	case now-*w.NextFireAt > watchStaleAfter:
+		// The sentence that matters: a watch whose row still says it was due ten
+		// minutes ago is not waiting for anything. Either the manager is down or the
+		// scheduler loop is not running, and saying "waiting" would send the operator
+		// looking at the schedule instead of at the process.
+		return fmt.Sprintf("watch %q was due at %s (%s ago) and has not fired: the scheduler is not running or is stuck",
+			name, isoTime(*w.NextFireAt), waitedFor(now-*w.NextFireAt))
+	default:
+		return fmt.Sprintf("watch %q is due at %s; the scheduler's next pass will take it%s",
+			name, isoTime(*w.NextFireAt), skipClause(w))
+	}
+}
+
+// skipClause is the tail that says why the last slot did not fire, and only when
+// that skip is current. A skip older than the last fire describes a slot that has
+// since been overtaken — printing it would tell an operator about a refusal that no
+// longer applies, which is the same failure as a stale cache with worse grammar.
+func skipClause(w Watch) string {
+	if w.LastSkipAt == nil || w.LastSkipReason == "" {
+		return ""
+	}
+	if w.LastFiredAt != nil && *w.LastSkipAt <= *w.LastFiredAt {
+		return ""
+	}
+	return "; it last skipped at " + isoTime(*w.LastSkipAt) + " because " + w.LastSkipReason
+}
+
+// isoTime renders a stored second for a sentence. UTC and RFC 3339, like the skip
+// reasons Task 5 writes, so a reader comparing the two is comparing one format.
+func isoTime(ts int64) string {
+	return time.Unix(ts, 0).UTC().Format(time.RFC3339)
+}
