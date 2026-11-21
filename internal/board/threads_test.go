@@ -462,3 +462,130 @@ func TestTheReservationGrowsWithTheConversation(t *testing.T) {
 		t.Fatalf("second reserve = %d, want the conversation plus the new message (%d)", second.Reserved, want)
 	}
 }
+
+// TestAFrozenThreadRefusesMessages: every post is refused with ErrThreadFrozen until the
+// budget moves, and the refusal says so.
+func TestAFrozenThreadRefusesMessages(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	out := 100
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 50, MaxOutputTokens: &out})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
+		t.Fatalf("first post = %v, want ErrThreadFrozen (reserve 102 > budget 50)", err)
+	}
+	for i, author := range []string{"a", "b"} {
+		if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: author, Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
+			t.Fatalf("post %d to a frozen thread = %v, want ErrThreadFrozen", i, err)
+		}
+	}
+}
+
+// TestRaisingTheBudgetReopensTheThread: a budget that fits reopens it, and the next post
+// goes through. Without this a frozen thread would be indistinguishable from a closed one.
+func TestRaisingTheBudgetReopensTheThread(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	out := 100
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 50, MaxOutputTokens: &out})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
+		t.Fatalf("the thread did not freeze: %v", err)
+	}
+	big := 10_000
+	patched, err := PatchThread(ctx, db, clock, th.ID, PatchThreadRequest{BudgetTokens: &big})
+	if err != nil {
+		t.Fatalf("PatchThread: %v", err)
+	}
+	if patched.Status != ThreadOpen || patched.BudgetTokens != 10_000 {
+		t.Fatalf("after the patch = %+v, want open at 10000", patched)
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); err != nil {
+		t.Fatalf("the reopened thread refused a post: %v", err)
+	}
+	// The reopen is an event: the dashboard's history reads events, and a status that
+	// changed without one would look like a board that woke up different.
+	var opens int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM events WHERE entity='thread' AND entity_id=? AND type='open'`, th.ID).Scan(&opens); err != nil {
+		t.Fatalf("count reopen events: %v", err)
+	}
+	if opens != 1 {
+		t.Fatalf("reopen events = %d, want 1", opens)
+	}
+}
+
+// TestFreezingWritesExactlyOneEvent: the freeze is one event, and a post to an already
+// frozen thread writes nothing at all — a thread that stays frozen must not spam the spine.
+func TestFreezingWritesExactlyOneEvent(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	out := 100
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 50, MaxOutputTokens: &out})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	count := func() int {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM events WHERE entity='thread' AND type='frozen'`).Scan(&n); err != nil {
+			t.Fatalf("count events: %v", err)
+		}
+		return n
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
+		t.Fatalf("first post = %v", err)
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("frozen events = %d after the freeze, want 1", got)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "b", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
+			t.Fatalf("post %d = %v", i, err)
+		}
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("frozen events = %d after three refused posts, want still 1", got)
+	}
+}
+
+// TestPatchNeverContradictsTheThread: a patch to a frozen thread whose numbers still do not
+// fit leaves it frozen, and a closed thread is not patchable at all.
+func TestPatchNeverContradictsTheThread(t *testing.T) {
+	db, clock := OpenForTest(t, filepath.Join(t.TempDir(), "board.db"))
+	ctx := context.Background()
+	out := 100
+	th, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 50, MaxOutputTokens: &out})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	if _, err := PostMessage(ctx, db, clock, th.ID, PostMessageRequest{Author: "a", Body: "x"}); !errors.Is(err, ErrThreadFrozen) {
+		t.Fatalf("the thread did not freeze: %v", err)
+	}
+	small := 60
+	if _, err := PatchThread(ctx, db, clock, th.ID, PatchThreadRequest{BudgetTokens: &small}); err != nil {
+		t.Fatalf("PatchThread: %v", err)
+	}
+	view, err := GetThread(ctx, db, th.ID)
+	if err != nil {
+		t.Fatalf("GetThread: %v", err)
+	}
+	if view.Status != ThreadFrozen {
+		t.Fatalf("status = %q after a patch that does not fit, want frozen", view.Status)
+	}
+
+	// A closed thread's budget is not a lever: the conversation is over.
+	two := 1
+	closed, err := CreateThread(ctx, db, clock, CreateThreadRequest{Subject: "s", BudgetTokens: 10_000, MaxTurns: &two})
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	if _, err := PostMessage(ctx, db, clock, closed.ID, PostMessageRequest{Author: "a", Body: "x"}); err != nil {
+		t.Fatalf("the single turn was refused: %v", err)
+	}
+	if _, err := PatchThread(ctx, db, clock, closed.ID, PatchThreadRequest{BudgetTokens: &small}); !errors.Is(err, ErrThreadClosed) {
+		t.Fatalf("patching a closed thread = %v, want ErrThreadClosed", err)
+	}
+}

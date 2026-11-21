@@ -453,3 +453,89 @@ func commitConn(ctx context.Context, conn *sql.Conn, committed *bool) error {
 // "admin", "system" and node ids; a message author that is none of those is still that
 // author, so it is passed through rather than guessed at.
 func actorFor(author string) string { return author }
+
+// PatchThreadRequest is the operator's lever: raise (or lower) a thread's budget. Nothing
+// else about a conversation is editable — messages are append-only, and a closed thread
+// stays closed (D8).
+type PatchThreadRequest struct {
+	BudgetTokens *int `json:"budget_tokens"`
+}
+
+// PatchThread changes the budget and, if the thread was frozen by a budget that no longer
+// binds, reopens it.
+//
+// The reopen is not unconditional: it happens only when the thread's own numbers now fit,
+// so PATCH cannot put a thread into a state its counters contradict. A patch that leaves a
+// frozen thread unable to send is accepted (the operator may be working towards a number)
+// and the thread stays frozen.
+func PatchThread(ctx context.Context, db *sql.DB, clock Clock, id string, req PatchThreadRequest) (Thread, error) {
+	if req.BudgetTokens == nil {
+		return Thread{}, fmt.Errorf("nothing to change: send budget_tokens")
+	}
+	budget := *req.BudgetTokens
+	if budget <= 0 {
+		return Thread{}, fmt.Errorf("budget_tokens must be positive")
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return Thread{}, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return Thread{}, fmt.Errorf("begin immediate: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	var th Thread
+	var owner sql.NullString
+	var closedAt sql.NullInt64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT id, COALESCE(work_item_id,''), subject, budget_tokens, max_output_tokens,
+		        tokens_reserved, tokens_used, max_turns, turns_used, turn_owner, status,
+		        created_at, closed_at
+		   FROM threads WHERE id=?`, id).
+		Scan(&th.ID, &th.WorkItemID, &th.Subject, &th.BudgetTokens, &th.MaxOutputTokens,
+			&th.TokensReserved, &th.TokensUsed, &th.MaxTurns, &th.TurnsUsed, &owner,
+			&th.Status, &th.CreatedAt, &closedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Thread{}, fmt.Errorf("thread %s: %w", id, ErrNoThread)
+		}
+		return Thread{}, err
+	}
+	if th.Status == ThreadClosed {
+		return Thread{}, fmt.Errorf("%w: a closed thread's budget is not a lever", ErrThreadClosed)
+	}
+
+	// Reopen only when the smallest possible next turn fits: max_output plus one prompt
+	// token, which is the cheapest reservation PostMessage can make (estimateTokens("") is
+	// 1). A looser test — "the budget is above what is used" — would set the thread open and
+	// let the very next post freeze it again, which reads to an operator as a patch that did
+	// not work.
+	newStatus := th.Status
+	if th.Status == ThreadFrozen && budget >= th.TokensUsed+th.MaxOutputTokens+1 {
+		newStatus = ThreadOpen
+	}
+	if _, err := conn.ExecContext(ctx,
+		`UPDATE threads SET budget_tokens=?, status=? WHERE id=?`, budget, newStatus, id); err != nil {
+		return Thread{}, err
+	}
+	if newStatus != th.Status {
+		if err := AppendEvent(ctx, conn, clock, "admin", "thread", id, newStatus, map[string]any{
+			"budget_tokens": budget, "previous_budget": th.BudgetTokens,
+		}); err != nil {
+			return Thread{}, err
+		}
+	}
+	if err := commitConn(ctx, conn, &committed); err != nil {
+		return Thread{}, err
+	}
+	th.BudgetTokens = budget
+	th.Status = newStatus
+	return th, nil
+}
