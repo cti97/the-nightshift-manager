@@ -90,6 +90,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /admin/watches", s.adminAuth(http.HandlerFunc(s.handleListWatches)))
 	mux.Handle("GET /admin/watches/{id}", s.adminAuth(http.HandlerFunc(s.handleGetWatch)))
 	mux.Handle("PATCH /admin/watches/{id}", s.adminAuth(http.HandlerFunc(s.handlePatchWatch)))
+	mux.Handle("POST /admin/threads", s.adminAuth(http.HandlerFunc(s.handleCreateThread)))
+	mux.Handle("PATCH /admin/threads/{id}", s.adminAuth(http.HandlerFunc(s.handlePatchThread)))
+	// The conversation itself is a participant's view: an agent reads and posts with the node
+	// token it already holds, and the operator's levers (create, budget) are admin routes.
+	mux.Handle("GET /threads/{id}", s.nodeAuth(http.HandlerFunc(s.handleGetThread)))
+	mux.Handle("POST /threads/{id}/messages", s.nodeAuth(http.HandlerFunc(s.handlePostMessage)))
+	mux.Handle("POST /runs/{id}/checkpoint", s.nodeAuth(http.HandlerFunc(s.handleCheckpoint)))
 	return mux
 }
 
@@ -755,4 +762,105 @@ func (s *Server) handlePatchWatch(w http.ResponseWriter, r *http.Request) {
 	default:
 		WriteError(w, http.StatusBadRequest, "patch_watch", err.Error())
 	}
+}
+
+// threadErrorStatus maps a board refusal to the response a caller can act on. The codes are
+// the part a client branches on; the message is for a human reading a log.
+func threadErrorStatus(err error) (int, string) {
+	switch {
+	case errors.Is(err, ErrThreadFrozen):
+		return http.StatusConflict, "thread_frozen"
+	case errors.Is(err, ErrThreadClosed):
+		return http.StatusConflict, "thread_closed"
+	case errors.Is(err, ErrSameAuthor):
+		return http.StatusConflict, "same_author_twice"
+	case errors.Is(err, ErrNoThread):
+		return http.StatusNotFound, "no_such_thread"
+	case errors.Is(err, ErrRunNotLive):
+		return http.StatusConflict, "run_not_live"
+	case errors.Is(err, ErrNotYourRun):
+		return http.StatusForbidden, "not_your_run"
+	case errors.Is(err, sql.ErrNoRows):
+		return http.StatusNotFound, "not_found"
+	default:
+		return http.StatusBadRequest, "thread"
+	}
+}
+
+// handleCreateThread is POST /admin/threads.
+func (s *Server) handleCreateThread(w http.ResponseWriter, r *http.Request) {
+	var req CreateThreadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	th, err := CreateThread(r.Context(), s.db, s.clock, req)
+	if err != nil {
+		status, code := threadErrorStatus(err)
+		WriteError(w, status, code, err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusCreated, th)
+}
+
+// handleGetThread is GET /threads/{id}: the thread, its messages and its remaining budget.
+func (s *Server) handleGetThread(w http.ResponseWriter, r *http.Request) {
+	view, err := GetThread(r.Context(), s.db, r.PathValue("id"))
+	if err != nil {
+		status, code := threadErrorStatus(err)
+		WriteError(w, status, code, err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, view)
+}
+
+// handlePostMessage is POST /threads/{id}/messages: reserve, refuse, send, settle. The
+// response carries the numbers that explain the decision, so a caller does not have to
+// re-read the thread to learn what it cost.
+func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
+	var req PostMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	res, err := PostMessage(r.Context(), s.db, s.clock, r.PathValue("id"), req)
+	if err != nil {
+		status, code := threadErrorStatus(err)
+		WriteError(w, status, code, err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusCreated, res)
+}
+
+// handlePatchThread is PATCH /admin/threads/{id}: the budget lever.
+func (s *Server) handlePatchThread(w http.ResponseWriter, r *http.Request) {
+	var req PatchThreadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	th, err := PatchThread(r.Context(), s.db, s.clock, r.PathValue("id"), req)
+	if err != nil {
+		status, code := threadErrorStatus(err)
+		WriteError(w, status, code, err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, th)
+}
+
+// handleCheckpoint is POST /runs/{id}/checkpoint, node-authenticated: the run must be live
+// and belong to the calling node.
+func (s *Server) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
+	var req CheckpointRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	cp, err := WriteCheckpoint(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r), req)
+	if err != nil {
+		status, code := threadErrorStatus(err)
+		WriteError(w, status, code, err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusCreated, cp)
 }
