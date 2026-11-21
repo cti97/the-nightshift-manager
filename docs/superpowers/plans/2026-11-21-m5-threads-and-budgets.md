@@ -157,6 +157,12 @@ the boundary (one message refused, exactly one freeze event), the operator raise
 budget, they continue, max_turns closes it, and a checkpoint written mid-run appears in
 the next attempt's claim. Recorded under `docs/superpowers/proofs/`.
 
+**Note after implementation:** the proof found three things the tasks did not name, all on the
+caller's side rather than the board's: a node must heartbeat (with `protocol_version`) before
+`/claim` finds it, and `curl -d` sends a form content type that the decision route parses as a
+form. The board answered correctly each time; the failures were silent enough to be worth
+writing down. See `docs/superpowers/proofs/2026-11-21-m5-threads-proof.md`.
+
 ## Verification
 
 ```bash
