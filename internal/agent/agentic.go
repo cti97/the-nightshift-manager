@@ -122,6 +122,10 @@ type AgenticExecutor struct {
 	// defaultTokenBudget.
 	TokenBudget int
 
+	// Policy is this node's local rule about which tools may run (spec §22.1). The zero value
+	// allows everything: a node without a policy file behaves as it did before policy existed.
+	Policy Policy
+
 	// SandboxRoot is where this run's disposable directory is created (spec
 	// §10's run_root). Required.
 	SandboxRoot string
@@ -306,6 +310,31 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 					Content: unknownToolMessage(call.Name),
 				})
 				continue
+			}
+
+			// The node's policy is consulted before the tool runs, not after it fails: a wall that
+			// acts after the subprocess has started is a wall the subprocess has already crossed.
+			// deny answers the model and keeps the run alive; ask parks it exactly as
+			// request_approval does, so the approval machinery is reused rather than paralleled.
+			if verdict, rule := e.Policy.Decide(call.Name); verdict != VerdictAllow {
+				if verdict == VerdictDeny {
+					e.logf("policy: denied %s (%s)", call.Name, rule)
+					messages = append(messages, provider.Message{
+						Role:    "tool",
+						Name:    call.Name,
+						CallID:  call.ID,
+						Content: policyRefusal(call.Name, rule),
+					})
+					continue
+				}
+				req := board.ApprovalRequest{
+					Action:  "run " + call.Name,
+					Reason:  fmt.Sprintf("this node's policy asks before %s (%s)", call.Name, rule),
+					Options: []string{"allow it for this run", "deny"},
+				}
+				res := meter.result(fmt.Sprintf("run stopped to ask for approval: %s (node policy)", call.Name))
+				res.Approval = &req
+				return res, nil
 			}
 
 			out, terr := tool.Run(ctx, sb, call.Arguments)

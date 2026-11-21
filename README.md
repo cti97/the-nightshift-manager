@@ -68,7 +68,7 @@ endpoints — an unprobed endpoint is not an error, just an empty claim.
 nsm version
 nsm manager serve   [--addr] [--db]
 nsm node register   --name --provides --reach [--role] [--concurrency] [--board]
-nsm agent run       --node --provides --reach --sandbox-root [--board]
+nsm agent run       --node --provides --reach --sandbox-root [--policy FILE] [--board]
 nsm approvals       [--board]                       # the queue, for a terminal
 nsm approve <item>  [--note "…"] [--board]
 nsm deny <item>     --note "…"   [--board]          # the note is the recorded reason
@@ -80,6 +80,11 @@ nsm watch hold <name> (--for 6h | --clear) [--board]
 
 Credentials are never flags: `NSM_ADMIN_TOKEN` for the admin commands, `NSM_ENROLL_TOKEN` for
 `node register`, `NSM_NODE_TOKEN` for `agent run`. A `--token` argument does not parse.
+
+`--policy` is a node's local wall: a JSON file of per-tool verdicts (`allow`, `deny`, `ask`),
+consulted before a tool runs. `deny` refuses the tool and tells the model why; `ask` parks the run
+for a human like `request_approval` does. Without a file every tool is allowed, which is how the
+node behaved before the policy existed.
 
 A watch is a standing trigger — cron, interval, or a condition probe — that emits an ordinary
 item. It never holds a lease and never runs a model: **a watch emits work, it does not run it.**

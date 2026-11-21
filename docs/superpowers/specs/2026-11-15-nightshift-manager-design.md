@@ -987,10 +987,15 @@ The three amendments below are the ones that would fit *this* design; the rest a
   satisfies the `dir` floor. Only Seatbelt is claimed today, because only Seatbelt is applied;
   a Linux item requiring confinement is refused, which is the honest answer until a bwrap path
   exists.
-- **Policy before the tool (A4).** `request_approval` is a tool the model may decline, so
-  "anything real gets approved" is a convention. A per-node `allow | deny | ask` policy
-  consulted before dispatch, with `request_approval` kept as the model's escape hatch, is what
-  makes an unattended run fail closed.
+- **Policy before the tool (A4 — done).** `request_approval` is a tool the model may decline, so
+  "anything real gets approved" was a convention. A node now carries an optional policy file
+  (`{"default":"allow","shell":"deny"}`, with `allow | deny | ask` per tool) consulted **before**
+  the tool runs: `deny` answers the model and keeps the run alive, `ask` parks the run exactly as
+  `request_approval` does, so the approval machinery is reused rather than paralleled. The zero
+  policy allows everything, because a safety layer that arrives switched on would change every
+  deployment without saying so. `finish` cannot be denied — a run with no exit loops to the step
+  cap — and an unknown tool name or verdict fails at load, because a policy that silently ignored
+  a typo is a wall with a hole in it. `request_approval` remains the model's escape hatch.
 - **Budget reconciliation for runs that never report (A7, corrected).** The review called this
   a reservation held forever; it is the opposite. The board has no escrow, so a crashed run
   contributes zero to the day's ledger because its usage is unknowable — and `spend/today` now

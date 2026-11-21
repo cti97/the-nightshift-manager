@@ -232,6 +232,7 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	provides := fs.String("provides", "", "comma-separated live capabilities (e.g. agentic,vision)")
 	reach := fs.String("reach", "", "comma-separated reach classes this node can actually use (host,lan,wan)")
 	sandboxRoot := fs.String("sandbox-root", "", "absolute path under which each run gets a disposable directory (required)")
+	policyPath := fs.String("policy", "", "JSON file of per-tool verdicts (allow|deny|ask), e.g. {\"default\":\"allow\",\"shell\":\"deny\"}")
 	if err := fs.Parse(args); err != nil {
 		return agent.Config{}, false
 	}
@@ -277,6 +278,25 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 		fmt.Fprintln(errOut, "warning: --provides is empty; this node will claim nothing")
 	}
 
+	// The policy is read before the process starts claiming: a node that would run with a wall it
+	// misread is worse than a node that refuses to start, and the operator is still watching.
+	var policy agent.Policy
+	if *policyPath != "" {
+		raw, err := os.ReadFile(*policyPath)
+		if err != nil {
+			fmt.Fprintf(errOut, "--policy %s: %v\n", *policyPath, err)
+			return agent.Config{}, false
+		}
+		policy, err = agent.ParsePolicy(raw)
+		if err != nil {
+			fmt.Fprintf(errOut, "--policy %s: %v\n", *policyPath, err)
+			return agent.Config{}, false
+		}
+		// Only when there is a wall: "no policy" on every start is a line that says nothing, and a
+		// log that is noisy about the default stops being read about the exception.
+		fmt.Fprintf(errOut, "policy: %s\n", policy.String())
+	}
+
 	// The token is read once and then removed from this process's environment.
 	// What that buys is inheritance, not secrecy: an ordinary child process
 	// started after this point does not receive the token in its environment.
@@ -304,6 +324,7 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 		Executor: &agent.AgenticExecutor{
 			Registry:    provider.NewRegistry(),
 			SandboxRoot: *sandboxRoot,
+			Policy:      policy,
 		},
 		Protocol: board.ProtocolMax,
 		Provides: providesLive,

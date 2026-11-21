@@ -766,3 +766,42 @@ func TestWatchCommandsExitOneWhenTheBoardFails(t *testing.T) {
 		}
 	}
 }
+
+// TestAgentRunRefusesABadPolicyBeforeClaiming: a node that would run behind a wall it misread is
+// worse than a node that refuses to start, and the operator is still watching at start time.
+//
+// It drives parseAgentConfig rather than run(): run() would, if the refusal regressed, start a
+// polling agent against a board that is not there and never return — a regression that hangs a
+// test is nearly as bad as one that passes it.
+func TestAgentRunRefusesABadPolicyBeforeClaiming(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "policy.json")
+	if err := os.WriteFile(bad, []byte(`{"shell":"forbid"}`), 0o644); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	t.Setenv("NSM_NODE_TOKEN", "token")
+	var errOut bytes.Buffer
+	cfg, ok := parseAgentConfig([]string{"--node", "n", "--provides", "agentic", "--reach", "host",
+		"--sandbox-root", dir, "--policy", bad}, &errOut)
+	if ok {
+		t.Fatal("a policy with an unknown verdict was accepted")
+	}
+	if !strings.Contains(errOut.String(), "allow, deny or ask") {
+		t.Fatalf("stderr = %q, want the verdict vocabulary", errOut.String())
+	}
+	_ = cfg
+
+	// A good policy loads, and the node says what wall it is behind.
+	good := filepath.Join(dir, "good.json")
+	if err := os.WriteFile(good, []byte(`{"default":"allow","shell":"deny"}`), 0o644); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	errOut.Reset()
+	if _, ok := parseAgentConfig([]string{"--node", "n", "--provides", "agentic", "--reach", "host",
+		"--sandbox-root", dir, "--policy", good}, &errOut); !ok {
+		t.Fatalf("a valid policy was refused: %s", errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "shell=deny") {
+		t.Fatalf("stderr = %q, want the loaded policy summarised", errOut.String())
+	}
+}
