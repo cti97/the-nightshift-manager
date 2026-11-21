@@ -147,3 +147,7 @@ through placement) — that is the load-bearing half. Everything after §10 is m
   otherwise the tool layer is the boundary and the agent says so in its log.
 - Tests are the contract, and every load-bearing assertion has been mutation-checked: a test that
   cannot fail on the defect it names is a test that has not been written yet.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
