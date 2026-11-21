@@ -280,6 +280,11 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := Report(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r), req)
 	if err != nil {
+		if errors.Is(err, ErrStaleLease) {
+			// A verdict, not a malformed request: the client must stop, not fix its body.
+			WriteError(w, http.StatusConflict, "stale_lease", err.Error())
+			return
+		}
 		WriteError(w, http.StatusBadRequest, "report", err.Error())
 		return
 	}

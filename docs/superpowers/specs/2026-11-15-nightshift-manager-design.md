@@ -959,13 +959,16 @@ The three amendments below are the ones that would fit *this* design; the rest a
 
 ### 22.1 What fits the current design
 
-- **Fencing the client, not the ledger (the review's A1, corrected).** A late report from a
-  reaped run is already refused — `Report` accepts only `claimed`/`running` runs, both its
-  UPDATEs carry that predicate, and a lost run's late write returns `Applied:false` and writes
-  nothing. What is missing is the *client* rule: a node that reconnects after a partition
-  learns only that its report was not applied, and may already have pushed. An epoch in the
-  claim and a `stale_lease` answer would turn that into "abandon the run, do not publish".
-  Small, and it belongs to the client contract more than to the schema.
+- **Fencing the client, not the ledger (the review's A1, corrected — done).** A late report from
+  a reaped run was always refused — `Report` accepts only `claimed`/`running` runs and both its
+  UPDATEs carry that predicate — but the refusal was silent: `Applied:false` with a 200, which a
+  client may read as "delivered", after it had already pushed. The two cases are now distinct
+  answers: a run settled *by a report* is an idempotent retry (200, `applied:false`), and a run
+  settled *by the reaper* is `409 stale_lease`, which the client's rule turns into "abandon this
+  run and publish nothing". The client stops on any 4xx except 408/429, because a verdict is not
+  a glitch. An epoch in the claim would still be the stronger design — it would catch a
+  live-looking stale run — but the status guard makes that unreachable today, so it stays an
+  option rather than a task.
 - **Confinement as a declared capability (A9).** `nodes` could declare `sandbox_profile`
   (`none | dir | bwrap | systemd_scope | seatbelt`), an item could require one
   (`sandbox:bwrap`), and placement would then enforce a safety property instead of only a

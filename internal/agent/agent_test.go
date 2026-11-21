@@ -602,3 +602,39 @@ func TestIncompatibleMessageUsesTheBoardsRangeOnlyWhenSent(t *testing.T) {
 		t.Fatalf("message = %q, the node's own range was printed as the board's", silentBoard)
 	}
 }
+
+// TestAgentAbandonsAStaleLeaseWithoutRetrying: the board answering 409 stale_lease means this run
+// was reaped and its item requeued — possibly to another node. Retrying is both futile and
+// harmful, so the agent logs once and stops; the item is left to whoever holds it now.
+func TestAgentAbandonsAStaleLeaseWithoutRetrying(t *testing.T) {
+	var reports atomic.Int32
+	f := newFixture(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/report") {
+				reports.Add(1)
+				board.WriteError(w, http.StatusConflict, "stale_lease", "the run's lease is gone")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+	exec := StubExecutor{OnRun: func(item board.ClaimedItem) (Result, error) {
+		return Result{Summary: "did the work"}, nil
+	}}
+	a := withFastReportRetries(New(f.config(exec)))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errc := startAgent(a, ctx)
+
+	waitFor(t, "the report was refused once", func() bool { return reports.Load() >= 1 })
+	// Give the retry loop time to misbehave if it were going to: the fast window is 5ms-50ms.
+	time.Sleep(400 * time.Millisecond)
+	if got := reports.Load(); got != 1 {
+		t.Fatalf("report calls = %d, want exactly 1: a 409 must not be retried", got)
+	}
+	if got := f.itemStatus(t); got == "done" {
+		t.Fatalf("item status = %q after a stale-lease refusal, want it untouched", got)
+	}
+	cancel()
+	waitAgent(t, errc, context.Canceled)
+}

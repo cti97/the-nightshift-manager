@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/cti97/the-nightshift-manager/internal/provider"
 )
 
 func TestReportIsIdempotent(t *testing.T) {
@@ -171,10 +174,11 @@ func TestReportCompletesAClaimedRunThatNeverStarted(t *testing.T) {
 	}
 }
 
-// A report that arrives after the reaper has already settled the run is a
-// no-op: the run is lost and the item is back in the queue. A late report must
-// not resurrect either, nor claim credit in the audit log.
-func TestReportAfterAReapIsANoOp(t *testing.T) {
+// A report that arrives after the reaper has already settled the run is a no-op on the board —
+// the run is lost, the item is back in the queue, and neither is resurrected — but it is NOT a
+// quiet success: the client is told ErrStaleLease, because it may have published already and
+// "applied: false" is too easy to read as "delivered". The test pins both halves (M6 fence).
+func TestALateReportIsANoOpAndAStaleLease(t *testing.T) {
 	db, clock := newTestDB(t)
 	ctx := context.Background()
 	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
@@ -195,8 +199,8 @@ func TestReportAfterAReapIsANoOp(t *testing.T) {
 	}
 
 	late, err := Report(ctx, db, clock, runID, node, ReportRequest{Status: "ok", Summary: "too late"})
-	if err != nil {
-		t.Fatalf("late Report: %v", err)
+	if !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("late Report = %v, want ErrStaleLease: a healed partition is not a retry", err)
 	}
 	if late.Applied {
 		t.Fatal("a report after the reap was applied; the run is already settled")
@@ -799,5 +803,108 @@ func TestReportRejectsNegativeTokenCounts(t *testing.T) {
 				t.Fatalf("reported events = %d after a refused report, want 0", reported)
 			}
 		})
+	}
+}
+
+// TestAStaleLeaseIsNotARetryOfASettledReport: the two non-live cases must stay distinguishable at
+// the route, because one is idempotent (retry the same call) and the other is a healed partition
+// (abandon the run).
+func TestAStaleLeaseIsNotARetryOfASettledReport(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	node := SeedNodeForTest(t, db, clock, "a", "executor", "agentic")
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	if _, err := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}}); err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	got, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Claim: %v", err)
+	}
+	runID := got[0].RunID
+	if err := StartRun(ctx, db, clock, runID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if _, err := Report(ctx, db, clock, runID, node, ReportRequest{
+		Status: "ok", TokensIn: 10, TokensOut: 5,
+	}); err != nil {
+		t.Fatalf("first report: %v", err)
+	}
+
+	// The same report again is a retry of a settled call: 200 with applied:false, no error.
+	again, err := Report(ctx, db, clock, runID, node, ReportRequest{Status: "ok", TokensIn: 10, TokensOut: 5})
+	if err != nil {
+		t.Fatalf("a repeated report = %v, want the idempotent answer", err)
+	}
+	if again.Applied {
+		t.Fatal("a repeated report was applied twice")
+	}
+
+	// Now a run that never reported: the same shape of write is a stale lease.
+	if _, err := CreateItem(ctx, db, clock, CreateItemRequest{Title: "u", Brief: "b", Needs: []string{"agentic"}}); err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	lost, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(lost) != 1 {
+		t.Fatalf("second Claim: %v", err)
+	}
+	clock.Advance(time.Duration(leaseSeconds+1) * time.Second)
+	if _, err := Reap(ctx, db, clock); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if _, err := Report(ctx, db, clock, lost[0].RunID, node, ReportRequest{Status: "ok"}); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("a report on a reaped run = %v, want ErrStaleLease", err)
+	}
+}
+
+// TestTheReportRouteSaysStaleLease: the client's rule depends on the status code, so the route has
+// to answer 409 and name the code — a 400 would read as "fix your body", which is the wrong
+// instruction for a run whose lease is gone.
+func TestTheReportRouteSaysStaleLease(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	srv := NewServer(db, clock, provider.NewRegistry(), HashToken("admin"), HashToken("enroll"))
+	node, token, err := RegisterNode(ctx, db, clock, RegisterRequest{
+		Name: "a", Role: "executor", ProvidesDeclared: []string{"agentic"},
+		ReachClasses: []string{"host"}, Concurrency: 1,
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	if _, err := Heartbeat(ctx, db, clock, node, HeartbeatRequest{
+		ProvidesLive: []string{"agentic"}, ReachClasses: []string{"host"}, Protocol: ProtocolMax,
+	}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	SeedEndpointForTest(t, db, clock, "local", "host", 0, "tools")
+	if _, err := CreateItem(ctx, db, clock, CreateItemRequest{Title: "t", Brief: "b", Needs: []string{"agentic"}}); err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	got, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Claim: %v", err)
+	}
+	runID := got[0].RunID
+	if err := StartRun(ctx, db, clock, runID, node); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	clock.Advance(time.Duration(leaseSeconds+1) * time.Second)
+	if _, err := Reap(ctx, db, clock); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	// do() sends no body, and the handler refuses empty JSON before the board is asked, so this
+	// request carries its own.
+	body := strings.NewReader(`{"status":"ok"}`)
+	req := httptest.NewRequest("POST", "/runs/"+runID+"/report", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("stale report: %d %s, want 409", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "stale_lease") {
+		t.Fatalf("body = %s, want the stale_lease code", rec.Body.String())
 	}
 }

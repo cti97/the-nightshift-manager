@@ -318,6 +318,18 @@ func (a *Agent) report(ctx context.Context, runID string, req board.ReportReques
 		if ctx.Err() != nil { // shutdown, not a board failure
 			return
 		}
+		if refusal, ok := terminalRefusal(err); ok {
+			// A verdict, not a glitch: the board will answer the same thing every time. A stale
+			// lease means this run was reaped and its item requeued, possibly to another node —
+			// so the operator needs to know that a second run may have happened, and the client
+			// rule is to publish nothing from this one (spec §22.1).
+			if refusal.Code == "stale_lease" {
+				a.logf("report run %s: the board says the lease is gone (%v); abandoning this run without a retry — publish nothing from it", runID, refusal)
+			} else {
+				a.logf("report run %s: the board refused it (%v); not retrying, because a 4xx is a verdict", runID, refusal)
+			}
+			return
+		}
 		if attempt >= a.reportTries {
 			a.logf("report run %s: giving up after %d attempts: %v", runID, attempt, err)
 			return
@@ -357,6 +369,10 @@ func (a *Agent) escalate(ctx context.Context, runID string, res Result) {
 		if ctx.Err() != nil { // shutdown, not a board failure
 			return
 		}
+		if refusal, ok := terminalRefusal(err); ok {
+			a.logf("escalate run %s: the board refused it (%v); not retrying, because a 4xx is a verdict", runID, refusal)
+			return
+		}
 		if attempt >= a.reportTries {
 			a.logf("escalate run %s: giving up after %d attempts: %v", runID, attempt, err)
 			return
@@ -375,4 +391,16 @@ func (a *Agent) escalate(ctx context.Context, runID string, res Result) {
 // agents' logs in one terminal stay distinguishable.
 func (a *Agent) logf(format string, args ...any) {
 	log.Printf("agent %s: "+format, append([]any{a.cfg.NodeID}, args...)...)
+}
+
+// terminalRefusal is a board answer that retrying cannot improve: a 4xx other than 408/429. It
+// exists so report and escalate share one rule — the alternative was two hand-written checks
+// that drift, and a retry loop against a stale lease is exactly the loop that turns one bad
+// night into a request storm.
+func terminalRefusal(err error) (*StatusError, bool) {
+	var se *StatusError
+	if errors.As(err, &se) && se.Terminal() {
+		return se, true
+	}
+	return nil, false
 }

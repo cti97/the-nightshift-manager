@@ -47,6 +47,44 @@ func NewClient(baseURL, token string) *Client {
 // post sends body as JSON and decodes the reply into out unless out is nil. A
 // non-2xx reply is an error carrying the board's own message: the caller logs
 // it and moves on.
+// StatusError is a refusal from the board, with the status and the board's own error code kept
+// apart from the prose. A caller that only has the message has to parse English to tell a stale
+// lease from a malformed body, and the two call for opposite behaviour: one is abandoned, the
+// other is fixed and retried.
+type StatusError struct {
+	Path       string
+	HTTPStatus int
+	Status     string // "409 Conflict"
+	Code       string // the board's error code, e.g. "stale_lease"; empty if the body was not JSON
+	Body       string
+}
+
+func (e *StatusError) Error() string { return fmt.Sprintf("%s: %s: %s", e.Path, e.Status, e.Body) }
+
+// Terminal reports whether retrying the same request can never succeed. A 4xx is a verdict about
+// the request — a bad body, someone else's run, a lease that is gone — and repeating it is a hot
+// loop with no chance. 408 and 429 are the exceptions: the board is asking to be asked later.
+func (e *StatusError) Terminal() bool {
+	return e.HTTPStatus >= 400 && e.HTTPStatus < 500 &&
+		e.HTTPStatus != http.StatusRequestTimeout && e.HTTPStatus != http.StatusTooManyRequests
+}
+
+func newStatusError(path string, httpStatus int, status string, body []byte) *StatusError {
+	se := &StatusError{
+		Path: path, HTTPStatus: httpStatus, Status: status,
+		Body: strings.TrimSpace(string(body)),
+	}
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &env) == nil {
+		se.Code = env.Error.Code
+	}
+	return se
+}
+
 func (c *Client) post(ctx context.Context, path string, body, out any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -67,7 +105,7 @@ func (c *Client) post(ctx context.Context, path string, body, out any) error {
 
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("%s: %s: %s", path, resp.Status, msg)
+		return newStatusError(path, resp.StatusCode, resp.Status, msg)
 	}
 
 	// Read to EOF before decoding. WriteJSON ends a reply with a newline, and a

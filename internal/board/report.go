@@ -42,6 +42,12 @@ type ReportResult struct {
 // The run and the item move together because a non-terminal run for a settled
 // item is exactly the state the reaper cannot recover: it only scans claimed
 // and running items, so a run left behind would stay live forever.
+// ErrStaleLease is a write from a run that the reaper settled: the lease is gone, the item
+// may already be running elsewhere, and the client must abandon the run rather than publish
+// it. It is deliberately different from the idempotent "already settled" answer, because one
+// is a retry and the other is a partition that healed (spec §22.1).
+var ErrStaleLease = errors.New("the run's lease is gone: the run was reaped and its item requeued")
+
 func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, req ReportRequest) (ReportResult, error) {
 	// An unknown status is a malformed report, not a failure. Treating "" (a
 	// body that omitted the field) as "error" would permanently fail an item
@@ -98,9 +104,24 @@ func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, 
 
 	// Anything that is no longer claimed or running has already been settled —
 	// by an earlier report, or by the reaper, which settles the run and the item
-	// in one transaction. Returning here writes nothing at all.
+	// in one transaction. Either way nothing is written here, but the two cases
+	// are not the same answer (M6 fence):
+	//
+	//   - settled by a report: this is a retry of the same call, and idempotency
+	//     means 200 with applied:false. The client has nothing to fix.
+	//   - settled by the reaper: the run was lost, its item requeued, and another
+	//     node may already be running it. Telling that client "not applied" is too
+	//     quiet — it may have pushed a branch already. It gets a 409 stale_lease,
+	//     which the client's rule turns into "abandon this run and publish nothing".
 	if runStatus != "claimed" && runStatus != "running" {
-		return settledResult(ctx, tx, itemID)
+		res, err := settledResult(ctx, tx, itemID)
+		if err != nil {
+			return ReportResult{}, err
+		}
+		if runStatus == "lost" || runStatus == "abandoned" {
+			return res, fmt.Errorf("%w (run %s is %s; item %s is %s)", ErrStaleLease, runID, runStatus, itemID, res.ItemStatus)
+		}
+		return res, nil
 	}
 
 	finalRun, itemStatus := "ok", "done"
