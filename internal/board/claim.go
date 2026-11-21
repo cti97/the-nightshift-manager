@@ -32,6 +32,12 @@ type ClaimedItem struct {
 	// choice rather than re-deriving it.
 	Endpoint ClaimEndpoint `json:"endpoint"`
 	Model    ClaimModel    `json:"model"`
+
+	// PriorCheckpoint is the newest progress marker across the item's earlier runs (M5
+	// D7): what the last attempt declared before it stopped. It is nil on a first attempt,
+	// and the board makes no promise that resuming from it restores tool state — it is a
+	// note from the previous attempt, which is exactly what spec §12 says it is.
+	PriorCheckpoint *Checkpoint `json:"prior_checkpoint,omitempty"`
 }
 
 // ClaimEndpoint is the construction config for the endpoint that placement
@@ -424,8 +430,13 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 		}
 
 		item.Status, item.Attempt = "claimed", r.attempt+1
+		prior, err := latestCheckpoint(ctx, conn, item.ID)
+		if err != nil {
+			return nil, err
+		}
 		claimed = append(claimed, ClaimedItem{
-			Item: item, Brief: r.brief, RunID: runID, PlacementReason: d.Reason,
+			PriorCheckpoint: prior,
+			Item:            item, Brief: r.brief, RunID: runID, PlacementReason: d.Reason,
 			Endpoint: ClaimEndpoint{
 				ID:       d.Chosen.Endpoint.ID,
 				Name:     d.Chosen.Endpoint.Name,
