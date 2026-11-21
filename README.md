@@ -33,6 +33,12 @@ read-only replica), `nsm agent install`, release signing and the manager's `/dis
 not written. `make release` builds the six-target matrix and checksums it, but nothing serves
 those artifacts yet.
 
+Every push and pull request runs `make test`, `make race`, `gofmt`, `go vet` and a `go mod tidy`
+diff on **both** `ubuntu-latest` and `macos-latest`, then builds and checksums the six-target
+matrix. Both platforms are load-bearing: the sandbox tests skip on Linux with a stated reason,
+so one runner alone would leave either Seatbelt or the Linux build unproven. The badge above is
+that run.
+
 ## Quick start
 
 ```sh
