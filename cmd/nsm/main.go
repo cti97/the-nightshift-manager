@@ -243,6 +243,7 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	sandboxRoot := fs.String("sandbox-root", "", "absolute path under which each run gets a disposable directory (required)")
 	policyPath := fs.String("policy", "", "JSON file of per-tool verdicts (allow|deny|ask), e.g. {\"default\":\"allow\",\"shell\":\"deny\"}")
 	executorKind := fs.String("executor", "agentic", "which executor to run: agentic (full tool loop) or reflex (one model call, for a steward)")
+	canaryEvery := fs.Duration("canary", 0, "probe the board's endpoints every this often and report what this box cannot reach (0 disables)")
 	lanSpec := fs.String("lan", "", "services to declare while reachable, as service=host:port pairs, e.g. nas=192.168.1.10:445")
 	if err := fs.Parse(args); err != nil {
 		return agent.Config{}, false
@@ -308,6 +309,10 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 		fmt.Fprintf(errOut, "policy: %s\n", policy.String())
 	}
 
+	if *canaryEvery < 0 {
+		fmt.Fprintln(errOut, "--canary cannot be negative; use 0 to disable it")
+		return agent.Config{}, false
+	}
 	lanProbes, err := agent.ParseLanProbes(*lanSpec)
 	if err != nil {
 		fmt.Fprintln(errOut, err)
@@ -361,6 +366,7 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 		Provides: providesLive,
 		Reaches:  reaches,
 		Lan:      lanProbes,
+		Canary:   agent.CanarySettings{Interval: *canaryEvery},
 	}, true
 }
 

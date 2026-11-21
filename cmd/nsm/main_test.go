@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -841,5 +842,32 @@ func TestAgentRunChoosesTheExecutor(t *testing.T) {
 		t.Fatalf("the default was refused: %s", errOut.String())
 	} else if _, isAgentic := cfg.Executor.(*agent.AgenticExecutor); !isAgentic {
 		t.Fatalf("default executor = %T, want *agent.AgenticExecutor", cfg.Executor)
+	}
+}
+
+// TestAgentRunTakesACanaryInterval: the canary is a duty of an always-on box, so it is opt-in and
+// its flag is a duration. A negative value is refused rather than treated as "off", because a typo
+// in a unit file should say so.
+func TestAgentRunTakesACanaryInterval(t *testing.T) {
+	dir := t.TempDir()
+	base := []string{"--node", "n", "--provides", "reflex", "--reach", "host", "--sandbox-root", dir}
+	cases := []struct {
+		args []string
+		ok   bool
+		want time.Duration
+	}{
+		{append(base, "--canary", "90s"), true, 90 * time.Second},
+		{base, true, 0},
+		{append(base, "--canary", "-1s"), false, 0},
+	}
+	for _, c := range cases {
+		t.Setenv("NSM_NODE_TOKEN", "tok")
+		cfg, ok := parseAgentConfig(c.args, io.Discard)
+		if ok != c.ok {
+			t.Fatalf("%v: ok = %v, want %v", c.args, ok, c.ok)
+		}
+		if ok && cfg.Canary.Interval != c.want {
+			t.Fatalf("%v: interval = %s, want %s", c.args, cfg.Canary.Interval, c.want)
+		}
 	}
 }

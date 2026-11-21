@@ -69,7 +69,7 @@ nsm version
 nsm manager serve   [--addr] [--db]
 nsm node register   --name --provides --reach [--role] [--concurrency] [--board]
 nsm agent run       --node --provides --reach --sandbox-root [--policy FILE] [--executor agentic|reflex]
-                    [--lan service=host:port,...]
+                    [--lan service=host:port,...] [--canary 60s]
 nsm agent install   --node --provides --reach --sandbox-root [--executor …] [--print]
 nsm approvals       [--board]                       # the queue, for a terminal
 nsm approve <item>  [--note "…"] [--board]
@@ -82,6 +82,11 @@ nsm watch hold <name> (--for 6h | --clear) [--board]
 
 Credentials are never flags: `NSM_ADMIN_TOKEN` for the admin commands, `NSM_ENROLL_TOKEN` for
 `node register`, `NSM_NODE_TOKEN` for `agent run`. A `--token` argument does not parse.
+
+`--canary` is the steward duty: every interval it probes each endpoint from this box's network path
+and reports what it cannot reach. Three consecutive failures mark an endpoint `down` (one WAN
+blip does not); a canary may demote but never promote, because a 401 from a reachable service is not
+health and only the manager's authenticated probe is allowed to say `ok`.
 
 `--lan` declares a service capability (`lan:nas`) only while a TCP dial to it answers, re-checked
 on every heartbeat: a laptop that leaves the house stops advertising the home NAS within 15s.

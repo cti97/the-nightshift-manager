@@ -124,6 +124,54 @@ func (c *Client) post(ctx context.Context, path string, body, out any) error {
 	return nil
 }
 
+// get is post's read-only twin. The canary list is the only GET the agent makes with its node
+// token today, and it deserves the same error shape: a 4xx is a verdict, not a glitch.
+func (c *Client) get(ctx context.Context, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return newStatusError(path, resp.StatusCode, resp.Status, msg)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("%s: decode reply: %w", path, err)
+	}
+	return nil
+}
+
+// CanaryTargets is the endpoint list the steward may watch.
+func (c *Client) CanaryTargets(ctx context.Context) ([]board.CanaryTarget, error) {
+	var out struct {
+		Endpoints []board.CanaryTarget `json:"endpoints"`
+	}
+	if err := c.get(ctx, "/canary", &out); err != nil {
+		return nil, err
+	}
+	return out.Endpoints, nil
+}
+
+// ReportCanary posts one observation and says whether it changed the endpoint's health.
+func (c *Client) ReportCanary(ctx context.Context, id string, rep board.CanaryReport) (board.CanaryResult, error) {
+	var out board.CanaryResult
+	err := c.post(ctx, "/canary/"+url.PathEscape(id), rep, &out)
+	return out, err
+}
+
 // runPath builds /runs/{id}/{action}. The run id is escaped so a malformed id
 // cannot turn into a different endpoint.
 func runPath(runID, action string) string {

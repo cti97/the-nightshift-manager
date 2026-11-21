@@ -121,6 +121,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/threads/{id}/messages", s.adminAuth(http.HandlerFunc(s.handleAdminMessage)))
 	// The conversation itself is a participant's view: an agent reads and posts with the node
 	// token it already holds, and the operator's levers (create, budget) are admin routes.
+	// The canary: an always-on node reports what it can reach from its own network path. It may
+	// demote an endpoint (down) and never promote one — see CanaryReport's comment.
+	mux.Handle("GET /canary", s.nodeAuth(http.HandlerFunc(s.handleCanaryTargets)))
+	mux.Handle("POST /canary/{id}", s.nodeAuth(http.HandlerFunc(s.handleCanaryReport)))
 	mux.Handle("GET /threads/{id}", s.nodeAuth(http.HandlerFunc(s.handleGetThread)))
 	mux.Handle("POST /threads/{id}/messages", s.nodeAuth(http.HandlerFunc(s.handlePostMessage)))
 	mux.Handle("POST /runs/{id}/checkpoint", s.nodeAuth(http.HandlerFunc(s.handleCheckpoint)))
@@ -391,6 +395,36 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
 // list a question nobody can answer. Everything the board refuses — somebody
 // else's run, a run that already settled — is a 409, because the caller's view
 // of the world is stale and a retry of the same body will not fix it.
+func (s *Server) handleCanaryTargets(w http.ResponseWriter, r *http.Request) {
+	targets, err := ListCanaryTargets(r.Context(), s.db)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "canary", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"endpoints": targets})
+}
+
+func (s *Server) handleCanaryReport(w http.ResponseWriter, r *http.Request) {
+	var body CanaryReport
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.LatencyMS < 0 {
+		WriteError(w, http.StatusBadRequest, "canary", "latency_ms cannot be negative")
+		return
+	}
+	res, err := ReportCanary(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r), body)
+	if errors.Is(err, ErrNoEndpoint) {
+		WriteError(w, http.StatusNotFound, "canary", err.Error())
+		return
+	}
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "canary", err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, res)
+}
+
 func (s *Server) handleEscalate(w http.ResponseWriter, r *http.Request) {
 	var body EscalationRequest
 	if !decodeJSON(w, r, &body) {

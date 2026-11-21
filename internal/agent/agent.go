@@ -48,6 +48,9 @@ type Config struct {
 	// Heartbeat and Poll default to 15s and 25s (spec §10).
 	Heartbeat time.Duration
 	Poll      time.Duration
+	// Canary is the steward's watch on the endpoints it can reach from its own network path. Zero
+	// Interval disables it: a node that is not always on has no business demoting endpoints.
+	Canary CanarySettings
 	// Lan is the services this node promises are reachable from inside the home network. They are
 	// probed on every heartbeat and declared only while they answer (spec §8): a cached capability
 	// is one the node stopped having when its owner closed the lid.
@@ -139,6 +142,19 @@ func (a *Agent) Run(ctx context.Context) error {
 	// Wait for the heartbeat goroutine before returning: Run's contract is that
 	// nothing of this agent is still running when it returns.
 	defer func() { <-hbDone }()
+
+	// The canary runs beside the heartbeat, on its own clock: it is a duty of being always on, not
+	// part of the claim loop, and a slow probe must never delay a claim.
+	canaryDone := make(chan struct{})
+	if a.cfg.Canary.Interval > 0 {
+		go func() {
+			defer close(canaryDone)
+			newCanary(a.c, a.cfg.Canary).Loop(ctx, a.logf)
+		}()
+	} else {
+		close(canaryDone)
+	}
+	defer func() { <-canaryDone }()
 
 	poll := time.NewTicker(a.cfg.Poll)
 	defer poll.Stop()
