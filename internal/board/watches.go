@@ -691,8 +691,13 @@ func (s *Server) RunWatches(ctx context.Context, every time.Duration) {
 			if err != nil {
 				s.logf("watches: %v", err)
 			}
-			if pass.Fired > 0 || pass.Skipped > 0 {
-				s.logf("watches: fired %d, skipped %d, failed %d", pass.Fired, pass.Skipped, pass.Failed)
+			// Skips are not logged. A healthy condition watch is a skip on every tick
+			// (the condition is true and it fires on the transition), and a held watch is
+			// a skip on every slot: a line per tick would bury the pass that mattered.
+			// The reason is on the row (last_skip_at, last_skip_reason) and in the state
+			// sentence, which is where an operator looks for it.
+			if pass.Fired > 0 || pass.Failed > 0 {
+				s.logf("watches: fired %d, failed %d", pass.Fired, pass.Failed)
 			}
 		}
 	}

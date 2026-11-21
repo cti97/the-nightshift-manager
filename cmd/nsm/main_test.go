@@ -544,7 +544,7 @@ func TestWatchAddRequiresATriggerAndATemplate(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"no trigger", []string{"watch", "add", "--name", "x", "--title", "t", "--brief", "b"}, "--every or --cron"},
+		{"no trigger", []string{"watch", "add", "--name", "x", "--title", "t", "--brief", "b"}, "--every, --cron, or --probe"},
 		{"both triggers", []string{"watch", "add", "--name", "x", "--title", "t", "--brief", "b", "--every", "1h", "--cron", "0 * * * *"}, "alternatives"},
 		{"no title", []string{"watch", "add", "--name", "x", "--every", "1h", "--brief", "b"}, "--title is required"},
 		{"no brief", []string{"watch", "add", "--name", "x", "--every", "1h", "--title", "t"}, "--brief is required"},
@@ -605,6 +605,31 @@ func TestWatchAddCreatesAWatchAndNamesItsSlot(t *testing.T) {
 	}
 	if clock.Now() == 0 {
 		t.Fatal("the fixture clock was not the board's")
+	}
+}
+
+// TestWatchAddConditionNeedsOnlyAProbe: a condition watch has no schedule, so a probe
+// alone is the whole trigger. Without this the CLI could not create the one kind of
+// watch that fires on a change.
+func TestWatchAddConditionNeedsOnlyAProbe(t *testing.T) {
+	srv, db, clock := watchBoard(t)
+	var out, errOut bytes.Buffer
+	code := run([]string{"watch", "add", "--board", srv.URL, "--name", "disk-edge",
+		"--probe", "test -f /tmp/flag", "--title", "t", "--brief", "b"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr %s)", code, errOut.String())
+	}
+	var trigger, schedule string
+	var next int64
+	if err := db.QueryRow(`SELECT trigger, COALESCE(schedule,''), next_fire_at FROM watches WHERE name='disk-edge'`).
+		Scan(&trigger, &schedule, &next); err != nil {
+		t.Fatalf("read watch: %v", err)
+	}
+	if trigger != board.TriggerCondition || schedule != "" {
+		t.Fatalf("trigger %q schedule %q, want a condition watch with no schedule", trigger, schedule)
+	}
+	if next > clock.Now() {
+		t.Fatalf("next_fire_at = %d, want the condition evaluated on the next pass (<= %d)", next, clock.Now())
 	}
 }
 

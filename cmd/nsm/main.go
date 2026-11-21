@@ -618,17 +618,25 @@ func watchAdd(args []string, out, errOut io.Writer) int {
 		// instructions emits work nobody can do.
 		fmt.Fprintln(errOut, "--brief is required: it is what the executor reads when the item runs")
 		return 2
-	case *every == "" && *cron == "":
-		fmt.Fprintln(errOut, "one of --every or --cron is required")
+	case *every == "" && *cron == "" && *probe == "":
+		// A condition watch has no schedule: the probe IS the trigger. Requiring a
+		// schedule here would make the one trigger that watches for a change the only
+		// one the CLI cannot create.
+		fmt.Fprintln(errOut, "one of --every, --cron, or --probe (a condition watch) is required")
 		return 2
 	case *every != "" && *cron != "":
 		fmt.Fprintln(errOut, "--every and --cron are alternatives; give one")
 		return 2
 	}
-	if *every != "" {
+	switch {
+	case *every != "":
 		req.Trigger, req.Schedule = board.TriggerInterval, *every
-	} else {
+	case *cron != "":
 		req.Trigger, req.Schedule = board.TriggerCron, *cron
+	default:
+		// Alone, a probe is a condition: it fires on the false->true edge, not on a
+		// clock. With a schedule, the same probe is a gate in front of that schedule.
+		req.Trigger = board.TriggerCondition
 	}
 	if d, err := time.ParseDuration(*dedupe); err != nil {
 		fmt.Fprintf(errOut, "--dedupe %q: %v\n", *dedupe, err)
