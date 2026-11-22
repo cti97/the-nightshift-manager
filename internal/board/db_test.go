@@ -130,6 +130,9 @@ func TestMigrationCreatesExpectedObjects(t *testing.T) {
 		"index idx_messages_thread",
 		"index idx_runs_started_at",
 		"index idx_watches_due",
+		"index idx_work_items_client_ref",
+		"index idx_work_items_filed_by_run",
+		"index idx_work_items_parent",
 		"table checkpoints",
 		"table config",
 		"table endpoints",
@@ -577,5 +580,45 @@ func TestAVersionFourDatabaseRefusesAnOlderBinary(t *testing.T) {
 	// is what must have left it untouched.
 	if v != 4 {
 		t.Fatalf("user_version = %d after the refusal, want 4 (nothing applied)", v)
+	}
+}
+
+// TestMigrationSevenAddsFilingColumns: the three columns agent-filed work needs, and the partial
+// unique index that makes client_ref an idempotency key without making every root item clash with
+// every other one.
+func TestMigrationSevenAddsFilingColumns(t *testing.T) {
+	db, clock := newTestDB(t)
+	cols := map[string]bool{}
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('work_items')`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		cols[name] = true
+	}
+	for _, want := range []string{"depth", "client_ref", "filed_by_run"} {
+		if !cols[want] {
+			t.Fatalf("work_items is missing %s", want)
+		}
+	}
+	// Two root items, both without a ref: the partial index must not treat NULL as a duplicate.
+	first, err := CreateItem(context.Background(), db, clock, CreateItemRequest{Title: "a", Brief: "b"})
+	if err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	if _, err := CreateItem(context.Background(), db, clock, CreateItemRequest{Title: "c", Brief: "d"}); err != nil {
+		t.Fatalf("a second root item was refused: %v", err)
+	}
+	var depth int
+	if err := db.QueryRow(`SELECT depth FROM work_items WHERE id=?`, first).Scan(&depth); err != nil {
+		t.Fatalf("read depth: %v", err)
+	}
+	if depth != 0 {
+		t.Fatalf("a root item has depth %d, want 0", depth)
 	}
 }

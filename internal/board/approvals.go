@@ -169,6 +169,11 @@ func Decide(ctx context.Context, db *sql.DB, clock Clock, itemID, decision, note
 		}
 	}
 
+	// A denied FILING is not a denied task (M7): "no, do not file that" must leave the run alive
+	// without the permission. It is the one refusal the board answers by requeuing rather than
+	// cancelling, because the operator is refusing one request the work made, not the work.
+	askedForFiling := readable && req.Action == filingApprovalAction
+
 	now := clock.Now()
 	var nextStatus, event string
 	var payload map[string]any
@@ -201,6 +206,26 @@ func Decide(ctx context.Context, db *sql.DB, clock Clock, itemID, decision, note
 		}
 		nextStatus, event = "queued", "approved"
 		payload = map[string]any{"action": req.Action, "note": note}
+	} else if askedForFiling {
+		reason := declineReason(note)
+		res, err := tx.ExecContext(ctx,
+			`UPDATE work_items
+			    SET status='queued', blocked_reason=?, approval_request=NULL, approval_granted=NULL,
+			        claimed_by=NULL, lease_expires_at=NULL, updated_at=?
+			  WHERE id=? AND status='needs_approval'`,
+			reason, now, itemID)
+		if err != nil {
+			return DecisionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return DecisionResult{}, err
+		}
+		if n != 1 {
+			return DecisionResult{}, fmt.Errorf("%w: %s was decided by someone else", ErrNotParked, itemID)
+		}
+		nextStatus, event = "queued", "denied"
+		payload = map[string]any{"action": req.Action, "note": note, "reason": reason}
 	} else {
 		// D7: a decline is a cancellation with a reason, not a failure. Nothing
 		// went wrong; a human said no, and the reason says so for the operator
@@ -322,11 +347,35 @@ func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 		}
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
+	// BEGIN IMMEDIATE on a dedicated connection, not db.BeginTx: the core below reads the run and
+	// then writes, and a DEFERRED transaction that upgrades mid-way is the `database is locked (517)`
+	// failure this codebase already documents. Taking the write lock first makes the wait bounded by
+	// busy_timeout instead of failing at the upgrade.
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }() // a commit makes it a no-op
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin immediate: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	if err := escalateInTx(ctx, conn, clock, runID, nodeID, req, tokens); err != nil {
+		return err
+	}
+	return commitConn(ctx, conn, &committed)
+}
+
+// escalateInTx is the escalation's transaction body: park the item, close the run, write one event.
+// It takes a connection rather than opening one so a caller that is already inside a transaction —
+// filing a child item, which must count filings and park in the same step — does not deadlock
+// against itself on the single write lock.
+func escalateInTx(ctx context.Context, conn *sql.Conn, clock Clock, runID, nodeID string, req ApprovalRequest, tokens RunTokens) error {
 
 	// Re-read the run inside the transaction. It is the only evidence that this
 	// node owns the work, and its status decides whether there is still anything
@@ -335,7 +384,7 @@ func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 	// and a run without a model predates pricing and costs 0 rather than failing.
 	var itemID, runStatus string
 	var costIn, costOut float64
-	if err := tx.QueryRowContext(ctx,
+	if err := conn.QueryRowContext(ctx,
 		`SELECT r.work_item_id, r.status,
 		        COALESCE(m.cost_in_per_mtok,0), COALESCE(m.cost_out_per_mtok,0)
 		   FROM runs r LEFT JOIN models m ON m.id = r.model_id
@@ -373,7 +422,7 @@ func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 	// approval_granted is cleared: a parked item holds a question, not an
 	// answer. A grant left from an earlier decision names a different action
 	// (D3), and leaving it on the row would let a later run match it.
-	res, err := tx.ExecContext(ctx,
+	res, err := conn.ExecContext(ctx,
 		`UPDATE work_items
 		    SET status='needs_approval', approval_request=?, approval_granted=NULL,
 		        claimed_by=NULL, lease_expires_at=NULL, updated_at=?
@@ -390,7 +439,7 @@ func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 		return fmt.Errorf("work item %s is no longer claimed by node %s; nothing was parked", itemID, nodeID)
 	}
 
-	res, err = tx.ExecContext(ctx,
+	res, err = conn.ExecContext(ctx,
 		`UPDATE runs
 		    SET status='escalated', ended_at=?,
 		        input_tokens=?, output_tokens=?, reserved_tokens=?, cost_estimate=?
@@ -409,12 +458,12 @@ func Escalate(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 	// cost is in the event for the same reason Report puts it there: the
 	// operator asking "what did the run that stopped to ask cost me" reads the
 	// audit spine, not the ledger's sum for the day.
-	if err := AppendEvent(ctx, tx, clock, "node:"+nodeID, "work_item", itemID, "escalated",
+	if err := AppendEvent(ctx, conn, clock, "node:"+nodeID, "work_item", itemID, "escalated",
 		map[string]any{
 			"run": runID, "action": req.Action, "reason": req.Reason,
 			"options": nonNilList(req.Options), "cost": cost,
 		}); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }

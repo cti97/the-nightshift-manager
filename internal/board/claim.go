@@ -401,9 +401,20 @@ func Claim(ctx context.Context, db *sql.DB, clock Clock, nodeID string, slots in
 		// is what makes a third run ask again instead of inheriting a permission
 		// an earlier run may already have acted on — the safe direction when the
 		// run is interrupted before the board hears from it.
+		//
+		// The exception is a filing grant (M7). "File one more item" is not an
+		// action the run performs; it is permission to ask, and the filing is what
+		// consumes it — after this claim, from inside the run. Clearing it here
+		// would spend the operator's answer on the act of resuming and then refuse
+		// the very filing it was granted for.
+		keepGrant := grantAction(r.grant) == filingApprovalAction
+		clear := ", approval_granted=NULL"
+		if keepGrant {
+			clear = ""
+		}
 		res, err := conn.ExecContext(ctx,
-			`UPDATE work_items SET status='claimed', claimed_by=?, lease_expires_at=?, attempt=attempt+1,
-			        approval_granted=NULL, updated_at=?
+			`UPDATE work_items SET status='claimed', claimed_by=?, lease_expires_at=?, attempt=attempt+1`+
+				clear+`, updated_at=?
 			  WHERE id=? AND claimed_by IS NULL AND status='queued'`,
 			nodeID, lease, clock.Now(), r.id)
 		if err != nil {

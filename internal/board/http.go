@@ -113,6 +113,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /runs/{id}/start", s.nodeAuth(http.HandlerFunc(s.handleStartRun)))
 	mux.Handle("POST /runs/{id}/report", s.nodeAuth(http.HandlerFunc(s.handleReport)))
 	mux.Handle("POST /runs/{id}/approval", s.nodeAuth(http.HandlerFunc(s.handleEscalate)))
+	// Filing: a live run asks for a child item. Node auth, because the run's own credential is the
+	// only evidence the board accepts that this node is doing this work (M7).
+	mux.Handle("POST /runs/{id}/items", s.nodeAuth(http.HandlerFunc(s.handleFileItem)))
 	mux.Handle("GET /admin/why/{id}", s.adminAuth(http.HandlerFunc(s.handleWhy)))
 	mux.Handle("GET /admin/corrupt-rows", s.adminAuth(http.HandlerFunc(s.handleCorruptRows)))
 	mux.Handle("GET /admin/approvals", s.adminAuth(http.HandlerFunc(s.handleApprovals)))
@@ -409,6 +412,30 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
 // list a question nobody can answer. Everything the board refuses — somebody
 // else's run, a run that already settled — is a 409, because the caller's view
 // of the world is stale and a retry of the same body will not fix it.
+func (s *Server) handleFileItem(w http.ResponseWriter, r *http.Request) {
+	var body FileItemRequest
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	res, err := FileItem(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r), body)
+	switch {
+	case errors.Is(err, ErrRunNotFiling):
+		WriteError(w, http.StatusConflict, "not_filing", err.Error())
+	case errors.Is(err, ErrClientRefTaken):
+		WriteError(w, http.StatusConflict, "client_ref_taken", err.Error())
+	case err != nil:
+		// A refused capability or a bad body is the caller's fault; the board's writers refuse
+		// before touching the store, so a 400 leaves nothing behind.
+		WriteError(w, http.StatusBadRequest, "filing", err.Error())
+	case res.Parked:
+		// Nothing was created: the run is waiting for a human. 202 says "received, not done", and a
+		// client that saw 201 would believe an item exists.
+		WriteJSON(w, http.StatusAccepted, res)
+	default:
+		WriteJSON(w, http.StatusCreated, res)
+	}
+}
+
 func (s *Server) handleCanaryTargets(w http.ResponseWriter, r *http.Request) {
 	targets, err := ListCanaryTargets(r.Context(), s.db)
 	if err != nil {
