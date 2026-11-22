@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -59,5 +60,37 @@ func TestA4xxIsAVerdictAndA5xxIsAGlitch(t *testing.T) {
 		if se.Terminal() != tc.terminal {
 			t.Fatalf("%s: terminal = %v, want %v", tc.path, se.Terminal(), tc.terminal)
 		}
+	}
+}
+
+// TestTheClientFilesAgainstItsRun: the run id is the path, and the body is the request — a client that
+// posted to /items instead of /runs/{id}/items would file nothing and say nothing.
+func TestTheClientFilesAgainstItsRun(t *testing.T) {
+	var gotPath string
+	var gotBody board.FileItemRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"item-7","created":true}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "token")
+	res, err := c.FileItem(context.Background(), "run-9", board.FileItemRequest{
+		Title: "t", Brief: "b", Needs: []string{"agentic"}, ClientRef: "ref",
+	})
+	if err != nil {
+		t.Fatalf("FileItem: %v", err)
+	}
+	if gotPath != "/runs/run-9/items" {
+		t.Fatalf("path = %q, want /runs/run-9/items", gotPath)
+	}
+	if gotBody.Title != "t" || gotBody.ClientRef != "ref" {
+		t.Fatalf("body = %+v", gotBody)
+	}
+	if res.ItemID != "item-7" || !res.Created {
+		t.Fatalf("result = %+v", res)
 	}
 }

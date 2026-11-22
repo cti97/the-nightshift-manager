@@ -213,6 +213,15 @@ func (c *Client) Report(ctx context.Context, runID string, req board.ReportReque
 	return out, err
 }
 
+// FileItem asks the board for a child item from this run (M7). The run id in the path is this node's
+// claim on the work: the board refuses a filing for a run another node owns, or for a run that has
+// already ended.
+func (c *Client) FileItem(ctx context.Context, runID string, req board.FileItemRequest) (board.FileItemResult, error) {
+	var out board.FileItemResult
+	err := c.post(ctx, runPath(runID, "items"), req, &out)
+	return out, err
+}
+
 // Enroll registers this node with the board and returns the node id and the
 // token it must use from then on. It is the one call a node makes before it has
 // a node token, so it carries the enrollment credential instead — a secret the

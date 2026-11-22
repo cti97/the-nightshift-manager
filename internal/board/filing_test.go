@@ -464,3 +464,24 @@ func TestTheFilingRouteCodesAreWhatAClientBranchesOn(t *testing.T) {
 		t.Fatalf("another node = %d, want 409 (body %s)", rec.Code, rec.Body)
 	}
 }
+
+// TestFilingBoundsItsInput: the ref becomes an index key and the needs list is parsed and stored, so
+// an unbounded one is a filing that can slow every later one.
+func TestFilingBoundsItsInput(t *testing.T) {
+	db, clock, node, _, runID := filingFixture(t)
+	tooMany := make([]string, maxNeedsPerFiling+1)
+	for i := range tooMany {
+		tooMany[i] = "agentic"
+	}
+	longRef := FileItemRequest{Title: "t", Brief: "b", ClientRef: strings.Repeat("r", maxClientRefBytes+1)}
+	if _, err := FileItem(context.Background(), db, clock, runID, node, longRef); err == nil {
+		t.Fatal("an overlong client_ref was accepted")
+	}
+	manyNeeds := FileItemRequest{Title: "t", Brief: "b", Needs: tooMany}
+	if _, err := FileItem(context.Background(), db, clock, runID, node, manyNeeds); err == nil {
+		t.Fatal("an overlong needs list was accepted")
+	}
+	if n := countRowsQuiet(t, db, `SELECT COUNT(*) FROM work_items WHERE parent_id IS NOT NULL`); n != 0 {
+		t.Fatalf("a refused filing left %d children", n)
+	}
+}

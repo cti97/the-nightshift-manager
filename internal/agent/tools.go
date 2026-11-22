@@ -360,6 +360,17 @@ func Find(name string) (Tool, bool) {
 	return Tool{}, false
 }
 
+// findTool looks a name up in a per-run set. The loop uses this rather than Find so a tool that is
+// bound for one run (filing) is found by that run and by no other.
+func findTool(tools []Tool, name string) (Tool, bool) {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return tool, true
+		}
+	}
+	return Tool{}, false
+}
+
 // Definition converts one tool into the provider's wire shape.
 func (t Tool) Definition() (provider.ToolDef, error) {
 	var head struct {

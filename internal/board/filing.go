@@ -31,6 +31,11 @@ const (
 	// that can make the board slow for everyone else.
 	maxTitleBytes = 512
 	maxBriefBytes = 64 << 10
+	// maxClientRefBytes and maxNeedsPerFiling bound the rest of an agent's filing. The ref becomes an
+	// index key, and the needs list is parsed and stored — an agent that sends either without a bound
+	// is an agent that can make every later filing slower.
+	maxClientRefBytes = 128
+	maxNeedsPerFiling = 16
 )
 
 // FileItemRequest is what a run asks for.
@@ -81,6 +86,12 @@ func FileItem(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string
 	}
 	if len(brief) > maxBriefBytes {
 		return FileItemResult{}, fmt.Errorf("brief is longer than %d bytes", maxBriefBytes)
+	}
+	if len(req.ClientRef) > maxClientRefBytes {
+		return FileItemResult{}, fmt.Errorf("client_ref is %d bytes and the limit is %d", len(req.ClientRef), maxClientRefBytes)
+	}
+	if len(req.Needs) > maxNeedsPerFiling {
+		return FileItemResult{}, fmt.Errorf("%d capabilities and the limit is %d", len(req.Needs), maxNeedsPerFiling)
 	}
 	needs, err := caps.Parse(req.Needs)
 	if err != nil {

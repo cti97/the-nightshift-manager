@@ -128,6 +128,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	// never heartbeated can do nothing. The first heartbeat is therefore sent
 	// synchronously, before the first claim, so the node is eligible by the
 	// time it asks for work.
+	// The executor is built from configuration, before a client exists. Filing needs the client, so
+	// it is attached here — once, before any run — rather than threaded through every Run call.
+	if f, ok := a.cfg.Executor.(interface{ attachFiler(filingClient) }); ok {
+		f.attachFiler(a.c)
+	}
+
 	a.heartbeat(ctx)
 
 	// Heartbeats run on their own goroutine, not once per claim cycle. A run

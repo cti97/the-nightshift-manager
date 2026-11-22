@@ -98,7 +98,26 @@ const noToolCallNudge = "You did not call a tool. Continue the task with one of 
 // caps have defaults (see the constants above) and a non-positive field selects
 // its default rather than disabling the cap — a safety number that can be
 // switched off by leaving a field zero is not a safety number.
+// toolSet is the tools one run is offered. Filing is bound to the run rather than to the executor,
+// because the run id is what the board checks ownership against — and it is only offered when there
+// is a client to file through: a model told it can file will try.
+func (e *AgenticExecutor) toolSet(runID string) []Tool {
+	tools := Tools()
+	if e.Filer != nil {
+		tools = append(tools, filingTool(e.Filer, runID))
+	}
+	return tools
+}
+
+// attachFiler is how Agent gives the executor its board client. Unexported: a caller outside this
+// package configures the executor's behaviour, not its plumbing.
+func (e *AgenticExecutor) attachFiler(c filingClient) { e.Filer = c }
+
 type AgenticExecutor struct {
+	// Filer is how a run files follow-up work (M7). Nil means the tool is not offered at all, which
+	// is the right default for an executor that was never given a board client — a reflex run, or a
+	// test: a model that is told it can file will try.
+	Filer filingClient
 	// Registry constructs the adapter for the endpoint the claim names. It is
 	// required in production; newProvider is the test seam. Construction is per
 	// run rather than per process because the endpoint is per claim, and
@@ -176,7 +195,7 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 
 	meter := &tokenMeter{limit: e.tokenLimit()}
 
-	tools := Tools()
+	tools := e.toolSet(item.RunID)
 	defs, err := Definitions(tools)
 	if err != nil {
 		return meter.result(""), fmt.Errorf("agent: tool definitions: %w", err)
@@ -299,7 +318,7 @@ func (e *AgenticExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 			if err := ctx.Err(); err != nil {
 				return meter.result(""), err
 			}
-			tool, ok := Find(call.Name)
+			tool, ok := findTool(tools, call.Name)
 			if !ok {
 				// An unknown tool is a model mistake the next step can fix. The
 				// answer names the closed set rather than failing the run.
