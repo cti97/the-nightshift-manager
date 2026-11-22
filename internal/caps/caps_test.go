@@ -207,3 +207,41 @@ func TestSandboxProfileReadsTheDeclaration(t *testing.T) {
 		t.Fatalf("profile = %q, want seatbelt", got)
 	}
 }
+
+// TestHarnessIsOneWord: the name becomes harness:<name> and is matched by string equality, so a
+// name with whitespace in it is a capability nobody can require.
+func TestHarnessIsOneWord(t *testing.T) {
+	got, err := Parse([]string{"harness:claude", " harness:codex "})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(got) != 2 || got[0] != "harness:claude" || got[1] != "harness:codex" {
+		t.Fatalf("parsed = %v", got)
+	}
+	for _, bad := range []string{"harness:", "harness: ", "harness:claude code"} {
+		if _, err := Parse([]string{bad}); err == nil {
+			t.Fatalf("%q was accepted", bad)
+		}
+	}
+}
+
+// TestAHarnessNodeCannotClaimASandbox is M8's first rule at the only place a node's claims are
+// checked: the board, on register and on every heartbeat. A node that said both would accept work
+// whose needs say "confine this" and hand it to a program nobody confined.
+func TestAHarnessNodeCannotClaimASandbox(t *testing.T) {
+	if err := ConfinementConflict([]string{"harness:claude", "sandbox:seatbelt"}); err == nil {
+		t.Fatal("a node claiming both a harness and a sandbox was accepted")
+	} else if !strings.Contains(err.Error(), "harness:claude") || !strings.Contains(err.Error(), "sandbox:seatbelt") {
+		t.Fatalf("the refusal does not name both: %v", err)
+	}
+	for _, ok := range [][]string{
+		{"harness:claude"},
+		{"sandbox:seatbelt"},
+		{"agentic", "harness:claude", "lan:nas"},
+		{},
+	} {
+		if err := ConfinementConflict(ok); err != nil {
+			t.Fatalf("%v was refused: %v", ok, err)
+		}
+	}
+}

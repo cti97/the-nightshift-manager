@@ -160,6 +160,9 @@ func RegisterNode(ctx context.Context, db *sql.DB, clock Clock, req RegisterRequ
 	if err != nil {
 		return "", "", err
 	}
+	if err := caps.ConfinementConflict(declared); err != nil {
+		return "", "", err
+	}
 	reach, err := parseReachClasses(req.ReachClasses)
 	if err != nil {
 		return "", "", err
@@ -228,6 +231,9 @@ func heartbeatInRange(ctx context.Context, db *sql.DB, clock Clock, nodeID strin
 
 	live, err := caps.Parse(req.ProvidesLive)
 	if err != nil {
+		return HeartbeatResponse{}, err
+	}
+	if err := caps.ConfinementConflict(live); err != nil {
 		return HeartbeatResponse{}, err
 	}
 	// Validated before any write, so a heartbeat carrying a typo changes

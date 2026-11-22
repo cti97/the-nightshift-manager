@@ -22,6 +22,7 @@ const (
 	tokensPrefix  = "tokens:"
 	lanPrefix     = "lan:"
 	sandboxPrefix = "sandbox:"
+	harnessPrefix = "harness:"
 )
 
 // sandboxProfiles is the closed set of confinement a node may declare and an item may require
@@ -87,6 +88,18 @@ func validate(c string) (string, error) {
 			return "", fmt.Errorf("capability %q: unknown sandbox profile (want none, dir, bwrap, systemd_scope or seatbelt)", c)
 		}
 		return sandboxPrefix + profile, nil
+	case strings.HasPrefix(c, harnessPrefix):
+		// A harness is a program the node runs with its own loop (Claude Code, Codex CLI, a script).
+		// It is a capability because work may REQUIRE a particular one, and because it is the marker
+		// that says "this node does not confine anything" — see ConfinementConflict.
+		name := strings.TrimSpace(strings.TrimPrefix(c, harnessPrefix))
+		if name == "" {
+			return "", fmt.Errorf("capability %q: harness needs a name", c)
+		}
+		if len(strings.Fields(name)) != 1 {
+			return "", fmt.Errorf("capability %q: harness name must not contain whitespace", c)
+		}
+		return harnessPrefix + name, nil
 	case strings.HasPrefix(c, lanPrefix):
 		name := strings.TrimSpace(strings.TrimPrefix(c, lanPrefix))
 		if name == "" {
@@ -102,6 +115,29 @@ func validate(c string) (string, error) {
 		}
 		return c, nil
 	}
+}
+
+// ConfinementConflict refuses a node that claims both a harness and a sandbox profile.
+//
+// A command executor runs somebody else's program; it cannot promise the confinement this project's
+// sandbox does. A node that declared sandbox:seatbelt AND harness:claude would accept work whose
+// needs say "confine this" and then hand it to a program nobody confined — the board would be
+// asserting something it cannot observe. If a harness ever proves its confinement, the way in is a
+// probe, not a flag (M8 Rule 1).
+func ConfinementConflict(provides []string) error {
+	hasHarness, hasSandbox := "", ""
+	for _, c := range provides {
+		switch {
+		case strings.HasPrefix(c, harnessPrefix):
+			hasHarness = c
+		case strings.HasPrefix(c, sandboxPrefix):
+			hasSandbox = c
+		}
+	}
+	if hasHarness != "" && hasSandbox != "" {
+		return fmt.Errorf("a node may declare %s or %s, not both: a harness is not a sandbox", hasHarness, hasSandbox)
+	}
+	return nil
 }
 
 // Satisfies reports whether anything providing `provides` can serve `needs`.

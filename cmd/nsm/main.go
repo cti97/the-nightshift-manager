@@ -19,6 +19,7 @@ import (
 
 	"github.com/cti97/the-nightshift-manager/internal/agent"
 	"github.com/cti97/the-nightshift-manager/internal/board"
+	"github.com/cti97/the-nightshift-manager/internal/caps"
 	"github.com/cti97/the-nightshift-manager/internal/provider"
 	"github.com/cti97/the-nightshift-manager/internal/version"
 )
@@ -256,7 +257,9 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 	reach := fs.String("reach", "", "comma-separated reach classes this node can actually use (host,lan,wan)")
 	sandboxRoot := fs.String("sandbox-root", "", "absolute path under which each run gets a disposable directory (required)")
 	policyPath := fs.String("policy", "", "JSON file of per-tool verdicts (allow|deny|ask), e.g. {\"default\":\"allow\",\"shell\":\"deny\"}")
-	executorKind := fs.String("executor", "agentic", "which executor to run: agentic (full tool loop) or reflex (one model call, for a steward)")
+	executorKind := fs.String("executor", "agentic", "which executor to run: agentic (built-in tool loop), reflex (one model call, for a steward) or command (a local harness)")
+	runCmd := fs.String("run-cmd", "", "with --executor command: the harness to run, e.g. 'claude -p \"$(cat $NSM_BRIEF_FILE)\"'")
+	harness := fs.String("harness", "", "with --executor command: the harness's name, declared as harness:<name>")
 	canaryEvery := fs.Duration("canary", 0, "probe the board's endpoints every this often and report what this box cannot reach (0 disables)")
 	lanSpec := fs.String("lan", "", "services to declare while reachable, as service=host:port pairs, e.g. nas=192.168.1.10:445")
 	if err := fs.Parse(args); err != nil {
@@ -341,13 +344,35 @@ func parseAgentConfig(args []string, errOut io.Writer) (agent.Config, bool) {
 			SandboxRoot: *sandboxRoot,
 			Policy:      policy,
 		}
+	case "command":
+		// A harness is not a sandbox: the node declares harness:<name> and the executor runs the
+		// operator's program unconfined. The board refuses a node that claims both (Rule 1 of M8).
+		if strings.TrimSpace(*runCmd) == "" {
+			fmt.Fprintln(errOut, "--executor command needs --run-cmd")
+			return agent.Config{}, false
+		}
+		if strings.TrimSpace(*harness) == "" {
+			fmt.Fprintln(errOut, "--executor command needs --harness <name>: the capability is how work asks for a specific harness")
+			return agent.Config{}, false
+		}
+		capability := "harness:" + strings.TrimSpace(*harness)
+		if _, err := caps.Parse([]string{capability}); err != nil {
+			fmt.Fprintf(errOut, "--harness: %v\n", err)
+			return agent.Config{}, false
+		}
+		providesLive = append(providesLive, capability)
+		if err := caps.ConfinementConflict(providesLive); err != nil {
+			fmt.Fprintln(errOut, err)
+			return agent.Config{}, false
+		}
+		executor = &agent.CommandExecutor{RunCmd: *runCmd, Root: *sandboxRoot}
 	case "reflex":
 		// The steward's path: one call, no tools, no sandbox. --sandbox-root is still required by
 		// this command because the flag is the node's, not the executor's, and a steward that
 		// later switches to agentic must not be unconfigured for it.
 		executor = &agent.ReflexExecutor{Registry: provider.NewRegistry()}
 	default:
-		fmt.Fprintf(errOut, "--executor %q is neither agentic nor reflex\n", *executorKind)
+		fmt.Fprintf(errOut, "--executor %q is neither agentic, reflex nor command\n", *executorKind)
 		return agent.Config{}, false
 	}
 

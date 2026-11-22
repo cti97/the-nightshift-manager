@@ -819,3 +819,34 @@ func assertIncompatibleClaimsNothing(t *testing.T, db *sql.DB, clock *FixedClock
 		t.Fatalf("an incompatible node claimed %d items, want 0", len(got))
 	}
 }
+
+// TestANodeCannotBeBothAHarnessAndASandbox: the refusal is at the board, not only in the CLI, because
+// a node can be registered by anything holding the enroll token. A node claiming both would accept
+// sandbox-requiring work and hand it to a program nobody confined (M8 Rule 1).
+func TestANodeCannotBeBothAHarnessAndASandbox(t *testing.T) {
+	db, clock := newTestDB(t)
+	ctx := context.Background()
+	if _, _, err := RegisterNode(ctx, db, clock, RegisterRequest{
+		Name: "confused", Role: "executor",
+		ProvidesDeclared: []string{"harness:claude", "sandbox:seatbelt"},
+		ReachClasses:     []string{"host"}, Concurrency: 1,
+	}); err == nil {
+		t.Fatal("a node registered claiming both a harness and a sandbox")
+	}
+
+	node := SeedNodeForTest(t, db, clock, "harness-node", "executor", "harness:claude")
+	if _, err := Heartbeat(ctx, db, clock, node, HeartbeatRequest{
+		ProvidesLive: []string{"harness:claude", "sandbox:dir"},
+		ReachClasses: []string{"host"}, Protocol: ProtocolMax,
+	}); err == nil {
+		t.Fatal("a heartbeat claiming both a harness and a sandbox was accepted")
+	}
+	// The live set is unchanged: a refused heartbeat must not half-apply.
+	var live string
+	if err := db.QueryRow(`SELECT provides_live FROM nodes WHERE id=?`, node).Scan(&live); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(live, "sandbox:") {
+		t.Fatalf("the refused heartbeat applied: %s", live)
+	}
+}

@@ -831,7 +831,7 @@ func TestAgentRunChoosesTheExecutor(t *testing.T) {
 	if _, ok := parseAgentConfig(append(base, "--executor", "agntic"), &errOut); ok {
 		t.Fatal("a misspelled executor was accepted")
 	}
-	if !strings.Contains(errOut.String(), "neither agentic nor reflex") {
+	if !strings.Contains(errOut.String(), "neither agentic, reflex nor command") {
 		t.Fatalf("stderr = %q, want the vocabulary", errOut.String())
 	}
 
@@ -869,5 +869,47 @@ func TestAgentRunTakesACanaryInterval(t *testing.T) {
 		if ok && cfg.Canary.Interval != c.want {
 			t.Fatalf("%v: interval = %s, want %s", c.args, cfg.Canary.Interval, c.want)
 		}
+	}
+}
+
+// TestCommandExecutorNeedsACommandAndAName: the harness is declared as a capability (so work can
+// require it) and the command is the operator's, so both are required before a claim happens.
+func TestCommandExecutorNeedsACommandAndAName(t *testing.T) {
+	dir := t.TempDir()
+	base := []string{"--node", "n", "--reach", "host", "--sandbox-root", dir, "--executor", "command"}
+	cases := []struct {
+		args []string
+		ok   bool
+		why  string
+	}{
+		{append(append([]string{}, base...), "--harness", "claude"), false, "no --run-cmd"},
+		{append(append([]string{}, base...), "--run-cmd", "true"), false, "no --harness"},
+		{append(append([]string{}, base...), "--run-cmd", "true", "--harness", "two words"), false, "a name with a space"},
+		{append(append([]string{}, base...), "--run-cmd", "true", "--harness", "claude", "--provides", "sandbox:seatbelt"), false, "both a harness and a sandbox"},
+	}
+	for _, c := range cases {
+		t.Setenv("NSM_NODE_TOKEN", "tok")
+		if _, ok := parseAgentConfig(c.args, io.Discard); ok {
+			t.Fatalf("%s was accepted", c.why)
+		}
+	}
+	// The happy path: the harness capability is added to what the node advertises, without the
+	// operator repeating it in --provides.
+	t.Setenv("NSM_NODE_TOKEN", "tok")
+	cfg, ok := parseAgentConfig(append(append([]string{}, base...), "--run-cmd", "claude -p hi", "--harness", "claude"), io.Discard)
+	if !ok {
+		t.Fatal("a valid command executor was refused")
+	}
+	found := false
+	for _, p := range cfg.Provides {
+		if p == "harness:claude" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("provides = %v, want harness:claude", cfg.Provides)
+	}
+	if _, isCommand := cfg.Executor.(*agent.CommandExecutor); !isCommand {
+		t.Fatalf("executor = %T, want *agent.CommandExecutor", cfg.Executor)
 	}
 }
