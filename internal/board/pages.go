@@ -5,6 +5,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -339,3 +340,67 @@ var itemPage = template.Must(template.New("item").Funcs(template.FuncMap{
   {{if .Children}}<ul class="tree">{{range .Children}}{{template "node" .}}{{end}}</ul>{{end}}
 </li>
 {{end}}`))
+
+// boardPage is the front door: the work on the board, in the order an operator needs it, with a way
+// into every item. Without it the only way to see what the board holds was /admin/board's counts or
+// knowing an id in advance.
+var boardPage = template.Must(template.New("board").Funcs(template.FuncMap{
+	"when": func(ts int64) string {
+		return time.Unix(ts, 0).UTC().Format("2006-01-02 15:04")
+	},
+	"short": func(s string) string {
+		if len(s) > 12 {
+			return s[:12]
+		}
+		return s
+	},
+	"money": func(f float64) string { return strconv.FormatFloat(f, 'f', 2, 64) },
+}).Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The board — the night shift manager</title>
+<style>
+  body { margin: 0 auto; max-width: 52rem; padding: 1rem; font: 16px/1.5 system-ui, -apple-system, sans-serif; color: #111; background: #fff; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.05rem; margin: 1.5rem 0 .4rem; text-transform: uppercase; letter-spacing: .04em; color: #444; }
+  .ledger { display: flex; flex-wrap: wrap; gap: .4rem 1.2rem; font-size: .9rem; color: #333; margin: .5rem 0 0; }
+  .ledger b { font-weight: 600; }
+  .warn { border-left: 3px solid #c90; padding-left: .6rem; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { border: 1px solid #9994; border-radius: .5rem; padding: .55rem .7rem; margin: .35rem 0; }
+  li a { color: #1144cc; text-decoration: none; font-weight: 600; }
+  li a:hover { text-decoration: underline; }
+  .meta { font-size: .82rem; color: #666; margin: .15rem 0 0; }
+  .status { display: inline-block; font-size: .75rem; padding: .02rem .4rem; border: 1px solid #9994; border-radius: 1rem; margin-left: .4rem; }
+  .empty { color: #666; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>The board</h1>
+<p class="ledger">
+  <span><b>{{.Total}}</b> items</span>
+  <span><b>{{index .View.Counts "needs_approval"}}</b> waiting on a human</span>
+  <span><b>{{index .View.Counts "running"}}</b> running</span>
+  <span><b>{{index .View.Counts "queued"}}</b> queued</span>
+  <span>spent today <b>{{money .View.Spend.Spent}}</b></span>
+  {{if .View.Spend.UnmeteredRuns}}<span class="warn">{{.View.Spend.UnmeteredRuns}} run(s) unmetered</span>{{end}}
+  {{if .View.Spend.Paused}}<span class="warn">board paused: {{.View.Spend.PauseReason}}</span>{{end}}
+</p>
+<p class="meta"><a href="/admin/approvals">Approvals</a></p>
+{{if .View.Truncated}}<p class="warn">Showing the first {{len .View.Items}} items; there are more.</p>{{end}}
+{{if not .View.Items}}<p class="empty">The board is empty.</p>{{end}}
+{{range .Groups}}
+<h2>{{.Label}} <span class="meta">({{len .Items}})</span></h2>
+<ul>
+{{range .Items}}
+  <li>
+    <a href="/admin/items/{{.ID}}">{{.Title}}</a><span class="status">{{.Status}}</span>
+    <p class="meta">{{.CreatedBy}}{{if .ClaimedBy}} · claimed by {{.ClaimedBy}}{{end}} · {{when .CreatedAt}}{{if .Depth}} · depth {{.Depth}}{{end}} · {{short .ID}}</p>
+  </li>
+{{end}}
+</ul>
+{{end}}
+</body>
+</html>`))

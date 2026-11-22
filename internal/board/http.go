@@ -102,6 +102,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.Handle("GET /admin/board", s.adminAuth(http.HandlerFunc(s.handleBoard)))
+	// The front door: the board as a page for a browser, the same data as JSON for a caller.
+	mux.Handle("GET /admin", s.adminAuth(http.HandlerFunc(s.handleBoardView)))
 	mux.Handle("GET /admin/spend/today", s.adminAuth(http.HandlerFunc(s.handleSpendToday)))
 	mux.Handle("PUT /admin/spend/ceiling", s.adminAuth(http.HandlerFunc(s.handleSetSpendCeiling)))
 	mux.Handle("POST /admin/items", s.adminAuth(http.HandlerFunc(s.handleCreateItem)))
@@ -535,6 +537,61 @@ func (s *Server) handleWhy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, ex)
+}
+
+// boardGroup is one status section on the page, in the order the page renders it.
+type boardGroup struct {
+	Label string
+	Items []BoardItem
+}
+
+func (s *Server) handleBoardView(w http.ResponseWriter, r *http.Request) {
+	view, err := ReadBoard(r.Context(), s.db, s.clock, boardPageLimit)
+	if err != nil {
+		if wantsHTML(r) {
+			renderHTML(w, http.StatusInternalServerError, decisionErrorPage, map[string]string{"Message": err.Error()})
+			return
+		}
+		WriteError(w, http.StatusInternalServerError, "board", err.Error())
+		return
+	}
+	if !wantsHTML(r) {
+		WriteJSON(w, http.StatusOK, view)
+		return
+	}
+	// Grouped here rather than in the template: the template language has no map iteration order, and
+	// a board whose sections shuffle on every reload is a board nobody can read twice.
+	order := []struct{ status, label string }{
+		{"needs_approval", "Waiting on a human"},
+		{"running", "Running"},
+		{"claimed", "Claimed"},
+		{"queued", "Queued"},
+		{"failed", "Failed"},
+		{"done", "Done"},
+		{"cancelled", "Cancelled"},
+	}
+	byStatus := map[string][]BoardItem{}
+	for _, it := range view.Items {
+		byStatus[it.Status] = append(byStatus[it.Status], it)
+	}
+	var groups []boardGroup
+	for _, o := range order {
+		if items := byStatus[o.status]; len(items) > 0 {
+			groups = append(groups, boardGroup{Label: o.label, Items: items})
+			delete(byStatus, o.status)
+		}
+	}
+	// Anything the schema grows later still appears, at the end, rather than vanishing from the page.
+	for status, items := range byStatus {
+		groups = append(groups, boardGroup{Label: status, Items: items})
+	}
+	total := 0
+	for _, n := range view.Counts {
+		total += n
+	}
+	renderHTML(w, http.StatusOK, boardPage, map[string]any{
+		"View": view, "Groups": groups, "Total": total,
+	})
 }
 
 func (s *Server) handleItemTree(w http.ResponseWriter, r *http.Request) {

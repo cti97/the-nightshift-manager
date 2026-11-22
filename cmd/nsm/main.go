@@ -131,6 +131,8 @@ func managerServe(args []string, errOut io.Writer) int {
 	addr := dbPath.String("addr", "127.0.0.1:8081", "listen address")
 	path := dbPath.String("db", "nsm.db", "sqlite path")
 	distDir := dbPath.String("dist", "", "release directory to serve on /dist (empty: serve no releases)")
+	retention := dbPath.Duration("retention", board.DefaultEventRetention(),
+		"how much audit history to keep (0 keeps everything; the floor is 24h)")
 	if err := dbPath.Parse(args); err != nil {
 		return 2
 	}
@@ -161,6 +163,11 @@ func managerServe(args []string, errOut io.Writer) int {
 	// Watches emit items; they never run them. Started here, not in the board
 	// package, so a test can drive RunWatchesOnce without a ticker.
 	go srv.RunWatches(context.Background(), watchEvery)
+	// Retention is the only thing in the board that deletes. It runs on the reaper's clock and is
+	// pruned in batches, so a first pass against a year-old board does not hold the write lock.
+	if *retention > 0 {
+		go srv.RunRetention(context.Background(), time.Hour, *retention)
+	}
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		fmt.Fprintf(errOut, "serve: %v\n", err)
 		return 1
