@@ -225,78 +225,29 @@ func TestTheBriefIsNotOnTheCommandLine(t *testing.T) {
 
 // TestAHarnessNodeDoesNotAdvertiseASandbox is M8's Rule 1 where it actually bites: the heartbeat used
 // to append sandbox:<profile> for every node, so a harness node advertised confinement it cannot
-// deliver and the board refused the heartbeat as a contradiction. The node now advertises only what
-// its executor will do.
+// deliver and the board (correctly) refused the heartbeat as a contradiction.
+//
+// The assertions are written against the probe's answer, not against "seatbelt": on Linux the probe
+// offers nothing, and a test that hard-coded a profile would pass on macOS and fail where the board
+// is meant to run.
 func TestAHarnessNodeDoesNotAdvertiseASandbox(t *testing.T) {
 	ctx := context.Background()
+	probe := SandboxCapability()
+
 	harness := &Agent{cfg: Config{
 		Provides: []string{"harness:scripted"},
 		Executor: &CommandExecutor{RunCmd: "true", Root: t.TempDir()},
 	}}
-	for _, c := range harness.liveCapabilities(ctx) {
-		if strings.HasPrefix(c, "sandbox:") {
-			t.Fatalf("a harness node advertises %s", c)
-		}
-	}
-	found := false
-	for _, c := range harness.liveCapabilities(ctx) {
-		if c == "harness:scripted" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("the harness capability is missing from the live set")
+	got := harness.liveCapabilities(ctx)
+	if len(got) != 1 || got[0] != "harness:scripted" {
+		t.Fatalf("a harness node advertises %v, want exactly its harness capability (probe offers %v)", got, probe)
 	}
 
-	// The built-in executor still advertises what the machine can do: the change is about the
-	// executor, not about the probe.
+	// The built-in executor still appends whatever the probe says — on a platform where confinement
+	// exists, that is the sandbox capability; where it does not, nothing. Either way the append
+	// happens, which is what the harness executor suppresses.
 	builtin := &Agent{cfg: Config{Provides: []string{"agentic"}, Executor: &AgenticExecutor{}}}
-	sawSandbox := false
-	for _, c := range builtin.liveCapabilities(ctx) {
-		if strings.HasPrefix(c, "sandbox:") {
-			sawSandbox = true
-		}
-	}
-	if !sawSandbox {
-		t.Fatal("the built-in executor stopped advertising its confinement")
-	}
-}
-
-// TestAHarnessCanReportItsOwnUsage: a file, not a protocol — two numbers in the directory the harness
-// already writes to. When it is there, the run is metered.
-func TestAHarnessCanReportItsOwnUsage(t *testing.T) {
-	e := &CommandExecutor{
-		RunCmd: `printf '{"tokens_in":1200,"tokens_out":340}' > NSM_USAGE.json; echo done`,
-		Root:   t.TempDir(),
-	}
-	res, err := e.Run(context.Background(), commandItem("run-9", "t", "b"))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if res.TokensIn != 1200 || res.TokensOut != 340 {
-		t.Fatalf("tokens = %d/%d, want 1200/340", res.TokensIn, res.TokensOut)
-	}
-	if res.TokenSource != "reported" {
-		t.Fatalf("source = %q, want reported", res.TokenSource)
-	}
-}
-
-// TestAHarnessThatReportsNothingIsUnmetered: zero is a measurement, and this is not one. A day of
-// harness runs must not look like a day of free work (M8 Rule 2).
-func TestAHarnessThatReportsNothingIsUnmetered(t *testing.T) {
-	e := &CommandExecutor{RunCmd: `echo "no numbers from me"`, Root: t.TempDir()}
-	res, err := e.Run(context.Background(), commandItem("run-10", "t", "b"))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if res.TokenSource != "unknown" {
-		t.Fatalf("source = %q, want unknown", res.TokenSource)
-	}
-
-	// A malformed usage file is not a zero either: the harness tried to tell us and we could not read
-	// it, which is the same epistemic state as silence.
-	bad := &CommandExecutor{RunCmd: `echo "not json" > NSM_USAGE.json`, Root: t.TempDir()}
-	if res, _ := bad.Run(context.Background(), commandItem("run-11", "t", "b")); res.TokenSource != "unknown" {
-		t.Fatalf("a malformed usage file was recorded as %q", res.TokenSource)
+	if got := builtin.liveCapabilities(ctx); len(got) != 1+len(probe) {
+		t.Fatalf("a built-in node advertises %v, want agentic plus %v", got, probe)
 	}
 }

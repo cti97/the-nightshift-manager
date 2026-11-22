@@ -142,9 +142,19 @@ func (e *CommandExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 	err := cmd.Run()
 	out := tail.String()
 
+	// Usage is read on EVERY path, including the ones that produced no answer. A harness that parked
+	// itself for a human still spent tokens, and a harness that crashed spent some; reporting either
+	// as "reported, 0" is the lie Rule 2 exists to prevent. The proof caught this on the escalation
+	// path, where the first version of this function returned a Result without a source.
+	in, outTokens, source := readUsage(workdir)
+	withUsage := func(res Result) Result {
+		res.TokensIn, res.TokensOut, res.TokenSource = in, outTokens, source
+		return res
+	}
+
 	if runCtx.Err() == context.DeadlineExceeded {
 		// The item stays out of "done": a harness killed at the limit did not finish the work.
-		return Result{Summary: truncateSummary("the harness ran longer than " + timeout.String() + "\n\n" + out)},
+		return withUsage(Result{Summary: truncateSummary("the harness ran longer than " + timeout.String() + "\n\n" + out)}),
 			fmt.Errorf("agent: the harness exceeded %s and was stopped", timeout)
 	}
 	if ctx.Err() != nil {
@@ -155,19 +165,18 @@ func (e *CommandExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 	if errors.As(err, &exitErr) {
 		code := exitErr.ExitCode()
 		if code == escalateExitCode {
-			return Result{
+			return withUsage(Result{
 				Summary:  truncateSummary(out),
 				Approval: escalationFromOutput(out, e.RunCmd),
-			}, nil
+			}), nil
 		}
-		return Result{Summary: truncateSummary(fmt.Sprintf("the harness exited %d\n\n%s", code, out))},
+		return withUsage(Result{Summary: truncateSummary(fmt.Sprintf("the harness exited %d\n\n%s", code, out))}),
 			fmt.Errorf("agent: the harness exited %d", code)
 	}
 	if err != nil {
 		return Result{}, fmt.Errorf("agent: start the harness: %w", err)
 	}
-	in, outTokens, source := readUsage(workdir)
-	return Result{Summary: truncateSummary(out), TokensIn: in, TokensOut: outTokens, TokenSource: source}, nil
+	return withUsage(Result{Summary: truncateSummary(out)}), nil
 }
 
 // escalationFromOutput builds the approval request. A harness may name its own action on a line
