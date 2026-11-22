@@ -230,15 +230,32 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 // heartbeat re-states what this node can do, as of now. provides_live is sent
 // on every beat: the board stores the live set, and an empty one here would
 // overwrite the registration on purpose (the node can then claim nothing).
+// liveCapabilities is what this node tells the board it can do, rebuilt on every beat.
+//
+// The sandbox probe is a fact about the MACHINE, but placement reads provides_live as what the node
+// will actually DO with the work. An executor that runs somebody else's program (--executor command)
+// cannot confine it, so it must not advertise confinement even where the machine could provide it —
+// otherwise an item whose needs say sandbox:seatbelt lands on a harness nobody confined (M8 Rule 1).
+func (a *Agent) liveCapabilities(ctx context.Context) []string {
+	caps := append([]string{}, a.cfg.Provides...)
+	confines := true
+	if c, ok := a.cfg.Executor.(interface{ Confines() bool }); ok {
+		confines = c.Confines()
+	}
+	if confines {
+		caps = append(caps, SandboxCapability()...)
+	}
+	caps = append(caps, LanCapabilities(ctx, a.cfg.Lan)...)
+	return caps
+}
+
 func (a *Agent) heartbeat(ctx context.Context) {
 	// The confinement capability is appended to the declared set on every beat, from the probe
 	// rather than from configuration: what this agent can promise about the boundary is a fact
 	// about the machine, and a stale claim here is a run placed on a sandbox that is not there.
-	// The declared set is rebuilt every beat from facts about the machine — the confinement probe
-	// and the LAN probes — never from what was declared last time.
-	caps := append([]string{}, a.cfg.Provides...)
-	caps = append(caps, SandboxCapability()...)
-	caps = append(caps, LanCapabilities(ctx, a.cfg.Lan)...)
+	// The declared set is rebuilt every beat from facts — the confinement probe, the LAN probes, and
+	// what the executor will actually do — never from what was declared last time.
+	caps := a.liveCapabilities(ctx)
 	resp, err := a.c.Heartbeat(ctx, board.HeartbeatRequest{
 		ProvidesLive: caps,
 		ReachClasses: a.cfg.Reaches,
@@ -321,6 +338,7 @@ func (a *Agent) execute(ctx context.Context, it board.ClaimedItem) {
 		TokensIn:       res.TokensIn,
 		TokensOut:      res.TokensOut,
 		ReservedTokens: res.ReservedTokens,
+		TokenSource:    res.TokenSource,
 	}
 	// A run that ended by asking a human is parked, not reported: the board has
 	// its own transition for it, and reporting it as ok or error would settle the
@@ -394,6 +412,7 @@ func (a *Agent) escalate(ctx context.Context, runID string, res Result) {
 		TokensIn:       res.TokensIn,
 		TokensOut:      res.TokensOut,
 		ReservedTokens: res.ReservedTokens,
+		TokenSource:    res.TokenSource,
 	}
 	for attempt := 1; ; attempt++ {
 		err := a.c.Escalate(ctx, runID, req)

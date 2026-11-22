@@ -241,6 +241,10 @@ type SpendStatus struct {
 	InputTokens    int64  `json:"input_tokens"`
 	OutputTokens   int64  `json:"output_tokens"`
 	ReservedTokens int64  `json:"reserved_tokens"`
+	// UnmeteredRuns counts today's runs nobody counted: a harness that reported no usage (M8 Rule 2).
+	// They are not zero-cost work, they are unmeasured work, and a ledger that showed them as zero
+	// would be lying in the direction that never stops anything.
+	UnmeteredRuns int64 `json:"unmetered_runs"`
 	// UnpricedRuns counts today's runs that consumed tokens and still cost
 	// nothing: a free local model, or a model nobody priced. Both are legitimate
 	// and only one is a mistake, so the ledger reports the count instead of
@@ -517,7 +521,7 @@ func formatAmount(v float64) string {
 // under-counting them.
 func sumSpend(ctx context.Context, q spendReader, dayStart int64) (SpendStatus, error) {
 	var st SpendStatus
-	var runs, in, out, reserved, unpriced, lost int64
+	var runs, in, out, reserved, unpriced, lost, unmetered int64
 	err := q.QueryRowContext(ctx, `
 		SELECT COUNT(*),
 		       COALESCE(SUM(input_tokens),0),
@@ -527,15 +531,17 @@ func sumSpend(ctx context.Context, q spendReader, dayStart int64) (SpendStatus, 
 		       COALESCE(SUM(CASE WHEN cost_estimate = 0
 		                          AND input_tokens+output_tokens+reserved_tokens > 0
 		                         THEN 1 ELSE 0 END),0),
-		       COALESCE(SUM(CASE WHEN status IN ('lost','abandoned') THEN 1 ELSE 0 END),0)
+		       COALESCE(SUM(CASE WHEN status IN ('lost','abandoned') THEN 1 ELSE 0 END),0),
+		       COALESCE(SUM(CASE WHEN token_source = 'unknown' THEN 1 ELSE 0 END),0)
 		  FROM runs
 		 WHERE started_at >= ? AND started_at < ?`, dayStart, dayStart+secondsPerDay).
-		Scan(&runs, &in, &out, &reserved, &st.Spent, &unpriced, &lost)
+		Scan(&runs, &in, &out, &reserved, &st.Spent, &unpriced, &lost, &unmetered)
 	if err != nil {
 		return SpendStatus{}, fmt.Errorf("sum today's runs: %w", err)
 	}
 	st.RunCount, st.InputTokens, st.OutputTokens, st.ReservedTokens, st.UnpricedRuns, st.LostRuns =
 		int(runs), in, out, reserved, int(unpriced), int(lost)
+	st.UnmeteredRuns = unmetered
 	return st, nil
 }
 

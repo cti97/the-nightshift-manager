@@ -507,7 +507,8 @@ func (s *Server) handleEscalate(w http.ResponseWriter, r *http.Request) {
 	}
 	err := Escalate(r.Context(), s.db, s.clock, r.PathValue("id"), nodeIDFrom(r),
 		ApprovalRequest{Action: body.Action, Reason: body.Reason, Options: body.Options},
-		RunTokens{TokensIn: body.TokensIn, TokensOut: body.TokensOut, ReservedTokens: body.ReservedTokens})
+		RunTokens{TokensIn: body.TokensIn, TokensOut: body.TokensOut, ReservedTokens: body.ReservedTokens,
+			TokenSource: body.TokenSource})
 	if err != nil {
 		WriteError(w, http.StatusConflict, "approval", err.Error())
 		return

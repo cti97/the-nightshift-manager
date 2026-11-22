@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -48,8 +49,10 @@ const (
 	// defaultCommandTimeout is generous because a harness is a whole agent session, and a run that
 	// needs an hour should finish rather than be killed at fifteen minutes.
 	defaultCommandTimeout = 2 * time.Hour
-	// commandTailBytes is how much of the harness's output becomes the run's summary.
-	commandTailBytes = 64 << 10
+	// commandTailBytes is how much of the harness's output becomes the run's summary. It matches the
+	// agent's own summary bound: an item row that a page renders should not be 64 KiB, and a harness
+	// that prints more than this is printing a log, not a result.
+	commandTailBytes = maxSummaryBytes
 	// escalateExitCode is how a harness asks for a human without a credential: exit 75, the BSD
 	// EX_TEMPFAIL convention, meaning "this could work later".
 	escalateExitCode = 75
@@ -60,7 +63,12 @@ const (
 func (e *CommandExecutor) commandEnv(item board.ClaimedItem, workdir, briefPath string) []string {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + workdir,
+		// HOME is the REAL home, not the workspace. A harness like `claude` keeps its login there; a
+		// harness that cannot find its credentials fails at the first call, and the operator's first
+		// experience of this feature would be an authentication error they did not cause. The
+		// workspace is cwd and is named in NSM_WORKDIR, which is the directory the harness should
+		// write to; what it does in its own home is the same thing it does when run by hand.
+		"HOME=" + os.Getenv("HOME"),
 		"NSM_ITEM_ID=" + item.Item.ID,
 		"NSM_RUN_ID=" + item.RunID,
 		"NSM_TITLE=" + item.Item.Title,
@@ -73,6 +81,12 @@ func (e *CommandExecutor) commandEnv(item board.ClaimedItem, workdir, briefPath 
 	}
 	return env
 }
+
+// Confines reports false, and the heartbeat honours it: this executor starts somebody else's program
+// in a directory and cannot promise the confinement the built-in sandbox provides. A node that
+// advertised sandbox:* while running this would accept work that needs confinement and hand it over
+// unconfined (M8 Rule 1).
+func (e *CommandExecutor) Confines() bool { return false }
 
 // Run materializes the brief, runs the command, and maps the outcome onto the board's vocabulary.
 func (e *CommandExecutor) Run(ctx context.Context, item board.ClaimedItem) (Result, error) {
@@ -152,7 +166,8 @@ func (e *CommandExecutor) Run(ctx context.Context, item board.ClaimedItem) (Resu
 	if err != nil {
 		return Result{}, fmt.Errorf("agent: start the harness: %w", err)
 	}
-	return Result{Summary: truncateSummary(out)}, nil
+	in, outTokens, source := readUsage(workdir)
+	return Result{Summary: truncateSummary(out), TokensIn: in, TokensOut: outTokens, TokenSource: source}, nil
 }
 
 // escalationFromOutput builds the approval request. A harness may name its own action on a line
@@ -180,6 +195,29 @@ func escalationFromOutput(out, runCmd string) *board.ApprovalRequest {
 		Reason:  "the harness stopped and asked for a human; it did not say why in a form the board can read:\n" + tailOf(out, 2000),
 		Options: []string{"allow it for this run", "deny"},
 	}
+}
+
+// usageFile is where a harness can say what it spent. It is a file rather than an argument or a
+// protocol: the harness already writes into this directory, and nothing about the board needs to be
+// understood to write two numbers.
+const usageFile = "NSM_USAGE.json"
+
+// readUsage reads the harness's own accounting. No file, or an unreadable one, means "unknown" — not
+// zero. A day of harness runs that reported nothing must not look like a day of free work (M8 Rule 2).
+func readUsage(workdir string) (in, out int, source string) {
+	raw, err := os.ReadFile(filepath.Join(workdir, usageFile))
+	if err != nil {
+		return 0, 0, "unknown"
+	}
+	var u struct {
+		TokensIn  int `json:"tokens_in"`
+		TokensOut int `json:"tokens_out"`
+	}
+	if err := json.Unmarshal(raw, &u); err != nil || u.TokensIn < 0 || u.TokensOut < 0 {
+		// A malformed file is not a zero: the harness tried to tell us and we could not read it.
+		return 0, 0, "unknown"
+	}
+	return u.TokensIn, u.TokensOut, "reported"
 }
 
 // tailBuffer keeps the last max bytes written to it. A harness can print megabytes; the summary is

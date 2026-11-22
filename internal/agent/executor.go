@@ -26,6 +26,11 @@ type Result struct {
 	// reporting the run, and the token counts above are what the board prices
 	// into the day's ledger when it parks the item.
 	Approval *board.ApprovalRequest
+
+	// TokenSource says whether the counts above are a measurement or a gap (M8 Rule 2). Empty means
+	// "reported": the built-in executors measure their own usage, and only an executor that runs
+	// somebody else's program can be in doubt.
+	TokenSource string
 }
 
 // Executor does the work. It receives the whole claim payload, so the brief —

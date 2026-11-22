@@ -283,6 +283,9 @@ type RunTokens struct {
 	TokensIn       int `json:"tokens_in"`
 	TokensOut      int `json:"tokens_out"`
 	ReservedTokens int `json:"reserved_tokens"`
+	// TokenSource travels with an escalation for the same reason it travels with a report: a harness
+	// that parked with no counts must not look like a run that spent nothing (M8 Rule 2).
+	TokenSource string `json:"token_source,omitempty"`
 }
 
 // EscalationRequest is the node's body for POST /runs/{id}/approval: the
@@ -298,6 +301,7 @@ type EscalationRequest struct {
 	TokensIn       int      `json:"tokens_in"`
 	TokensOut      int      `json:"tokens_out"`
 	ReservedTokens int      `json:"reserved_tokens"`
+	TokenSource    string   `json:"token_source,omitempty"`
 }
 
 // Escalate parks a run's item for a human and closes the run, in one
@@ -442,9 +446,10 @@ func escalateInTx(ctx context.Context, conn *sql.Conn, clock Clock, runID, nodeI
 	res, err = conn.ExecContext(ctx,
 		`UPDATE runs
 		    SET status='escalated', ended_at=?,
-		        input_tokens=?, output_tokens=?, reserved_tokens=?, cost_estimate=?
+		        input_tokens=?, output_tokens=?, reserved_tokens=?, cost_estimate=?, token_source=?
 		  WHERE id=? AND status IN ('claimed','running')`,
-		now, tokens.TokensIn, tokens.TokensOut, tokens.ReservedTokens, cost, runID)
+		now, tokens.TokensIn, tokens.TokensOut, tokens.ReservedTokens, cost,
+		tokenSourceOf(tokens.TokenSource), runID)
 	if err != nil {
 		return err
 	}

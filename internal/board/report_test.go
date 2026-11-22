@@ -908,3 +908,67 @@ func TestTheReportRouteSaysStaleLease(t *testing.T) {
 		t.Fatalf("body = %s, want the stale_lease code", rec.Body.String())
 	}
 }
+
+// TestReportRecordsTokenSource is M8 Rule 2 at the boundary: a harness that counted nothing must not
+// be written down as a run that spent nothing. Empty means reported, because the executors that
+// predate the field measure their own usage.
+func TestReportRecordsTokenSource(t *testing.T) {
+	cases := []struct {
+		req  string
+		want string
+	}{
+		{"", "reported"},
+		{"reported", "reported"},
+		{"estimated", "estimated"},
+		{"unknown", "unknown"},
+		{"nonsense", "unknown"},
+	}
+	for _, c := range cases {
+		db, clock, node, _, runID := filingFixture(t)
+		if _, err := Report(context.Background(), db, clock, runID, node, ReportRequest{
+			Status: "ok", Summary: "done", TokenSource: c.req,
+		}); err != nil {
+			t.Fatalf("%q: %v", c.req, err)
+		}
+		var got string
+		if err := db.QueryRow(`SELECT token_source FROM runs WHERE id=?`, runID).Scan(&got); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if got != c.want {
+			t.Fatalf("token_source(%q) = %q, want %q", c.req, got, c.want)
+		}
+	}
+}
+
+// TestSpendCountsUnmeteredRuns: the ledger's one job here is to stop showing unmetered work as free.
+func TestSpendCountsUnmeteredRuns(t *testing.T) {
+	db, clock, node, _, firstRun := filingFixture(t)
+	ctx := context.Background()
+	if _, err := Report(ctx, db, clock, firstRun, node, ReportRequest{Status: "ok", TokenSource: "unknown"}); err != nil {
+		t.Fatalf("report 1: %v", err)
+	}
+	// A second run that did count.
+	if _, err := CreateItem(ctx, db, clock, CreateItemRequest{Title: "second", Brief: "b", Needs: []string{"agentic"}}); err != nil {
+		t.Fatalf("CreateItem: %v", err)
+	}
+	claimed, err := Claim(ctx, db, clock, node, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: %d, %v", len(claimed), err)
+	}
+	if _, err := Report(ctx, db, clock, claimed[0].RunID, node, ReportRequest{
+		Status: "ok", TokensIn: 10, TokensOut: 20, TokenSource: "reported",
+	}); err != nil {
+		t.Fatalf("report 2: %v", err)
+	}
+
+	st, err := TodaySpend(ctx, db, clock)
+	if err != nil {
+		t.Fatalf("TodaySpend: %v", err)
+	}
+	if st.RunCount != 2 {
+		t.Fatalf("runs = %d, want 2", st.RunCount)
+	}
+	if st.UnmeteredRuns != 1 {
+		t.Fatalf("unmetered = %d, want exactly the one that reported nothing", st.UnmeteredRuns)
+	}
+}

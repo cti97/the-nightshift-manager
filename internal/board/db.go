@@ -34,6 +34,9 @@ var schema6 string
 //go:embed schema7.sql
 var schema7 string
 
+//go:embed schema8.sql
+var schema8 string
+
 // A migration upgrades a database one version, to Version.
 type migration struct {
 	version int
@@ -75,6 +78,9 @@ var migrations = []migration{
 	// Migration 7 (M7 Task 1): the three columns agent-filed work needs — depth (stored, not
 	// derived), filed_by_run (fan-out is counted per run) and client_ref (idempotency).
 	{version: 7, script: schema7},
+	// Migration 8 (M8 Rule 2): runs.token_source, so "no tokens" and "nobody counted" stop looking
+	// the same to the ledger.
+	{version: 8, script: schema8},
 }
 
 // schemaVersion is the schema version this binary implements: the version

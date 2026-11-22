@@ -18,7 +18,10 @@ import (
 // the spend ledger needs both to avoid under-counting a retried run. Any other Status value
 // is rejected before any write, so a body missing the field cannot fail an item.
 type ReportRequest struct {
-	Status         string `json:"status"` // "ok" | "error"
+	Status string `json:"status"` // "ok" | "error"
+	// TokenSource says where the counts came from (M8 Rule 2). Empty means "reported": a caller that
+	// does not know this field is a built-in executor whose numbers are its own measurement.
+	TokenSource    string `json:"token_source,omitempty"`
 	Summary        string `json:"summary"`
 	TokensIn       int    `json:"tokens_in"`
 	TokensOut      int    `json:"tokens_out"`
@@ -47,6 +50,23 @@ type ReportResult struct {
 // it. It is deliberately different from the idempotent "already settled" answer, because one
 // is a retry and the other is a partition that healed (spec §22.1).
 var ErrStaleLease = errors.New("the run's lease is gone: the run was reaped and its item requeued")
+
+// tokenSourceOf normalises the caller's word. An unrecognised value is "unknown" rather than an
+// error: the run happened, and refusing its report would leave an item claimed forever. The ledger's
+// job is to say nobody counted, not to punish the caller for saying it badly.
+func tokenSourceOf(s string) string {
+	switch s {
+	case "", "reported", "estimated":
+		// Empty is the built-in executors: their numbers are their own measurement, and a caller
+		// that predates this field must not be recorded as unmetered.
+		if s == "" {
+			return "reported"
+		}
+		return s
+	default:
+		return "unknown"
+	}
+}
 
 func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, req ReportRequest) (ReportResult, error) {
 	// An unknown status is a malformed report, not a failure. Treating "" (a
@@ -149,9 +169,11 @@ func Report(ctx context.Context, db *sql.DB, clock Clock, runID, nodeID string, 
 	// discards any partial write. That is what makes exactly-once true on this
 	// function's own logic, rather than on the connection pool's serialisation.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE runs SET status=?, ended_at=?, input_tokens=?, output_tokens=?, reserved_tokens=?, cost_estimate=?, error=?, transcript_path=?
+		`UPDATE runs SET status=?, ended_at=?, input_tokens=?, output_tokens=?, reserved_tokens=?, cost_estimate=?,
+		                 token_source=?, error=?, transcript_path=?
 		  WHERE id=? AND status IN ('claimed','running')`,
 		finalRun, clock.Now(), req.TokensIn, req.TokensOut, req.ReservedTokens, cost,
+		tokenSourceOf(req.TokenSource),
 		nullable(req.Error), nullable(req.Transcript), runID)
 	if err != nil {
 		return ReportResult{}, err
