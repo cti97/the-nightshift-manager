@@ -769,13 +769,32 @@ Cheap because the model is stubbed. The six that matter:
 - **M3** — escalation and approvals.
 - **M4** — watches (cron, interval, condition) with dedupe and cooldown.
 - **M5** — threads and budget reserve/settle.
-- **M6** — steward: Pi, `ReflexExecutor` (done), dynamic `lan:*` capabilities (done), endpoint canary,
-  read-only replica, plus `nsm agent install` (launchd / systemd / Task Scheduler), release
-  signing, and the manager's `/dist` channel.
+- **M6** — steward: Pi, `ReflexExecutor`, dynamic `lan:*` capabilities, endpoint canary, read-only
+  replica, `nsm agent install` (launchd / systemd), release signing, and the manager's `/dist`
+  channel. **Done**, except that no agent has run on a Pi and the replica's snapshot age is in
+  headers rather than on the page.
+- **M7** — agents file work: a live run creates child items (depth ≤ 2, ≤ 5 per parent, capability
+  subset), with filing above either limit routed through the approval machinery as `file_item`.
+  **Done**, including the `file_item` tool and the tree page; `nsm run file` is deliberately absent,
+  because an operator-side way to file as any run would bypass the capability rule.
+- **M8** — local harnesses: any existing harness (Claude Code, Codex CLI, a script) is a node through
+  `--executor command`. A harness declares `harness:<name>` and never `sandbox:<profile>` — the two
+  are refused together at the board — and a run nobody counted settles as `unknown`, never zero.
+  **Done** except the MCP shim (T4), which is not started and is not needed by any harness that can
+  run a command.
+- **M9** — the operator's board: retention for `events` (90 days by default, 24h floor, runs and items
+  never pruned) and `GET /admin`, a page showing every item by status with a way into each one.
+  **Done**.
 
-Watches come after the claim path because a watch whose emitted items cannot be claimed is a
-spam generator. The Pi comes last because everything above it must work before a steward is
-worth adding.
+The build order's principle held: each milestone made the next one testable. M7 needed M3's approval
+machinery to express a limit as a question; M8 needed M6's executor boundary and M7's capability
+subset rule to keep a harness from claiming more than its host can do; M9 needed M1–M8 to have
+produced the rows worth pruning and the work worth showing.
+
+Watches came after the claim path because a watch whose emitted items cannot be claimed is a spam
+generator. The Pi came last because everything above it had to work before a steward was worth
+adding. The operator's board came after that, because a page is only worth building once there is
+something on it worth seeing.
 
 ## 19. Known weaknesses
 
