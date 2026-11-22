@@ -68,7 +68,8 @@ endpoints — an unprobed endpoint is not an error, just an empty claim.
 nsm version
 nsm manager serve   [--addr] [--db]
 nsm node register   --name --provides --reach [--role] [--concurrency] [--board]
-nsm agent run       --node --provides --reach --sandbox-root [--policy FILE] [--executor agentic|reflex]
+nsm agent run       --node --provides --reach --sandbox-root [--policy FILE]
+                    [--executor agentic|reflex|command] [--run-cmd '…'] [--harness NAME]
                     [--lan service=host:port,...] [--canary 60s]
 nsm agent install   --node --provides --reach --sandbox-root [--executor …] [--print]
                     [--upgrade --pubkey KEY]
@@ -87,6 +88,13 @@ nsm watch hold <name> (--for 6h | --clear) [--board]
 
 Credentials are never flags: `NSM_ADMIN_TOKEN` for the admin commands, `NSM_ENROLL_TOKEN` for
 `node register`, `NSM_NODE_TOKEN` for `agent run`. A `--token` argument does not parse.
+
+`--executor command` runs your own harness instead of the built-in loop: the brief is written to a
+0600 file in a per-run workspace, and the harness gets six `NSM_*` variables and no credentials —
+a harness is not a sandbox, so a node using one declares `harness:<name>` and never `sandbox:<profile>`
+(the board refuses both). A harness that needs a human exits **75**, optionally with a line
+`NSM-ESCALATE: action | reason`; one that accounts for itself writes `NSM_USAGE.json`, and one that
+does not is recorded as *unmetered* rather than free.
 
 `--canary` is the steward duty: every interval it probes each endpoint from this box's network path
 and reports what it cannot reach. Three consecutive failures mark an endpoint `down` (one WAN
@@ -161,7 +169,8 @@ frozen thread's budget.
   [M6](docs/superpowers/plans/2026-11-21-m6-steward.md) (done),
   [M7](docs/superpowers/plans/2026-11-21-m7-agents-file-work.md) (done through T5: filing, limits,
   approvals, the tool, the tree page and `nsm item tree`),
-  [M8](docs/superpowers/plans/2026-11-21-m8-local-harnesses.md) (planned).
+  [M8](docs/superpowers/plans/2026-11-21-m8-local-harnesses.md) (T1–T3 and T5 done; the MCP shim
+  T4 is not started).
 - Plans — the milestone-by-milestone build, each with its acceptance tests.
 - Design memos — proposals that are not scheduled:
   [read-only replica](docs/superpowers/designs/2026-11-21-read-only-replica.md).

@@ -57,9 +57,22 @@ row, so `spend/today` can say "3 runs unmetered" instead of pretending.
 This is the one place where M8 adds a concept to the board rather than reusing one, and it is worth
 it: a ledger that silently counts unknown as zero is worse than no ledger.
 
+## What building it changed
+
+- **T3's premise was false.** There is no narrow board credential for a subprocess; the exit-code
+  signal replaces it (see T3).
+- **The heartbeat had to learn what an executor does.** It appended `sandbox:<profile>` for every
+  node, so a harness node claimed confinement it cannot deliver and the board (correctly) refused its
+  heartbeats. `Confines()` is now part of the contract, and a node advertises only what its executor
+  will actually do.
+- **Rule 2 needed a column, not just a promise.** `runs.token_source` plus `unmetered_runs` in the
+  ledger; without them "no tokens" and "nobody counted" are the same zero.
+- **HOME stays the real home.** The first version pointed it at the workspace, which would make every
+  real harness fail to find its login — the first thing an operator would hit.
+
 ## Tasks
 
-### T1 — `harness:<name>` in the vocabulary
+### T1 — `harness:<name>` in the vocabulary — done
 
 `internal/caps`: a `harness:` prefix, validated like `lan:` (one word after the colon), declared by a
 node and requireable by an item. Placement needs no change — it is a subset check — but the *refusal*
@@ -68,7 +81,7 @@ when a node omits it is worth a test.
 Acceptance: `TestHarnessIsOneWord`, `TestAnItemNeedingAHarnessIsNotPlacedOnANodeWithoutIt`,
 `TestAHarnessNodeCannotDeclareASandboxProfile`.
 
-### T2 — `CommandExecutor`
+### T2 — `CommandExecutor` — done
 
 `internal/agent/command.go`: materialize the brief into a per-run workspace
 (`<sandbox-root>/<run-id>/`), export `NSM_ITEM_ID`, `NSM_RUN_ID`, `NSM_ATTEMPT`, `NSM_BRIEF_FILE`,
@@ -83,20 +96,29 @@ Acceptance: `TestTheBriefIsInTheHarnessWorkspace`, `TestANonZeroExitIsAFailedRun
 `TestTheNodeTokenIsNotInTheHarnessEnvironment`, `TestTheCommandOutputIsBounded`,
 `TestTheWorkspaceIsPerRun`.
 
-### T3 — in-run helpers: `nsm task`
+### T3 — the harness signal, not `nsm task` (done, redesigned)
 
-A harness that hits a decision it cannot make must be able to ask, and a wrapper command cannot parse
-its way to that. `nsm task escalate --action deploy --reason "…"` reads `NSM_RUN_ID` and
-`NSM_NODE_TOKEN` from the environment, calls the board, and exits 0 once the item is parked;
-`nsm task thread --say "…"` posts to the item's thread if it has one.
+**This task was designed on a false premise and is built differently.** It assumed a narrow credential
+— "escalate and post, no claim, no report" — but this codebase has no such thing: a node token is the
+whole node, so putting it in a subprocess's environment would let a harness claim and report other
+work. The narrow credential is a feature nobody has built (scoped tokens), and M8 should not invent
+one to satisfy a plan.
 
-This is the one part of M8 that gives a subprocess a board credential, and it is deliberately the
-narrowest possible: escalate and post, no claim, no report, no admin.
+What a credential-less harness *can* do is stop and say so:
 
-Acceptance: `TestTaskEscalateParksItsOwnRun`, `TestTaskEscalateNeedsTheRunEnvironment`,
-`TestTaskThreadPostsAsTheItemsNode`.
+- **exit 75** (`EX_TEMPFAIL`) parks the run and asks a human;
+- **`NSM-ESCALATE: <action> | <reason>`** on stdout names what it wants, so the operator reads the
+  harness's own words rather than a generic "the agent stopped";
+- exit 75 without that line still parks, with the output as the reason.
 
-### T4 — the MCP shim
+That is the capability T3 wanted without the credential it assumed. If scoped tokens are ever built,
+`nsm task thread` becomes possible; until then a harness that needs to say something says it in its
+output or in the escalation reason.
+
+Acceptance as built: `TestExitSeventyFiveAsksForAHuman`, `TestAnUnnamedEscalationStillAsks`,
+`TestAnEscalatingHarnessIsStillUnmetered`.
+
+### T4 — the MCP shim — NOT STARTED
 
 For a tool-calling harness, the natural integration is not a wrapper command but tools:
 `nsm mcp serve` speaks MCP over stdio (JSON-RPC 2.0, stdlib only) and exposes `board_claim`,
@@ -110,11 +132,16 @@ interactive machine than one told to run a command.
 Acceptance: `TestMCPHandshakeAndToolList`, `TestAClaimThroughMCPIsTheSameClaim`,
 `TestMCPReportsATerminalRefusalAsAToolError`, `TestMCPServesNoAdminTools`.
 
-### T5 — proof
+### T5 — proof — done
 
-A real harness (Claude Code, or a scripted stand-in if the CLI is unavailable) takes an item through
-claim → run → escalate via `nsm task` → operator approves → the same harness finishes it. The proof
-records the board's view: one node, two attempts, one grant, and an unmetered run marked as such.
+`docs/superpowers/proofs/2026-11-22-m8-harnesses-proof.md`: a real manager, a real
+`--executor command` agent, and a scripted harness that parks itself by exit 75, is approved, and
+finishes on the second attempt. The ledger records both runs as `unknown` rather than free.
+
+The proof found three things the unit tests could not: a harness node was advertising a sandbox it
+cannot deliver (the heartbeat appended one for every node), the escalation path was recording
+"reported, 0" for a harness that spent tokens, and a proof that sleeps less than the agent's poll
+interval proves nothing.
 
 ## What M8 does not do
 
