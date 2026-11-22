@@ -273,3 +273,69 @@ func (s *Server) handleAdminMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	WriteJSON(w, http.StatusCreated, res)
 }
+
+// itemPage renders a tree: the item, everything an agent filed under it, and what each child is
+// waiting for. It exists because agent-filed work is otherwise five rows with a parent_id that no
+// page shows — the operator sees work appear and cannot tell who asked for it or from where.
+var itemPage = template.Must(template.New("item").Funcs(template.FuncMap{
+	"when": func(ts int64) string {
+		return time.Unix(ts, 0).UTC().Format("2006-01-02 15:04") + " UTC"
+	},
+	"short": func(s string) string {
+		if len(s) > 12 {
+			return s[:12]
+		}
+		return s
+	},
+}).Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} — the night shift manager</title>
+<style>
+  body { margin: 0 auto; max-width: 46rem; padding: 1rem; font: 16px/1.5 system-ui, -apple-system, sans-serif; color: #111; background: #fff; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 0 0 .25rem; }
+  .meta { font-size: .85rem; color: #555; margin: .15rem 0; }
+  .status { display: inline-block; font-size: .8rem; padding: .05rem .45rem; border: 1px solid #9994; border-radius: 1rem; }
+  .status.queued, .status.claimed, .status.running { background: #eef; }
+  .status.done { background: #efe; }
+  .status.failed, .status.cancelled { background: #fee; }
+  .status.needs_approval { background: #ffd; }
+  ul.tree { list-style: none; padding-left: 1rem; border-left: 1px solid #9994; margin: .4rem 0; }
+  ul.tree.root { padding-left: 0; border-left: 0; }
+  li { margin: .5rem 0; }
+  .card { border: 1px solid #9994; border-radius: .5rem; padding: .6rem .8rem; }
+  .asked { border-left: 3px solid #c90; padding-left: .6rem; margin-top: .4rem; font-size: .9rem; }
+  .empty { color: #555; }
+</style>
+</head>
+<body>
+<h1>{{.Title}}</h1>
+<p class="meta">
+  <span class="status {{.Status}}">{{.Status}}</span>
+  created by {{.CreatedBy}} at {{when .CreatedAt}}{{if .FiledBy}} — filed by run {{short .FiledBy}}{{end}}
+</p>
+{{if .Needs}}<p class="meta">needs {{range $i, $n := .Needs}}{{if $i}}, {{end}}{{$n}}{{end}}</p>{{end}}
+{{if .Parked}}<div class="asked"><strong>Waiting on a human:</strong> {{.Parked.Action}} — {{.Parked.Reason}}</div>{{end}}
+
+<h2>Work filed under this item</h2>
+{{if not .Children}}<p class="empty">Nothing has been filed under this item.</p>{{end}}
+<ul class="tree root">
+{{range .Children}}{{template "node" .}}{{end}}
+</ul>
+<p class="meta"><a href="/admin/approvals">Approvals</a></p>
+</body>
+</html>
+{{define "node"}}
+<li>
+  <div class="card">
+    <strong>{{.Title}}</strong>
+    <span class="status {{.Status}}">{{.Status}}</span>
+    <p class="meta">created by {{.CreatedBy}} at {{when .CreatedAt}} — depth {{.Depth}}{{if .FiledBy}}, filed by run {{short .FiledBy}}{{end}}</p>
+    {{if .Parked}}<div class="asked">{{.Parked.Action}} — {{.Parked.Reason}}</div>{{end}}
+  </div>
+  {{if .Children}}<ul class="tree">{{range .Children}}{{template "node" .}}{{end}}</ul>{{end}}
+</li>
+{{end}}`))

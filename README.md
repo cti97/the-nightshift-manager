@@ -75,6 +75,7 @@ nsm agent install   --node --provides --reach --sandbox-root [--executor …] [-
 nsm dist keygen     --out nsm.key            # ed25519 signing key, 0600, refuses to overwrite
 nsm dist sign       --key nsm.key --dir dist # writes dist/SHA256SUMS.sig
 nsm dist verify     --pub KEY --dir dist
+nsm item tree <id>                          # the item and everything agents filed under it
 nsm approvals       [--board]                       # the queue, for a terminal
 nsm approve <item>  [--note "…"] [--board]
 nsm deny <item>     --note "…"   [--board]          # the note is the recorded reason
@@ -158,8 +159,8 @@ frozen thread's budget.
   [M4](docs/superpowers/plans/2026-11-17-m4-watches.md),
   [M5](docs/superpowers/plans/2026-11-21-m5-threads-and-budgets.md),
   [M6](docs/superpowers/plans/2026-11-21-m6-steward.md) (done),
-  [M7](docs/superpowers/plans/2026-11-21-m7-agents-file-work.md) (in progress: filing, limits,
-  approvals and the tool are in; the page is not),
+  [M7](docs/superpowers/plans/2026-11-21-m7-agents-file-work.md) (done through T5: filing, limits,
+  approvals, the tool, the tree page and `nsm item tree`),
   [M8](docs/superpowers/plans/2026-11-21-m8-local-harnesses.md) (planned).
 - Plans — the milestone-by-milestone build, each with its acceptance tests.
 - Design memos — proposals that are not scheduled:

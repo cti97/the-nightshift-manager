@@ -485,3 +485,42 @@ func TestFilingBoundsItsInput(t *testing.T) {
 		t.Fatalf("a refused filing left %d children", n)
 	}
 }
+
+// TestADecisionSentAsJSONWithAFormContentTypeIsStillRead: `curl -d '{"decision":"approve"}'` sends
+// application/x-www-form-urlencoded with a JSON body. Reading that as an empty form answered
+// `decision "" is neither approve nor deny`, and an operator running the M7 proof lost a round to it.
+// The body's first byte decides, not the header.
+func TestADecisionSentAsJSONWithAFormContentTypeIsStillRead(t *testing.T) {
+	db, clock, node, parentID, runID := filingFixture(t)
+	for i := 0; i < maxFilingsPerRun; i++ {
+		req := fileReq("child")
+		req.ClientRef = "ref-" + string(rune('a'+i))
+		if _, err := FileItem(context.Background(), db, clock, runID, node, req); err != nil {
+			t.Fatalf("filing %d: %v", i, err)
+		}
+	}
+	if _, err := FileItem(context.Background(), db, clock, runID, node, fileReq("sixth")); err != nil {
+		t.Fatalf("sixth: %v", err)
+	}
+	srv := NewServer(db, clock, provider.NewRegistry(), HashToken(testAdminToken), HashToken(testEnrollToken))
+	// No explicit Content-Type, exactly as curl -d sends it.
+	req := httptest.NewRequest(http.MethodPost, "/admin/approvals/"+parentID,
+		strings.NewReader(`{"decision":"approve","note":"sent as json"}`))
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("decision = %d (body %s)", rec.Code, rec.Body)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM work_items WHERE id=?`, parentID).Scan(&status); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("status = %q, want queued after an approval", status)
+	}
+	if !strings.Contains(rec.Body.String(), `"status":"queued"`) {
+		t.Fatalf("the answer is not the JSON one a JSON caller expects: %s", rec.Body)
+	}
+}

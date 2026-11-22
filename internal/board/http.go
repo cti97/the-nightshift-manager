@@ -1,6 +1,7 @@
 package board
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,8 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 
 	"github.com/cti97/the-nightshift-manager/internal/provider"
@@ -117,6 +120,8 @@ func (s *Server) Handler() http.Handler {
 	// only evidence the board accepts that this node is doing this work (M7).
 	mux.Handle("POST /runs/{id}/items", s.nodeAuth(http.HandlerFunc(s.handleFileItem)))
 	mux.Handle("GET /admin/why/{id}", s.adminAuth(http.HandlerFunc(s.handleWhy)))
+	// One item and everything filed under it (M7 T4): the page when a browser asks, JSON otherwise.
+	mux.Handle("GET /admin/items/{id}", s.adminAuth(http.HandlerFunc(s.handleItemTree)))
 	mux.Handle("GET /admin/corrupt-rows", s.adminAuth(http.HandlerFunc(s.handleCorruptRows)))
 	mux.Handle("GET /admin/approvals", s.adminAuth(http.HandlerFunc(s.handleApprovals)))
 	mux.Handle("POST /admin/approvals/{id}", s.adminAuth(http.HandlerFunc(s.handleDecision)))
@@ -324,21 +329,46 @@ type DecisionRequest struct {
 // second decision is a conflict, not an overwrite, and the first one stands.
 // A 404 means the id is not on the board at all; a 400 means the body did not
 // name a decision, which is a malformed request rather than a lost race.
+// readDecisionBody reads a decision from JSON or from a form, deciding by the body's first byte. It
+// returns whether the body was JSON so the caller can answer in the same language.
+func readDecisionBody(r *http.Request) (DecisionRequest, bool, error) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, requestBodyLimit+1))
+	if err != nil {
+		return DecisionRequest{}, false, fmt.Errorf("read body: %w", err)
+	}
+	if int64(len(raw)) > requestBodyLimit {
+		return DecisionRequest{}, false, fmt.Errorf("the body is larger than %d bytes", requestBodyLimit)
+	}
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) > 0 && trimmed[0] == '{' {
+		var req DecisionRequest
+		if err := json.Unmarshal(trimmed, &req); err != nil {
+			return DecisionRequest{}, true, fmt.Errorf("the body starts with { but is not JSON: %w", err)
+		}
+		return req, true, nil
+	}
+	vals, err := url.ParseQuery(string(raw))
+	if err != nil {
+		return DecisionRequest{}, false, fmt.Errorf("parse form: %w", err)
+	}
+	return DecisionRequest{Decision: vals.Get("decision"), Note: vals.Get("note")}, false, nil
+}
+
 func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 	// The page posts a form; the API posts JSON. The page's answer is a redirect
 	// back to the queue (so a refresh does not re-decide) or a readable error
 	// page, because a phone cannot read a JSON envelope.
-	form := isFormPost(r)
-	if form {
-		if err := r.ParseForm(); err != nil {
+	// The body decides how it is read, not the header alone. `curl -d '{"decision":"approve"}'` sends
+	// application/x-www-form-urlencoded with a JSON body, and the old split read that as an empty form
+	// and answered `decision "" is neither approve nor deny` — a trap that cost the M7 proof a round.
+	// A body whose first byte is `{` is JSON whatever the header says; anything else is a form.
+	req, isJSON, err := readDecisionBody(r)
+	form := !isJSON
+	if err != nil {
+		if form {
 			renderHTML(w, http.StatusBadRequest, decisionErrorPage, map[string]string{"Message": err.Error()})
-			return
+		} else {
+			WriteError(w, http.StatusBadRequest, "decision", err.Error())
 		}
-	}
-	var req DecisionRequest
-	if form {
-		req = DecisionRequest{Decision: r.PostFormValue("decision"), Note: r.PostFormValue("note")}
-	} else if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Decision != Approve && req.Decision != Deny {
@@ -504,6 +534,23 @@ func (s *Server) handleWhy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, ex)
+}
+
+func (s *Server) handleItemTree(w http.ResponseWriter, r *http.Request) {
+	tree, err := ItemTree(r.Context(), s.db, r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			WriteError(w, http.StatusNotFound, "not_found", "no such work item")
+			return
+		}
+		WriteError(w, http.StatusInternalServerError, "tree", err.Error())
+		return
+	}
+	if wantsHTML(r) {
+		renderHTML(w, http.StatusOK, itemPage, tree)
+		return
+	}
+	WriteJSON(w, http.StatusOK, tree)
 }
 
 // handleCorruptRows is A2: the enumerable list of cells the claim path cannot

@@ -97,18 +97,33 @@ is consumed by it. A denial leaves the run parked with the operator's note.
 
 Acceptance: `TestAGrantLetsExactlyOneExtraChildThrough`, `TestADenialParksTheRunWithItsReason`.
 
-### T4 — CLI and page
+### T4 — CLI and page — done
 
-`nsm item tree <id>` prints the descendants; the item page renders the tree and who filed each
-child; `nsm run file --run ID --title … --brief …` is the operator-side equivalent used in tests.
+Built as `GET /admin/items/{id}` — JSON for a caller, a page for a browser (the route's `Accept`
+decides, as the approvals page already does) — plus `nsm item tree <id>`, which prints one indented
+line per item with its status, who filed it and the run it came from.
 
-Acceptance: `TestTheTreeShowsEveryDescendant`, `TestThePageNamesAgentFiledChildren`.
+`nsm run file` is deliberately NOT built: filing from a run is an agent's act, and an operator who
+wants a child can create one with `--parent`. A CLI that could file as any run would be a way to
+bypass the capability rule, which is the one thing the route exists to enforce.
 
-### T5 — proof
+Acceptance as built: `TestTheTreeShowsEveryDescendantWithItsProvenance`,
+`TestTheTreePageRendersForABrowser`, `TestTheTreeSaysWhenItIsParked`,
+`TestItemTreePrintsWhatTheBoardFiles`, `TestItemTreeNeedsAnAdminToken`.
 
-A real run files two children; one completes, one escalates; a third beyond the cap parks the parent,
-the operator approves with a note, and the child runs. The proof doc records the tree as the page
-renders it.
+One fix the race detector forced: children were ordered by `created_at, id`, and ids are random
+tokens, so siblings filed in the same second came out in arbitrary order. The order is
+`created_at, rowid` — insertion order, which is the order the operator watched them appear in.
+
+### T5 — proof — done
+
+`docs/superpowers/proofs/2026-11-21-m7-filing-proof.md`: a real manager, real HTTP, five filings, a
+retry returning the first item, a capability refusal, a sixth that parks as 202, an approval, a
+re-claim that does NOT spend the grant, one granted child, and a seventh that parks at six.
+
+Three caller-side findings are recorded there: the decision route's form-versus-JSON trap (now fixed
+at the route: the body's first byte decides), `client_ref` being scoped to one run, and a node at
+concurrency 1 holding a lease being unable to claim.
 
 ## What M7 does not do
 
