@@ -12,9 +12,11 @@ set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/nsm-smoke.XXXXXX")
-admin=smoke-admin-$RANDOM
-enroll=smoke-enroll-$RANDOM
-port=$((18000 + RANDOM % 2000))
+# $$ rather than $RANDOM: /bin/sh is dash on Debian and Ubuntu, and dash has no RANDOM. The PID is
+# unique per run, which is all these three need.
+admin=smoke-admin-$$
+enroll=smoke-enroll-$$
+port=$((18000 + $$ % 2000))
 board="http://127.0.0.1:$port"
 fail() { printf '\nFAIL: %s\n' "$1" >&2; printf -- '--- manager log ---\n' >&2; cat "$work/manager.log" >&2 || true; exit 1; }
 say() { printf '== %s ==\n' "$1"; }
