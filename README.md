@@ -39,6 +39,9 @@ matrix. Both platforms are load-bearing: the sandbox tests skip on Linux with a 
 so one runner alone would leave either Seatbelt or the Linux build unproven. The badge above is
 that run.
 
+`make smoke` runs the quick start below against the built binary and checks the board agrees
+afterwards; CI runs it on both platforms, so these instructions cannot quietly stop being true.
+
 ## Quick start
 
 ```sh

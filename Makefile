@@ -1,6 +1,6 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: build test vet race release check-tree
+.PHONY: build test vet race release check-tree smoke
 
 build:
 	go build -o bin/nsm ./cmd/nsm
@@ -21,3 +21,7 @@ vet:
 
 release:
 	./scripts/build-release.sh $(VERSION)
+
+# The README's quick start, executed against the shipped binary. Runs in CI on both platforms.
+smoke:
+	./scripts/smoke.sh

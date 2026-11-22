@@ -67,6 +67,12 @@ jobs:
           CGO_ENABLED: "1"
         run: make race
 
+      - name: smoke (the README's quick start)
+        # The unit tests prove functions; this proves the wiring an operator follows: enroll, place,
+        # claim, report, read back — against the shipped binary over real HTTP. It catches a route
+        # that moved or a flag that was renamed, which no unit test can.
+        run: make smoke
+
   release:
     name: six targets
     runs-on: ubuntu-latest
