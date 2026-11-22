@@ -158,7 +158,8 @@ frozen thread's budget.
   [M4](docs/superpowers/plans/2026-11-17-m4-watches.md),
   [M5](docs/superpowers/plans/2026-11-21-m5-threads-and-budgets.md),
   [M6](docs/superpowers/plans/2026-11-21-m6-steward.md) (done),
-  [M7](docs/superpowers/plans/2026-11-21-m7-agents-file-work.md) (planned).
+  [M7](docs/superpowers/plans/2026-11-21-m7-agents-file-work.md) (planned),
+  [M8](docs/superpowers/plans/2026-11-21-m8-local-harnesses.md) (planned).
 - Plans — the milestone-by-milestone build, each with its acceptance tests.
 - Design memos — proposals that are not scheduled:
   [read-only replica](docs/superpowers/designs/2026-11-21-read-only-replica.md).
