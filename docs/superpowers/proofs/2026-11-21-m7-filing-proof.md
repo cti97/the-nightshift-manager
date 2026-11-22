@@ -84,17 +84,42 @@ for this and from where" is a row rather than an inference.
 
 ## Three findings, recorded rather than smoothed over
 
-1. **The decision route takes a form, not JSON, unless the Content-Type says otherwise.** `curl -d`
+1. **The decision route took a form, not JSON, unless the Content-Type said otherwise.** `curl -d`
    defaults to `application/x-www-form-urlencoded`, so the JSON body was read as a form and the
-   decision arrived empty — `decision "" is neither approve nor deny`. This is the same caller-side
-   trap M5's proof recorded; it is a property of the route (the approvals *page* posts a form), not a
-   bug, but it costs every scripted operator ten minutes.
+   decision arrived empty — `decision "" is neither approve nor deny`. **Fixed at the route**: the
+   body's first byte decides now, so a JSON body is read as JSON whatever the header says
+   (`TestADecisionSentAsJSONWithAFormContentTypeIsStillRead`). The trap had cost every scripted
+   operator ten minutes; the fix means the next one pays nothing.
 2. **A client_ref is scoped to a run.** Reusing `ref-1` from a later run answers `409 client_ref_taken`,
    by design: a key identifies one run's request, and returning another run's item would be a silent
    cross-run join. The first script reusing refs across runs looked like a product bug and was not.
 3. **A node at concurrency 1 that holds a lease cannot claim.** The first script's second claim
    returned an empty list because the earlier partial run still held the item. The proof now registers
    its own node, which is also what makes it re-runnable.
+
+## The tree, on the real board
+
+`GET /admin/items/{id}` answers a page to a browser and JSON to a caller; `nsm item tree` prints the
+same tree for a terminal. Against the board this proof left behind:
+
+```
+$ nsm item tree de51ea1f4c79b62627272d5807c9815d7d4caf38fffecd9f5f6720607e276ce2
+the big job [needs_approval] — admin
+  waiting on a human: file_item — this item has already filed 6 children, which is the limit
+  child 1 [queued] — agent:7a74f535… via run 84444b8cf087
+  child 2 [queued] — agent:7a74f535… via run 84444b8cf087
+  child 3 [queued] — agent:7a74f535… via run 84444b8cf087
+  child 4 [queued] — agent:7a74f535… via run 84444b8cf087
+  child 5 [queued] — agent:7a74f535… via run 84444b8cf087
+  the granted child [queued] — agent:7a74f535… via run 0373800eb80c
+
+6 item(s) under this one
+```
+
+The same item as a page (`Accept: text/html`) renders one card per child with its status, the agent
+that filed it, its depth and the run it came from; the JSON answer carries `children: 6` and
+`approval_request` set. Six children across **two runs** is visible here in one screen: five from the
+first run, the granted one from the run that resumed the item.
 
 ## What this proof does not show
 
@@ -105,5 +130,6 @@ for this and from where" is a row rather than an inference.
   showed the tool-set condition was previously untested.
 - Nothing was placed. Children are `queued`; whether placement picks them up is M1–M2's feature and
   is covered there.
-- The tree is not rendered on a page yet (M7 T4). The board's answer is `/admin/why` and the
-  approvals list, as shown above.
+- The page was checked by hand against the proof's board, not by a browser: the HTML is asserted by
+  `TestTheTreePageRendersForABrowser` and was read once with `curl -H 'Accept: text/html'`. Nobody has
+  looked at it on a phone.
