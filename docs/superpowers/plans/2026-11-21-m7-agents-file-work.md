@@ -46,9 +46,32 @@ Agents retry. `POST /runs/{id}/items` takes a `client_ref` the caller chooses, u
 repeat returns the existing item with `created: false`. Without it, every network hiccup between the
 agent and the board files the same child twice and spends the work twice.
 
+## What building it changed
+
+Three of the plan's own claims did not survive contact:
+
+1. **"Fan-out is counted per run"** is defeated by the reaper. Every re-claim creates a new run id, so
+   five children per attempt is fifteen for one item — the exact case the paragraph above said it was
+   preventing. The cap now counts the parent's children; `filed_by_run` stays, as the audit record of
+   who asked.
+2. **The grant cannot be consumed by the claim.** M3's rule is that a claim eats its grant. For
+   `file_item` that spent the operator's answer on the act of resuming and then refused the filing it
+   had been granted for. The claim now preserves a `file_item` grant and the filing consumes it.
+3. **A denied filing must not cancel the work.** D7's "a decline is a cancellation with a reason" is
+   about the task; this refusal is about one request the task made. A denial now requeues with the
+   note as `blocked_reason`.
+
+Two smaller ones: `CreateItem` ignored `ParentID`, so an operator-filed child was depth 0 and the
+agents under it could file two more levels; and a parked filing answered `201`, telling a client an
+item existed while the board waited for a human (`202` now).
+
+The caller is a **tool**, not a CLI: `file_item` is bound per run to the board client and added to
+that run's tool set only when the executor has a client. The model supplies the work and the id;
+the run id comes from the executor, because the run is what the board checks ownership against.
+
 ## Tasks
 
-### T1 — the schema (migration 7)
+### T1 — the schema (migration 7) — done
 
 `work_items` gains `created_by TEXT`, `depth INTEGER NOT NULL DEFAULT 0`,
 `client_ref TEXT UNIQUE`, and `filed_by_run TEXT` (the run that filed it, so fan-out is counted
@@ -57,7 +80,7 @@ against a run and not against an item that may be retried).
 Acceptance: `TestADepthTwoChildCannotBeMoved`, `TestClientRefIsUniqueAcrossTheBoard`,
 `TestAFreshBoardHasDepthZero`.
 
-### T2 — `POST /runs/{id}/items`
+### T2 — `POST /runs/{id}/items` — done, plus the tool
 
 Node auth, the run's own node, only while the run is `claimed` or `running`. Validates depth,
 capability subset and fan-out inside one `BEGIN IMMEDIATE` transaction; returns
@@ -67,7 +90,7 @@ Acceptance: `TestAnAgentMayFileAChildOfItsOwnRun`, `TestAChildCannotWantWhatItsP
 `TestAFilingForAnotherNodesRunIsRefused`, `TestTheSixthChildIsAnApprovalNotAWrite`,
 `TestARetriedFilingReturnsTheSameItem`, `TestFilingAfterTheRunEndedIsRefused`.
 
-### T3 — the `file_item` approval
+### T3 — the `file_item` approval — done
 
 `request_approval` gains the action `file_item`; a grant allows exactly one filing above the cap and
 is consumed by it. A denial leaves the run parked with the operator's note.
