@@ -143,6 +143,18 @@ cannot deliver (the heartbeat appended one for every node), the escalation path 
 "reported, 0" for a harness that spent tokens, and a proof that sleeps less than the agent's poll
 interval proves nothing.
 
+## Hardening after the proof
+
+- **`nsm agent install` writes the harness flags.** The first version passed `--executor` but not
+  `--run-cmd`/`--harness`, so `install --executor command` wrote a service that died at its first
+  start with "--executor command needs --run-cmd". Found by asking what a reboot would do; the test
+  asserts the generated unit contains them.
+- **Usage is read on every exit path**, including escalation, failure and timeout. The first version
+  only read it on success, so an escalating harness was recorded as "reported, 0".
+- **The sandbox assertion is measured against the probe, not against seatbelt.** Linux CI has no
+  confinement to offer, and a test that hard-coded a profile passed on macOS and failed where the
+  board is meant to run.
+
 ## What M8 does not do
 
 - **No per-harness API keys in the manager.** The harness holds its own credentials; the board never

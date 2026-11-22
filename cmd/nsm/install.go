@@ -190,7 +190,9 @@ func installCommand(args []string, out, errOut io.Writer) int {
 	reach := fs.String("reach", "", "comma-separated reach classes")
 	sandboxRoot := fs.String("sandbox-root", "", "absolute path under which each run gets a disposable directory (required)")
 	policyPath := fs.String("policy", "", "JSON file of per-tool verdicts (allow|deny|ask)")
-	executorKind := fs.String("executor", "agentic", "agentic or reflex")
+	executorKind := fs.String("executor", "agentic", "agentic, reflex or command")
+	runCmd := fs.String("run-cmd", "", "with --executor command: the harness command line")
+	harnessName := fs.String("harness", "", "with --executor command: the harness name, declared as harness:<name>")
 	printOnly := fs.Bool("print", false, "print the files instead of writing them")
 	upgrade := fs.Bool("upgrade", false, "replace this binary with the release the board serves first (needs NSM_ADMIN_TOKEN)")
 	pubKey := fs.String("pubkey", os.Getenv("NSM_RELEASE_PUBKEY"), "base64 ed25519 release key to pin (or a file holding it)")
@@ -207,6 +209,15 @@ func installCommand(args []string, out, errOut io.Writer) int {
 		"--sandbox-root", *sandboxRoot, "--executor", *executorKind}
 	if *policyPath != "" {
 		runArgs = append(runArgs, "--policy", *policyPath)
+	}
+	// The command executor's flags must be written into the unit too. Without this, `install
+	// --executor command` wrote a service whose first start failed with "--executor command needs
+	// --run-cmd" — a unit that could never run, discovered at 3am by a reboot rather than here.
+	if *runCmd != "" {
+		runArgs = append(runArgs, "--run-cmd", *runCmd)
+	}
+	if *harnessName != "" {
+		runArgs = append(runArgs, "--harness", *harnessName)
 	}
 	if _, ok := parseAgentConfig(runArgs, errOut); !ok {
 		return 2

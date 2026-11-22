@@ -121,3 +121,28 @@ func TestInstallPrintWritesNothing(t *testing.T) {
 	// before MkdirAll/WriteFile when --print is set. The files themselves are asserted by content,
 	// because writing them here would install a daemon on the machine running the tests.
 }
+
+// TestInstallWritesTheHarnessFlagsIntoTheUnit: the flags that make a command node work must reach the
+// service, or the unit starts and dies with "--executor command needs --run-cmd" — and an operator
+// finds out at the next reboot, not at install time.
+func TestInstallWritesTheHarnessFlagsIntoTheUnit(t *testing.T) {
+	t.Setenv("NSM_NODE_TOKEN", "tok")
+	var out, errOut bytes.Buffer
+	code := installCommand([]string{"--node", "n", "--provides", "harness:scripted", "--reach", "host",
+		"--sandbox-root", t.TempDir(), "--executor", "command",
+		"--run-cmd", "claude -p \"$(cat $NSM_BRIEF_FILE)\"", "--harness", "scripted", "--print"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d (%s)", code, errOut.String())
+	}
+	for _, want := range []string{"--run-cmd", "--harness", "scripted", "claude -p"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("the generated service does not contain %q:\n%s", want, out.String())
+		}
+	}
+	// A harness with no command is refused here rather than by a unit that cannot start.
+	var badOut, badErr bytes.Buffer
+	if code := installCommand([]string{"--node", "n", "--provides", "harness:scripted", "--reach", "host",
+		"--sandbox-root", t.TempDir(), "--executor", "command", "--harness", "scripted", "--print"}, &badOut, &badErr); code == 0 {
+		t.Fatal("install accepted a command executor with no --run-cmd")
+	}
+}
