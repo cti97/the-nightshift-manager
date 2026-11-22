@@ -27,6 +27,9 @@ type Server struct {
 	// adminTokenHash is the credential the operator's CLI/UI carries. Handlers
 	// never see the plaintext; they compare the hash of the bearer token.
 	adminTokenHash string
+	// distDir is the release directory this manager serves, or empty for none. Set through
+	// SetDistDir, never by a request: the path is configuration, not input.
+	distDir string
 	// enrollTokenHash is a credential that can do exactly one thing: register a
 	// node. It is deliberately not the admin token (spec §15 read register as a
 	// node-token endpoint, which cannot bootstrap itself): an enrolling machine
@@ -119,6 +122,10 @@ func (s *Server) Handler() http.Handler {
 	// The operator's own view and reply. The page and the JSON share one route (M3 D8's pattern).
 	mux.Handle("GET /admin/threads/{id}", s.adminAuth(http.HandlerFunc(s.handleThreadPage)))
 	mux.Handle("POST /admin/threads/{id}/messages", s.adminAuth(http.HandlerFunc(s.handleAdminMessage)))
+	// The release channel. Admin-authenticated: an artifact list is a map of the fleet.
+	mux.Handle("GET /dist/SHA256SUMS", s.adminAuth(http.HandlerFunc(s.handleDistSums)))
+	mux.Handle("GET /dist/SHA256SUMS.sig", s.adminAuth(http.HandlerFunc(s.handleDistSig)))
+	mux.Handle("GET /dist/files/{name}", s.adminAuth(http.HandlerFunc(s.handleDistArtifact)))
 	// The conversation itself is a participant's view: an agent reads and posts with the node
 	// token it already holds, and the operator's levers (create, budget) are admin routes.
 	// The canary: an always-on node reports what it can reach from its own network path. It may

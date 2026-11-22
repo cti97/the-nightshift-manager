@@ -52,6 +52,8 @@ func run(args []string, out, errOut io.Writer) int {
 			return 2
 		}
 		return managerServe(args[2:], errOut)
+	case "dist":
+		return distCommand(args[1:], out, errOut)
 	case "agent":
 		if len(args) < 2 {
 			usage(errOut)
@@ -87,7 +89,7 @@ func run(args []string, out, errOut io.Writer) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: nsm <version|manager|agent|node|approvals|approve|deny|watch> [args]")
+	fmt.Fprintln(w, "usage: nsm <version|manager|agent|dist|node|approvals|approve|deny|watch> [args]")
 	fmt.Fprintln(w, "       nsm agent <run|install> [args]")
 }
 
@@ -123,6 +125,7 @@ func managerServe(args []string, errOut io.Writer) int {
 	dbPath.SetOutput(errOut)
 	addr := dbPath.String("addr", "127.0.0.1:8081", "listen address")
 	path := dbPath.String("db", "nsm.db", "sqlite path")
+	distDir := dbPath.String("dist", "", "release directory to serve on /dist (empty: serve no releases)")
 	if err := dbPath.Parse(args); err != nil {
 		return 2
 	}
@@ -138,6 +141,13 @@ func managerServe(args []string, errOut io.Writer) int {
 	defer db.Close()
 
 	srv := board.NewServer(db, board.SystemClock(), provider.NewRegistry(), board.HashToken(admin), board.HashToken(enroll))
+	if *distDir != "" {
+		if st, err := os.Stat(*distDir); err != nil || !st.IsDir() {
+			fmt.Fprintf(errOut, "--dist %s is not a directory\n", *distDir)
+			return 2
+		}
+		srv.SetDistDir(*distDir)
+	}
 	fmt.Fprintf(errOut, "nsm manager listening on %s (db %s)\n", *addr, *path)
 	// The reaper is the only thing that expires a lease: without it a node that
 	// dies mid-run holds its item forever. It lives for the life of the process;

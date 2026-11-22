@@ -71,6 +71,10 @@ nsm node register   --name --provides --reach [--role] [--concurrency] [--board]
 nsm agent run       --node --provides --reach --sandbox-root [--policy FILE] [--executor agentic|reflex]
                     [--lan service=host:port,...] [--canary 60s]
 nsm agent install   --node --provides --reach --sandbox-root [--executor …] [--print]
+                    [--upgrade --pubkey KEY]
+nsm dist keygen     --out nsm.key            # ed25519 signing key, 0600, refuses to overwrite
+nsm dist sign       --key nsm.key --dir dist # writes dist/SHA256SUMS.sig
+nsm dist verify     --pub KEY --dir dist
 nsm approvals       [--board]                       # the queue, for a terminal
 nsm approve <item>  [--note "…"] [--board]
 nsm deny <item>     --note "…"   [--board]          # the note is the recorded reason
@@ -95,6 +99,15 @@ on every heartbeat: a laptop that leaves the house stops advertising the home NA
 wrapper that sources a `0600` environment file: the node token never appears in a unit file or a
 plist, because those are world-readable and end up in every backup. `--print` shows all three files
 without writing anything.
+
+`nsm manager serve --dist dist` serves a signed release on `/dist` (admin token only — an artifact
+list is a map of the fleet's platforms). The signature is ed25519 over the exact bytes of
+`SHA256SUMS`, verified with `crypto/ed25519` inside the binary that needs it: no external tool to
+install on a Pi, and no second copy of the checksum format to drift. The private key never goes on
+the manager — a signature the manager could forge protects nobody from a compromised manager.
+`nsm agent install --upgrade --pubkey …` fetches the artifact for its own target, checks the
+signature, checks the bytes, and replaces itself with one atomic rename; a refused upgrade leaves
+the old binary untouched.
 
 `--policy` is a node's local wall: a JSON file of per-tool verdicts (`allow`, `deny`, `ask`),
 consulted before a tool runs. `deny` refuses the tool and tells the model why; `ask` parks the run

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/xml"
 	"flag"
 	"fmt"
@@ -189,6 +190,8 @@ func installCommand(args []string, out, errOut io.Writer) int {
 	policyPath := fs.String("policy", "", "JSON file of per-tool verdicts (allow|deny|ask)")
 	executorKind := fs.String("executor", "agentic", "agentic or reflex")
 	printOnly := fs.Bool("print", false, "print the files instead of writing them")
+	upgrade := fs.Bool("upgrade", false, "replace this binary with the release the board serves first (needs NSM_ADMIN_TOKEN)")
+	pubKey := fs.String("pubkey", os.Getenv("NSM_RELEASE_PUBKEY"), "base64 ed25519 release key to pin (or a file holding it)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -227,6 +230,18 @@ func installCommand(args []string, out, errOut io.Writer) int {
 		Token:   token,
 		BaseDir: filepath.Join(home, ".config", "nsm"),
 		Label:   installLabel,
+	}
+	if *upgrade {
+		if *pubKey == "" {
+			// Without a pinned key an upgrade is a shell script from the internet with a checksum
+			// attached by whoever served it.
+			fmt.Fprintln(errOut, "install: --upgrade needs --pubkey (the key the release was signed with)")
+			return 2
+		}
+		if err := upgradeFromBoard(context.Background(), *baseURL, os.Getenv("NSM_ADMIN_TOKEN"), *pubKey, bin, out); err != nil {
+			fmt.Fprintf(errOut, "install: upgrade: %v\n", err)
+			return 1
+		}
 	}
 	files, err := spec.installFiles()
 	if err != nil {
