@@ -30,7 +30,7 @@ var approvalsPage = template.Must(template.New("approvals").Funcs(template.FuncM
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">` + iconLink + `
 <title>Approvals — the night shift manager</title>
 <style>
   body { margin: 0 auto; max-width: 44rem; padding: 1rem; font: 16px/1.5 system-ui, -apple-system, sans-serif; color: #111; background: #fff; }
@@ -80,7 +80,7 @@ var decisionErrorPage = template.Must(template.New("decision-error").Parse(`<!do
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">` + iconLink + `
 <title>Decision refused</title>
 <style>
   body { margin: 0 auto; max-width: 44rem; padding: 1rem; font: 16px/1.5 system-ui, sans-serif; color: #111; background: #fff; }
@@ -141,7 +141,7 @@ var threadPage = template.Must(template.New("thread").Funcs(template.FuncMap{
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">` + iconLink + `
 <title>{{.Subject}} — thread</title>
 <style>
   body { margin: 0 auto; max-width: 44rem; padding: 1rem; font: 16px/1.5 system-ui, -apple-system, sans-serif; color: #111; background: #fff; }
@@ -190,7 +190,7 @@ var threadPage = template.Must(template.New("thread").Funcs(template.FuncMap{
 // often — with the reason and a way back.
 var threadErrorPage = template.Must(template.New("thread-error").Parse(`<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` + iconLink + `
 <title>Post refused</title>
 <style>body { margin: 0 auto; max-width: 44rem; padding: 1rem; font: 16px/1.5 system-ui, sans-serif; }
 .error { border: 1px solid #b33; border-radius: .5rem; padding: 1rem; margin: 1rem 0; }</style></head>
@@ -292,7 +292,7 @@ var itemPage = template.Must(template.New("item").Funcs(template.FuncMap{
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">` + iconLink + `
 <title>{{.Title}} — the night shift manager</title>
 <style>
   body { margin: 0 auto; max-width: 46rem; padding: 1rem; font: 16px/1.5 system-ui, -apple-system, sans-serif; color: #111; background: #fff; }
@@ -359,7 +359,7 @@ var boardPage = template.Must(template.New("board").Funcs(template.FuncMap{
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">` + iconLink + `
 <title>The board — the night shift manager</title>
 <style>
   body { margin: 0 auto; max-width: 52rem; padding: 1rem; font: 16px/1.5 system-ui, -apple-system, sans-serif; color: #111; background: #fff; }

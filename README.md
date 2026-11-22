@@ -1,11 +1,18 @@
-# The Night Shift Manager
+<p align="center">
+  <img src="assets/logo.svg" alt="the night shift manager" width="112" height="112">
+</p>
 
-[![ci](https://github.com/cti97/the-nightshift-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/cti97/the-nightshift-manager/actions/workflows/ci.yml)
+<h1 align="center">the night shift manager</h1>
 
-A coordination board for heterogeneous machines. A VPS runs the manager; laptops and a
-Raspberry Pi run agents that pick up work whenever they are awake and qualified. Nothing is
-assigned to anyone — nodes ask, the board decides placement from declared capabilities, and
-every decision is explainable.
+<p align="center">a coordination board for machines that are awake at different times</p>
+
+<p align="center">
+  <a href="https://github.com/cti97/the-nightshift-manager/actions/workflows/ci.yml"><img src="https://github.com/cti97/the-nightshift-manager/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+</p>
+
+A VPS runs the manager; laptops and a Raspberry Pi run agents that pick up work whenever they are
+awake and qualified. Nothing is assigned to anyone — nodes ask, the board decides placement from
+declared capabilities, and every decision is explainable.
 
 The name is the point: it is a night shift for machines that sleep.
 

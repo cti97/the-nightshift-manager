@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="The night shift manager">
+  <title>The night shift manager</title>
+  <!-- For light backgrounds, print and one-colour use. No badge: the mark has to carry itself. -->
+  <defs>
+    <mask id="crescent-mono">
+      <rect width="128" height="128" fill="#fff"/>
+      <circle cx="80" cy="64" r="38" fill="#000"/>
+    </mask>
+  </defs>
+  <circle cx="64" cy="64" r="46" fill="#0F172A" mask="url(#crescent-mono)"/>
+  <rect x="84" y="58" width="26" height="12" rx="6" fill="#F59E0B"/>
+</svg>

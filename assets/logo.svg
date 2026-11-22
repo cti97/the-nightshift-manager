@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="The night shift manager">
+  <title>The night shift manager</title>
+  <!-- A crescent and one amber bar: the night, and the one item in flight. Two elements, because at
+       16px a third becomes a smudge. The crescent is a circle with a circle taken out of it (a mask),
+       so both horns taper the same way; drawing it as two arcs with mismatched radii leaves one
+       horn a hairline scratch. -->
+  <defs>
+    <mask id="crescent">
+      <rect width="128" height="128" fill="#fff"/>
+      <circle cx="80" cy="64" r="38" fill="#000"/>
+    </mask>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0F172A"/>
+  <circle cx="64" cy="64" r="46" fill="#F5E9D0" mask="url(#crescent)"/>
+  <rect x="84" y="58" width="26" height="12" rx="6" fill="#F59E0B"/>
+</svg>

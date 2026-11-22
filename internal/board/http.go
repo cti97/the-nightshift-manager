@@ -102,6 +102,13 @@ func NewToken() (string, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /version", s.handleVersion)
+	// The favicon is public: it is the same bytes for everyone, it carries nothing, and a browser asks
+	// for it before any credential is involved.
+	mux.HandleFunc("GET /favicon.svg", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/svg+xml")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		_, _ = w.Write([]byte(faviconSVG))
+	})
 	mux.Handle("GET /admin/board", s.adminAuth(http.HandlerFunc(s.handleBoard)))
 	// The front door: the board as a page for a browser, the same data as JSON for a caller.
 	mux.Handle("GET /admin", s.adminAuth(http.HandlerFunc(s.handleBoardView)))

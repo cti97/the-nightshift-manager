@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 128" width="640" height="128" role="img" aria-label="The night shift manager">
+  <title>The night shift manager</title>
+  <!-- The lockup uses the system sans, so it renders as a different face on different machines. The
+       README uses the mark plus HTML text instead; this file is for slides, where a close match is
+       enough and having one file to drop in is worth more than font independence. -->
+  <defs>
+    <mask id="crescent-word">
+      <rect width="128" height="128" fill="#fff"/>
+      <circle cx="80" cy="64" r="38" fill="#000"/>
+    </mask>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0F172A"/>
+  <circle cx="64" cy="64" r="46" fill="#F5E9D0" mask="url(#crescent-word)"/>
+  <rect x="84" y="58" width="26" height="12" rx="6" fill="#F59E0B"/>
+  <g fill="#0F172A" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="158" y="64" font-size="42" font-weight="600" letter-spacing="-1">the night shift</text>
+    <text x="162" y="100" font-size="20" font-weight="400" letter-spacing="7">MANAGER</text>
+  </g>
+</svg>
