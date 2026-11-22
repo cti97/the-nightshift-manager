@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/cti97/the-nightshift-manager/internal/release"
 )
 
 // installSpec is what an install writes down: how to start this agent, and where its secret lives.
@@ -231,6 +233,12 @@ func installCommand(args []string, out, errOut io.Writer) int {
 		BaseDir: filepath.Join(home, ".config", "nsm"),
 		Label:   installLabel,
 	}
+	if *upgrade && *printOnly {
+		// --print exists so an operator can look before anything changes. An upgrade replaces the
+		// binary, so the combination has no meaning that is not a surprise.
+		fmt.Fprintln(errOut, "install: --print and --upgrade cannot be combined: printing must not replace the binary")
+		return 2
+	}
 	if *upgrade {
 		if *pubKey == "" {
 			// Without a pinned key an upgrade is a shell script from the internet with a checksum
@@ -238,8 +246,24 @@ func installCommand(args []string, out, errOut io.Writer) int {
 			fmt.Fprintln(errOut, "install: --upgrade needs --pubkey (the key the release was signed with)")
 			return 2
 		}
-		if err := upgradeFromBoard(context.Background(), *baseURL, os.Getenv("NSM_ADMIN_TOKEN"), *pubKey, bin, out); err != nil {
+		// The installed release is recorded beside the env file: it is the only record of what this
+		// node is running, and the anti-rollback rule needs it to refuse an older signed release.
+		recordPath := filepath.Join(spec.BaseDir, "installed-release")
+		installed, _ := os.ReadFile(recordPath)
+		guard := func(entry release.Entry) error {
+			return refuseDowngrade(strings.TrimSpace(string(installed)), entry)
+		}
+		entry, err := upgradeFromBoard(context.Background(), *baseURL, os.Getenv("NSM_ADMIN_TOKEN"), *pubKey, bin, guard, out)
+		if err != nil {
 			fmt.Fprintf(errOut, "install: upgrade: %v\n", err)
+			return 1
+		}
+		if err := os.MkdirAll(spec.BaseDir, 0o700); err != nil {
+			fmt.Fprintf(errOut, "install: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(recordPath, []byte(entry.File+"\n"), 0o600); err != nil {
+			fmt.Fprintf(errOut, "install: record the installed release: %v\n", err)
 			return 1
 		}
 	}

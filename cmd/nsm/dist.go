@@ -170,16 +170,25 @@ func readPublicKey(s string) (ed25519.PublicKey, error) {
 	return release.ParsePublicKey(s)
 }
 
+// maxArtifactBytes bounds an upgrade download. The signature only proves WHO published the bytes, not
+// how many there are: a compromised or broken manager can stream until the disk is full, and the hash
+// check only happens at the end.
+var maxArtifactBytes int64 = 256 << 20
+
 // upgradeFromBoard replaces the running binary with the release the board serves, after checking the
 // signature over the checksum file and the checksum over the bytes. Nothing is written until both
 // pass: a partial download must not be able to become an executable.
-func upgradeFromBoard(ctx context.Context, baseURL, adminToken, pubKey, exePath string, out io.Writer) error {
+// guard is consulted after the signature verifies and before anything is downloaded: it is where the
+// caller refuses an older release, and doing it here means a refused upgrade never writes a byte.
+type upgradeGuard func(entry release.Entry) error
+
+func upgradeFromBoard(ctx context.Context, baseURL, adminToken, pubKey, exePath string, guard upgradeGuard, out io.Writer) (release.Entry, error) {
 	pub, err := readPublicKey(pubKey)
 	if err != nil {
-		return err
+		return release.Entry{}, err
 	}
 	if adminToken == "" {
-		return errors.New("NSM_ADMIN_TOKEN is required to fetch a release: the artifact list is not public")
+		return release.Entry{}, errors.New("NSM_ADMIN_TOKEN is required to fetch a release: the artifact list is not public")
 	}
 	client := &http.Client{Timeout: 60 * time.Second}
 	get := func(path string) ([]byte, error) {
@@ -205,15 +214,20 @@ func upgradeFromBoard(ctx context.Context, baseURL, adminToken, pubKey, exePath 
 
 	sums, err := get("/dist/SHA256SUMS")
 	if err != nil {
-		return err
+		return release.Entry{}, err
 	}
 	sig, err := get("/dist/SHA256SUMS.sig")
 	if err != nil {
-		return err
+		return release.Entry{}, err
 	}
 	want, err := release.Check(pub, sums, string(sig), runtime.GOOS, runtime.GOARCH, "")
 	if err != nil {
-		return err
+		return release.Entry{}, err
+	}
+	if guard != nil {
+		if err := guard(want); err != nil {
+			return release.Entry{}, err
+		}
 	}
 
 	// Download beside the target, so the rename is on one filesystem and atomic. A temp file in
@@ -221,41 +235,71 @@ func upgradeFromBoard(ctx context.Context, baseURL, adminToken, pubKey, exePath 
 	// executable behind.
 	tmp, err := os.CreateTemp(filepath.Dir(exePath), ".nsm-upgrade-*")
 	if err != nil {
-		return fmt.Errorf("prepare download: %w", err)
+		return release.Entry{}, fmt.Errorf("prepare download: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/dist/files/"+want.File, nil)
 	if err != nil {
-		return err
+		return release.Entry{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return release.Entry{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download %s: %s", want.File, resp.Status)
+		return release.Entry{}, fmt.Errorf("download %s: %s", want.File, resp.Status)
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h), resp.Body)
+	n, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(resp.Body, maxArtifactBytes+1))
 	if err != nil {
-		return fmt.Errorf("download %s: %w", want.File, err)
+		return release.Entry{}, fmt.Errorf("download %s: %w", want.File, err)
+	}
+	if n > maxArtifactBytes {
+		return release.Entry{}, fmt.Errorf("%s is larger than %d MiB", want.File, maxArtifactBytes>>20)
+	}
+	if resp.ContentLength >= 0 && n != resp.ContentLength {
+		return release.Entry{}, fmt.Errorf("%s arrived truncated: %d of %d bytes", want.File, n, resp.ContentLength)
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return release.Entry{}, err
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != want.Hash {
-		return fmt.Errorf("%s: sha256 %s, the signed release says %s", want.File, got, want.Hash)
+		return release.Entry{}, fmt.Errorf("%s: sha256 %s, the signed release says %s", want.File, got, want.Hash)
 	}
 	if err := os.Chmod(tmpName, 0o755); err != nil {
-		return err
+		return release.Entry{}, err
 	}
 	if err := os.Rename(tmpName, exePath); err != nil {
-		return fmt.Errorf("replace %s: %w", exePath, err)
+		return release.Entry{}, fmt.Errorf("replace %s: %w", exePath, err)
 	}
 	fmt.Fprintf(out, "upgraded %s to %s (%s)\n", exePath, want.File, release.HumanBytes(n))
+	return want, nil
+}
+
+// refuseDowngrade is the anti-rollback rule. A signature proves a release is genuine; it does not
+// prove it is current, so a compromised manager can replay an old but validly signed release and put
+// a known-bad binary back on every node. When either version has no order (dev, ci, proof) the check
+// allows the install and says so: refusing an unversioned build would make local development
+// impossible, and the version is printed either way.
+func refuseDowngrade(installedFile string, offered release.Entry) error {
+	if installedFile == "" {
+		return nil
+	}
+	installed, okOld := release.VersionFromFile(installedFile)
+	offeredVersion, okNew := release.VersionFromFile(offered.File)
+	if !okOld || !okNew {
+		return nil
+	}
+	cmp, ok := release.CompareVersions(offeredVersion, installed)
+	if !ok {
+		return nil
+	}
+	if cmp < 0 {
+		return fmt.Errorf("refusing to downgrade: %s is older than the installed %s", offered.File, installedFile)
+	}
 	return nil
 }

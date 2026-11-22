@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/cti97/the-nightshift-manager/internal/provider"
 	"github.com/cti97/the-nightshift-manager/internal/version"
@@ -30,6 +31,9 @@ type Server struct {
 	// distDir is the release directory this manager serves, or empty for none. Set through
 	// SetDistDir, never by a request: the path is configuration, not input.
 	distDir string
+	// snapshotting is the single-flight flag for /admin/snapshot. A snapshot is a full read of the
+	// database; two at once is twice the lock for the same answer.
+	snapshotting atomic.Bool
 	// enrollTokenHash is a credential that can do exactly one thing: register a
 	// node. It is deliberately not the admin token (spec §15 read register as a
 	// node-token endpoint, which cannot bootstrap itself): an enrolling machine
@@ -122,6 +126,9 @@ func (s *Server) Handler() http.Handler {
 	// The operator's own view and reply. The page and the JSON share one route (M3 D8's pattern).
 	mux.Handle("GET /admin/threads/{id}", s.adminAuth(http.HandlerFunc(s.handleThreadPage)))
 	mux.Handle("POST /admin/threads/{id}/messages", s.adminAuth(http.HandlerFunc(s.handleAdminMessage)))
+	// A whole-board snapshot, admin only and rate-limited by being expensive: it is how a replica
+	// is fed. It contains every item, message and token hash, which is why it is not a node route.
+	mux.Handle("GET /admin/snapshot", s.adminAuth(http.HandlerFunc(s.handleSnapshot)))
 	// The release channel. Admin-authenticated: an artifact list is a map of the fleet.
 	mux.Handle("GET /dist/SHA256SUMS", s.adminAuth(http.HandlerFunc(s.handleDistSums)))
 	mux.Handle("GET /dist/SHA256SUMS.sig", s.adminAuth(http.HandlerFunc(s.handleDistSig)))

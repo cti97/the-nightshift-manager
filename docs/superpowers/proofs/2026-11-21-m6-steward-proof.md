@@ -100,10 +100,32 @@ list of safe routes — so a route added later cannot become writable on the rep
 Response headers carried `X-Nsm-Replica: read-only` and a snapshot age, because a page that looks
 live during an outage is worse than one that looks broken.
 
+## What hardening changed after the first proof
+
+Six failures the happy path hid, each now a test:
+
+1. **The replica exited when the manager was down at boot** — which is the outage it exists for. It
+   now falls back to the snapshot on disk and keeps retrying; with no snapshot it still refuses to
+   start, because a replica with nothing to serve is a replica that lies.
+2. **It leaked a database handle per pull** (one per minute, forever). The replaced handle is now
+   closed after a grace period, so at most three are open; the leak test counts closes.
+3. **It opened the snapshot read-write and ran migrations on it** — rewriting schema and dropping a
+   `-wal` beside a frozen artifact. `OpenReadOnly` uses `mode=ro&immutable=1` and never migrates.
+4. **`/admin/snapshot` had no single-flight guard** — two concurrent snapshots read the whole database
+   twice under the same lock. The second now gets `409`.
+5. **Snapshots and artifacts were downloaded without a cap** — a compromised manager could stream
+   until a Pi's disk filled, and the signature would still be valid. Both are capped, and a short
+   read is detected against `Content-Length` rather than handed to the swap.
+6. **A signed but older release could be replayed** by a compromised manager, reinstalling a known-bad
+   binary on every node. The install records what it wrote and refuses a lower version.
+
 ## What this proof does not show
 
 - The replica has no lag banner *on the page* yet, only headers and a log line; the design memo asks
   for a visible number.
+- The anti-rollback rule only bites on dotted numeric versions. `dev`, `ci` and `proof` have no order,
+  so an unversioned build can be installed over anything — deliberately, because otherwise local
+  development would be impossible.
 - Replication is whole-file, every interval. A board large enough for that to hurt would want
   Litestream; the memo argues the trade.
 - No agent has been run on a Raspberry Pi. The install writes a systemd **user** unit that has been

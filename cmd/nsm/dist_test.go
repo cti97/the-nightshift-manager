@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cti97/the-nightshift-manager/internal/release"
@@ -157,7 +159,7 @@ func TestUpgradeReplacesTheBinaryAfterBothChecks(t *testing.T) {
 		t.Fatalf("write old: %v", err)
 	}
 	var out bytes.Buffer
-	if err := upgradeFromBoard(context.Background(), srv.URL, "admin-secret", pubB64, exe, &out); err != nil {
+	if _, err := upgradeFromBoard(context.Background(), srv.URL, "admin-secret", pubB64, exe, nil, &out); err != nil {
 		t.Fatalf("upgrade: %v", err)
 	}
 	got, err := os.ReadFile(exe)
@@ -193,7 +195,7 @@ func TestUpgradeRefusesATamperedArtifact(t *testing.T) {
 	if err := os.WriteFile(exe, []byte("old binary\n"), 0o755); err != nil {
 		t.Fatalf("write old: %v", err)
 	}
-	if err := upgradeFromBoard(context.Background(), srv.URL, "admin-secret", pubB64, exe, &bytes.Buffer{}); err == nil {
+	if _, err := upgradeFromBoard(context.Background(), srv.URL, "admin-secret", pubB64, exe, nil, &bytes.Buffer{}); err == nil {
 		t.Fatal("a tampered artifact replaced the binary")
 	}
 	got, _ := os.ReadFile(exe)
@@ -212,14 +214,132 @@ func TestUpgradeRefusesAnotherKeyAndAMissingToken(t *testing.T) {
 	if err := os.WriteFile(exe, []byte("old\n"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := upgradeFromBoard(context.Background(), srv.URL, "admin-secret", otherPubB64, exe, &bytes.Buffer{}); err == nil {
+	if _, err := upgradeFromBoard(context.Background(), srv.URL, "admin-secret", otherPubB64, exe, nil, &bytes.Buffer{}); err == nil {
 		t.Fatal("a signature from another key was accepted")
 	}
-	if err := upgradeFromBoard(context.Background(), srv.URL, "", pubB64, exe, &bytes.Buffer{}); err == nil {
+	if _, err := upgradeFromBoard(context.Background(), srv.URL, "", pubB64, exe, nil, &bytes.Buffer{}); err == nil {
 		t.Fatal("an upgrade without an admin token was accepted")
 	}
 	got, _ := os.ReadFile(exe)
 	if string(got) != "old\n" {
 		t.Fatal("a refused upgrade changed the binary")
 	}
+}
+
+// TestPrintAndUpgradeAreRefusedTogether: --print promises that looking changes nothing, and an
+// upgrade replaces the binary.
+func TestPrintAndUpgradeAreRefusedTogether(t *testing.T) {
+	t.Setenv("NSM_NODE_TOKEN", "tok")
+	var out, errOut bytes.Buffer
+	code := installCommand([]string{"--node", "n", "--provides", "reflex", "--reach", "host",
+		"--sandbox-root", t.TempDir(), "--print", "--upgrade", "--pubkey", "AAAA"}, &out, &errOut)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
+	}
+	if !strings.Contains(errOut.String(), "cannot be combined") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
+// TestAnOlderSignedReleaseIsRefused: a signature proves a release is genuine, not that it is
+// current. A compromised manager replaying an old one must not reinstall it.
+func TestAnOlderSignedReleaseIsRefused(t *testing.T) {
+	entry := release.Entry{File: "nsm-1.0.0-darwin-arm64", OS: "darwin", Arch: "arm64"}
+	if err := refuseDowngrade("nsm-2.0.0-darwin-arm64", entry); err == nil {
+		t.Fatal("1.0.0 over 2.0.0 was allowed")
+	}
+	if err := refuseDowngrade("nsm-1.0.0-darwin-arm64", entry); err != nil {
+		t.Fatalf("reinstalling the same version was refused: %v", err)
+	}
+	newer := release.Entry{File: "nsm-2.1.0-darwin-arm64", OS: "darwin", Arch: "arm64"}
+	if err := refuseDowngrade("nsm-2.0.0-darwin-arm64", newer); err != nil {
+		t.Fatalf("an upgrade was refused: %v", err)
+	}
+	// Unversioned builds have no order: developing against a local `make release` must still work,
+	// and the operator sees the version in the output.
+	dev := release.Entry{File: "nsm-dev-darwin-arm64"}
+	if err := refuseDowngrade("nsm-2.0.0-darwin-arm64", dev); err != nil {
+		t.Fatalf("an unversioned build was refused: %v", err)
+	}
+	if err := refuseDowngrade("", newer); err != nil {
+		t.Fatalf("a first install was refused: %v", err)
+	}
+}
+
+// TestTheGuardRunsBeforeAnyDownload: a refused release must not touch the binary, and the guard is
+// called with the entry the signature vouched for.
+func TestTheGuardRunsBeforeAnyDownload(t *testing.T) {
+	dir, pubB64, _, _, _ := releaseFixture(t)
+	var downloads atomic.Int32
+	srv := distServerCounting(t, dir, "admin-secret", &downloads)
+	defer srv.Close()
+	exe := filepath.Join(t.TempDir(), "nsm")
+	if err := os.WriteFile(exe, []byte("old\n"), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	refused := errors.New("refused by the guard")
+	_, err := upgradeFromBoard(context.Background(), srv.URL, "admin-secret", pubB64, exe,
+		func(entry release.Entry) error {
+			if entry.File == "" || entry.Hash == "" {
+				t.Fatalf("the guard saw an empty entry: %+v", entry)
+			}
+			return refused
+		}, &bytes.Buffer{})
+	if !errors.Is(err, refused) {
+		t.Fatalf("err = %v, want the guard's refusal", err)
+	}
+	if got := downloads.Load(); got != 0 {
+		t.Fatalf("the artifact was downloaded %d times before the guard ran", got)
+	}
+	got, _ := os.ReadFile(exe)
+	if string(got) != "old\n" {
+		t.Fatal("a refused upgrade changed the binary")
+	}
+}
+
+// TestAnOversizedArtifactIsRefused: the signature says who published the bytes, not how many.
+func TestAnOversizedArtifactIsRefused(t *testing.T) {
+	old := maxArtifactBytes
+	maxArtifactBytes = 4 // the fixture artifact is 11 bytes
+	defer func() { maxArtifactBytes = old }()
+	dir, pubB64, _, _, _ := releaseFixture(t)
+	srv := distServer(t, dir, "admin-secret")
+	defer srv.Close()
+	exe := filepath.Join(t.TempDir(), "nsm")
+	if err := os.WriteFile(exe, []byte("old\n"), 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := upgradeFromBoard(context.Background(), srv.URL, "admin-secret", pubB64, exe, nil, &bytes.Buffer{})
+	// The error must NAME the size: a hash mismatch would also be an error, and would let this test
+	// pass while the cap did nothing.
+	if err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("err = %v, want it to refuse the size", err)
+	}
+	got, _ := os.ReadFile(exe)
+	if string(got) != "old\n" {
+		t.Fatal("an oversized artifact changed the binary")
+	}
+}
+
+// distServerCounting counts artifact downloads, which is how "before any download" is measured.
+func distServerCounting(t *testing.T, dir, adminToken string, downloads *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+adminToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/dist/files/")
+		if name != r.URL.Path {
+			downloads.Add(1)
+		} else {
+			name = filepath.Base(r.URL.Path)
+		}
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
 }

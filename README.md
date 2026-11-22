@@ -107,7 +107,9 @@ install on a Pi, and no second copy of the checksum format to drift. The private
 the manager — a signature the manager could forge protects nobody from a compromised manager.
 `nsm agent install --upgrade --pubkey …` fetches the artifact for its own target, checks the
 signature, checks the bytes, and replaces itself with one atomic rename; a refused upgrade leaves
-the old binary untouched.
+the old binary untouched. It records the artifact it installed and refuses a **lower** version: a
+signature proves a release is genuine, not that it is current, so a compromised manager could
+otherwise replay an old but validly signed binary.
 
 `--policy` is a node's local wall: a JSON file of per-tool verdicts (`allow`, `deny`, `ask`),
 consulted before a tool runs. `deny` refuses the tool and tells the model why; `ask` parks the run

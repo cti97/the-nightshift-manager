@@ -167,3 +167,56 @@ func TestKeysHaveExactlyOneLength(t *testing.T) {
 		t.Fatal("a raw (non-base64) public key was accepted")
 	}
 }
+
+// TestVersionsOrderWhatCanBeOrdered: the numbers order, a pre-release sorts below its release, and
+// anything that is not numeric has no order at all — refusing to guess is what makes the
+// anti-rollback rule safe to apply to a "dev" build.
+func TestVersionsOrderWhatCanBeOrdered(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+		ok   bool
+	}{
+		{"1.0.0", "1.0.0", 0, true},
+		{"1.0.0", "1.0.1", -1, true},
+		{"1.10.0", "1.9.0", 1, true},
+		{"2", "1.9.9", 1, true},
+		{"1.0.0-rc1", "1.0.0", -1, true},
+		{"1.0.0", "1.0.0-rc1", 1, true},
+		{"1.0.0-rc1", "1.0.0-rc2", -1, true},
+		{"dev", "1.0.0", 0, false},
+		{"1.0.0", "ci", 0, false},
+		{"v1.0.0", "1.0.0", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := CompareVersions(c.a, c.b)
+		if ok != c.ok {
+			t.Fatalf("CompareVersions(%q,%q) ok = %v, want %v", c.a, c.b, ok, c.ok)
+		}
+		if ok && got != c.want {
+			t.Fatalf("CompareVersions(%q,%q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// TestVersionFromFileReadsTheBuildName: the artifact name is the only place a release states its
+// version, and a name that is not the build's shape yields no version rather than a guess.
+func TestVersionFromFileReadsTheBuildName(t *testing.T) {
+	cases := map[string]string{
+		"nsm-1.0.0-darwin-arm64":      "1.0.0",
+		"nsm-1.0.0-linux-amd64":       "1.0.0",
+		"nsm-1.0.0-windows-arm64.exe": "1.0.0",
+		"nsm-1.2.3-rc1-darwin-amd64":  "1.2.3-rc1",
+	}
+	for name, want := range cases {
+		got, ok := VersionFromFile(name)
+		if !ok || got != want {
+			t.Fatalf("VersionFromFile(%q) = %q, %v; want %q", name, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"SHA256SUMS", "nsm-linux-amd64", "other-1.0.0-linux-amd64"} {
+		if _, ok := VersionFromFile(bad); ok {
+			t.Fatalf("VersionFromFile(%q) found a version", bad)
+		}
+	}
+}

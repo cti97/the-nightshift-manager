@@ -52,6 +52,8 @@ func run(args []string, out, errOut io.Writer) int {
 			return 2
 		}
 		return managerServe(args[2:], errOut)
+	case "replica":
+		return replicaCommand(args[1:], out, errOut)
 	case "dist":
 		return distCommand(args[1:], out, errOut)
 	case "agent":
@@ -89,7 +91,7 @@ func run(args []string, out, errOut io.Writer) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: nsm <version|manager|agent|dist|node|approvals|approve|deny|watch> [args]")
+	fmt.Fprintln(w, "usage: nsm <version|manager|agent|replica|dist|node|approvals|approve|deny|watch> [args]")
 	fmt.Fprintln(w, "       nsm agent <run|install> [args]")
 }
 

@@ -191,3 +191,77 @@ func HumanBytes(n int64) string {
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
+
+// VersionFromFile reads the version out of `nsm-<version>-<os>-<arch>[.exe]`, which is the only place
+// a release names its own version.
+func VersionFromFile(name string) (string, bool) {
+	base := strings.TrimSuffix(name, ".exe")
+	parts := strings.Split(base, "-")
+	if len(parts) < 4 || parts[0] != "nsm" {
+		return "", false
+	}
+	return strings.Join(parts[1:len(parts)-2], "-"), true
+}
+
+// CompareVersions orders two dotted numeric versions: -1, 0 or 1, and false when either side has no
+// order at all ("proof", "dev", "ci").
+//
+// A pre-release suffix sorts below the release it precedes (1.2.3-rc1 < 1.2.3), which is the one
+// semver rule worth keeping here: it is why a release candidate can be tested and then upgraded to
+// the release itself. Suffixes are compared lexically, which is enough to tell rc1 from rc2 and not
+// enough to be a semver implementation — this exists to refuse a downgrade, not to resolve ranges.
+func CompareVersions(a, b string) (int, bool) {
+	an, apre, ok := splitNumericVersion(a)
+	if !ok {
+		return 0, false
+	}
+	bn, bpre, ok := splitNumericVersion(b)
+	if !ok {
+		return 0, false
+	}
+	for i := 0; i < len(an) || i < len(bn); i++ {
+		var x, y int
+		if i < len(an) {
+			x = an[i]
+		}
+		if i < len(bn) {
+			y = bn[i]
+		}
+		if x != y {
+			if x < y {
+				return -1, true
+			}
+			return 1, true
+		}
+	}
+	switch {
+	case apre == bpre:
+		return 0, true
+	case apre == "":
+		return 1, true // a release outranks its own pre-release
+	case bpre == "":
+		return -1, true
+	case apre < bpre:
+		return -1, true
+	default:
+		return 1, true
+	}
+}
+
+// splitNumericVersion turns "1.2.3-rc1" into [1 2 3] and "rc1". A non-numeric component makes the
+// whole version unordered: guessing an order for "dev" would let it compare equal to everything.
+func splitNumericVersion(v string) ([]int, string, bool) {
+	core, pre, _ := strings.Cut(strings.TrimSpace(v), "-")
+	if core == "" {
+		return nil, "", false
+	}
+	var out []int
+	for _, part := range strings.Split(core, ".") {
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 {
+			return nil, "", false
+		}
+		out = append(out, n)
+	}
+	return out, pre, true
+}
