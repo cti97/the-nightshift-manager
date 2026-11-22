@@ -2,6 +2,9 @@ package board
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -156,5 +159,36 @@ func TestTheCutoffIsExclusiveAtTheBoundary(t *testing.T) {
 	}
 	if res.Deleted != 1 {
 		t.Fatalf("deleted %d, want only the event before the boundary", res.Deleted)
+	}
+}
+
+// TestThePruneRouteIsAnOperatorsTool: prune-now takes the window from the caller — the setting lives
+// in a unit file, not in the board's memory — and reports what it removed.
+func TestThePruneRouteIsAnOperatorsTool(t *testing.T) {
+	srv, clock := newServer(t)
+	if _, err := srv.db.Exec(`INSERT INTO events (at,actor,entity,entity_id,type,payload) VALUES (?,?,?,?,?,?)`,
+		clock.Now()-int64(40*24*time.Hour/time.Second), "admin", "work_item", "x", "created", "{}"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	post := func(body string, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/admin/retention/prune", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := post(`{"keep_hours":720}`, testAdminToken); rec.Code != http.StatusOK {
+		t.Fatalf("prune = %d (%s)", rec.Code, rec.Body)
+	} else if !strings.Contains(rec.Body.String(), `"deleted":1`) {
+		t.Fatalf("prune said: %s", rec.Body)
+	}
+	if rec := post(`{"keep_hours":720}`, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("prune without a token = %d", rec.Code)
+	}
+	if rec := post(`{"keep_hours":0}`, testAdminToken); rec.Code != http.StatusBadRequest {
+		t.Fatalf("keep_hours 0 = %d, want 400 (it means keep everything)", rec.Code)
 	}
 }

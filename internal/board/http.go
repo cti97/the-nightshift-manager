@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync/atomic"
+	"time"
 
 	"github.com/cti97/the-nightshift-manager/internal/provider"
 	"github.com/cti97/the-nightshift-manager/internal/version"
@@ -139,6 +140,9 @@ func (s *Server) Handler() http.Handler {
 	// A whole-board snapshot, admin only and rate-limited by being expensive: it is how a replica
 	// is fed. It contains every item, message and token hash, which is why it is not a node route.
 	mux.Handle("GET /admin/snapshot", s.adminAuth(http.HandlerFunc(s.handleSnapshot)))
+	// Prune now, rather than waiting for the hourly tick: an operator who has just changed the
+	// retention setting, or who is about to copy the database, should not have to wait.
+	mux.Handle("POST /admin/retention/prune", s.adminAuth(http.HandlerFunc(s.handlePrune)))
 	// The release channel. Admin-authenticated: an artifact list is a map of the fleet.
 	mux.Handle("GET /dist/SHA256SUMS", s.adminAuth(http.HandlerFunc(s.handleDistSums)))
 	mux.Handle("GET /dist/SHA256SUMS.sig", s.adminAuth(http.HandlerFunc(s.handleDistSig)))
@@ -592,6 +596,41 @@ func (s *Server) handleBoardView(w http.ResponseWriter, r *http.Request) {
 	renderHTML(w, http.StatusOK, boardPage, map[string]any{
 		"View": view, "Groups": groups, "Total": total,
 	})
+}
+
+// pruneRequest takes the window from the caller, because "prune now" is usually "prune to the new
+// setting" and the setting lives in the operator's unit file, not in the board's memory.
+type pruneRequest struct {
+	KeepHours int `json:"keep_hours"`
+}
+
+func (s *Server) handlePrune(w http.ResponseWriter, r *http.Request) {
+	var req pruneRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.KeepHours <= 0 {
+		WriteError(w, http.StatusBadRequest, "retention", "keep_hours must be positive; 0 means keep everything and there is nothing to prune")
+		return
+	}
+	keep := time.Duration(req.KeepHours) * time.Hour
+	// One request may need several batches; the answer reports the total and whether more remains, so
+	// a caller can repeat rather than the handler holding the connection open for a year of rows.
+	total := 0
+	for {
+		res, err := PruneEvents(r.Context(), s.db, s.clock, RetentionRequest{Keep: keep})
+		if err != nil {
+			WriteError(w, http.StatusInternalServerError, "retention", err.Error())
+			return
+		}
+		total += res.Deleted
+		if !res.More {
+			WriteJSON(w, http.StatusOK, map[string]any{
+				"deleted": total, "cutoff": res.Cutoff, "keep_hours": req.KeepHours,
+			})
+			return
+		}
+	}
 }
 
 func (s *Server) handleItemTree(w http.ResponseWriter, r *http.Request) {

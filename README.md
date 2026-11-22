@@ -104,6 +104,10 @@ health and only the manager's authenticated probe is allowed to say `ok`.
 `--lan` declares a service capability (`lan:nas`) only while a TCP dial to it answers, re-checked
 on every heartbeat: a laptop that leaves the house stops advertising the home NAS within 15s.
 
+**The board keeps 90 days of audit history by default** (`--retention`; `0` keeps everything, and
+nothing below 24h is obeyed). Pruning removes `events` only — runs are the ledger's source and items
+are the work. `POST /admin/retention/prune` does it on demand.
+
 `nsm agent install` writes a launchd agent (macOS) or a systemd **user** unit (Linux), plus a
 wrapper that sources a `0600` environment file: the node token never appears in a unit file or a
 plist, because those are world-readable and end up in every backup. `--print` shows all three files
@@ -170,7 +174,8 @@ frozen thread's budget.
   [M7](docs/superpowers/plans/2026-11-21-m7-agents-file-work.md) (done through T5: filing, limits,
   approvals, the tool, the tree page and `nsm item tree`),
   [M8](docs/superpowers/plans/2026-11-21-m8-local-harnesses.md) (T1–T3 and T5 done; the MCP shim
-  T4 is not started).
+  T4 is not started),
+  [M9](docs/superpowers/plans/2026-11-22-m9-operator-board.md) (done: retention and the board page).
 - Plans — the milestone-by-milestone build, each with its acceptance tests.
 - Design memos — proposals that are not scheduled:
   [read-only replica](docs/superpowers/designs/2026-11-21-read-only-replica.md).
